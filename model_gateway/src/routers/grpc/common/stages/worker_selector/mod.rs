@@ -91,8 +91,9 @@ pub(crate) fn build_strategy(
             let rt = runtime.ok_or_else(|| {
                 "psrl strategy requires the routing loop to be enabled".to_string()
             })?;
-            // The transfer coordinator is only meaningful when migration is on.
-            let kv_transfer = if config.enable_mig_strategy && config.kv_transfer.enable {
+            // Transfer when a request is re-routed to a different instance
+            // (hint != selected). Sticky pin is independent of coordinator-side mig.
+            let kv_transfer = if config.kv_transfer.enable {
                 Some(Arc::new(KvTransferCoordinator::new(
                     config.kv_transfer.clone(),
                     kv_event_monitor,
@@ -104,7 +105,6 @@ pub(crate) fn build_strategy(
                 worker_registry,
                 policy_registry,
                 rt,
-                config.enable_mig_strategy,
                 config.candidate_sort_key,
                 config.enable_group_sticky_routing,
                 kv_transfer,

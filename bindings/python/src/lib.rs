@@ -493,10 +493,9 @@ struct Router {
     worker_selection_strategy: String,
     // Config for PSRL worker selection strategy
     psrl_ps_manager_addr: String,
-    psrl_enable_mig_strategy: bool,
     psrl_candidate_sort_key: String,
     psrl_enable_group_sticky: bool,
-    // KV-cache transfer on migration (cache-aware routing)
+    // KV-cache transfer when a request is re-routed to a different instance
     psrl_kv_transfer_enable: bool,
     psrl_kv_transfer_mode: String,
     psrl_kv_transfer_timeout_ms: u64,
@@ -872,7 +871,6 @@ impl Router {
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .worker_selection_strategy(worker_selection_strategy)
             .psrl_ps_manager_addr(&self.psrl_ps_manager_addr)
-            .psrl_enable_mig_strategy(self.psrl_enable_mig_strategy)
             .psrl_candidate_sort_key(candidate_sort_key)
             .psrl_enable_group_sticky(self.psrl_enable_group_sticky)
             .psrl_kv_transfer(kv_transfer_config)
@@ -1007,7 +1005,6 @@ impl Router {
         mesh_advertise_host = None,
         worker_selection_strategy = String::from("naive"),
         psrl_ps_manager_addr = String::new(),
-        psrl_enable_mig_strategy = false,
         psrl_candidate_sort_key = String::from("version"),
         psrl_enable_group_sticky = false,
         psrl_kv_transfer_enable = false,
@@ -1146,7 +1143,6 @@ impl Router {
         mesh_advertise_host: Option<String>,
         worker_selection_strategy: String,
         psrl_ps_manager_addr: String,
-        psrl_enable_mig_strategy: bool,
         psrl_candidate_sort_key: String,
         psrl_enable_group_sticky: bool,
         psrl_kv_transfer_enable: bool,
@@ -1298,7 +1294,6 @@ impl Router {
             mesh_peer_urls,
             worker_selection_strategy,
             psrl_ps_manager_addr,
-            psrl_enable_mig_strategy,
             psrl_candidate_sort_key,
             psrl_enable_group_sticky,
             psrl_kv_transfer_enable,

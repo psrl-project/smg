@@ -1,13 +1,13 @@
-//! KV-cache transfer coordinator for cross-instance migration.
+//! KV-cache transfer coordinator for cross-instance re-routing.
 //!
-//! When a PSRL rollout request migrates from its previous instance `A`
+//! When a PSRL rollout request is routed from its previous instance `A`
 //! (`rollout_instance_hint`) to a newly-selected instance `B`, the cached
 //! prefix that `A` already holds would otherwise be re-prefilled on `B`. This
 //! coordinator proactively moves that prefix `A → B` out of band (a unary
 //! `TransferKv` RPC to `A`'s servicer, which pushes via LMCache `transfer_direct`),
 //! so `B` resumes from cache.
 //!
-//! The migration is detected by the PSRL worker selector; this module owns the
+//! The re-route is detected by the PSRL worker selector; this module owns the
 //! *mechanism*:
 //!
 //! - **Overlap gate** — consult the event-driven [`KvEventMonitor`] indexer to

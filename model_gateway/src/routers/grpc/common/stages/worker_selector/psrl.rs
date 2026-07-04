@@ -8,8 +8,10 @@
 //! 1. **Version filter** — retain only workers whose synced version tag ≥ the
 //!    request's `version_tag`.  Uses a synchronous `parking_lot::Mutex` to avoid
 //!    yielding to the async runtime on the hot path.
-//! 2. **Partial-hint pin** — when a `rollout_instance_hint` is present and
-//!    migration is disabled, route directly to that instance.
+//! 2. **Trajectory sticky pin** — when `is_sticky` and a `rollout_instance_hint`
+//!    is present, route directly to that instance. Non-sticky requests (including
+//!    partial-rollout loopbacks) are free to land on any eligible instance;
+//!    coordinator-side migration is independent of this stage.
 //! 3. **Group pin** — when `prompt_id` is present and multi-instance group
 //!    sampling is disabled, route to the instance already serving that prompt.
 //! 4. **Can-reserve filter** — call `CanReserveRequest` via the PS Manager to
@@ -109,7 +111,6 @@ pub(crate) struct PsrlWorkerSelector {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     runtime: Arc<RoutingLoopRuntime>,
-    enable_mig_strategy: bool,
     candidate_sort_key: CandidateSortKey,
     enable_group_sticky: bool,
     kv_transfer: Option<Arc<KvTransferCoordinator>>,
@@ -124,13 +125,11 @@ impl PsrlWorkerSelector {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         runtime: Arc<RoutingLoopRuntime>,
-        enable_mig_strategy: bool,
         candidate_sort_key: CandidateSortKey,
         enable_group_sticky: bool,
         kv_transfer: Option<Arc<KvTransferCoordinator>>,
     ) -> Self {
         info!(
-            enable_mig_strategy,
             enable_group_sticky,
             kv_transfer_enabled = kv_transfer.is_some(),
             "PSRL worker selector initialized (sticky config)"
@@ -139,7 +138,6 @@ impl PsrlWorkerSelector {
             worker_registry,
             policy_registry,
             runtime,
-            enable_mig_strategy,
             candidate_sort_key,
             enable_group_sticky,
             kv_transfer,
@@ -229,9 +227,12 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
             return None;
         }
 
-        // ── Stage 2: partial-hint pin ───────────────────────────────────────
-        if !self.enable_mig_strategy || meta.is_sticky {
-            // Request with rollout instance hint is a partial hint
+        // ── Stage 2: trajectory sticky pin ──────────────────────────────────
+        // Only `is_sticky` pins to the previous instance. Non-sticky requests
+        // keep `rollout_instance_hint` as the KV-transfer source but are free
+        // to land on any eligible worker (policy / cache-aware / load balance).
+        // Coordinator-side imbalance migration is independent of this stage.
+        if meta.is_sticky {
             if let Some(ref hint) = meta.rollout_instance_hint {
                 let pinned: Vec<Arc<dyn Worker>> = candidates
                     .iter()
@@ -601,7 +602,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                     src_dp = hint.1,
                     dst_worker = %selected_instance.0,
                     dst_dp = selected_instance.1,
-                    "KV migration detected: routing to different instance"
+                    "KV re-route detected: routing to different instance"
                 );
                 if let Some(src) = self.find_worker_by_instance(model_id, hint) {
                     coordinator
@@ -760,7 +761,6 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             Arc::clone(&runtime),
-            false,
             CandidateSortKey::Version,
             true,
             None,
@@ -781,7 +781,6 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             Arc::clone(runtime),
-            false,
             CandidateSortKey::Version,
             true,
             None,
@@ -835,9 +834,9 @@ mod tests {
         assert_eq!(pinned, None);
     }
 
-    /// Stage 2 pin: rollout_instance_hint (mig disabled) should pin to the hinted instance.
+    /// Stage 2 pin: sticky + rollout_instance_hint pins to the hinted instance.
     #[test]
-    fn stage2_partial_hint_pin_logic() {
+    fn stage2_sticky_hint_pin_logic() {
         // Simulate the filter: a hint matches one of two candidates.
         let hint: (String, usize) = ("worker-a".to_string(), 0);
         let instances = [

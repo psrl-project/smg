@@ -101,10 +101,9 @@ class RouterArgs:
     # PSRL worker selection configuration
     worker_selection_strategy: str = "naive"
     psrl_ps_manager_addr: str = ""
-    psrl_enable_mig_strategy: bool = False
     psrl_candidate_sort_key: str = "version"
     psrl_enable_group_sticky: bool = False
-    # KV-cache transfer on migration
+    # KV-cache transfer when a request is re-routed to a different instance
     psrl_kv_transfer_enable: bool = False
     psrl_kv_transfer_mode: str = "async"  # async | sync | pin_sync
     psrl_kv_transfer_timeout_ms: int = 30000
@@ -819,12 +818,6 @@ class RouterArgs:
             type=str,
             default=RouterArgs.psrl_ps_manager_addr,
             help="PS Manager gRPC address used by the PSRL worker selection strategy",
-        )
-        routing_loop_group.add_argument(
-            f"--{prefix}psrl-enable-mig-strategy",
-            action="store_true",
-            default=RouterArgs.psrl_enable_mig_strategy,
-            help="Enable PSRL migration-aware worker selection",
         )
         routing_loop_group.add_argument(
             f"--{prefix}psrl-candidate-sort-key",

@@ -59,15 +59,15 @@ pub enum KvTransferMode {
     PinSync,
 }
 
-/// Configuration for KV-cache transfer on migration.
+/// Configuration for KV-cache transfer on re-route.
 ///
-/// When a request migrates from instance A (its `rollout_instance_hint`) to a
+/// When a request is routed from instance A (its `rollout_instance_hint`) to a
 /// newly-selected instance B, the router can proactively move A's cached prefix
 /// to B so the request resumes from cache instead of re-prefilling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KvTransferConfig {
-    /// Master switch. When false, migration never triggers a transfer.
+    /// Master switch. When false, re-routing never triggers a transfer.
     pub enable: bool,
     /// Coordination mode between transfer and dispatch.
     pub transfer_mode: KvTransferMode,
@@ -93,13 +93,11 @@ impl Default for KvTransferConfig {
 #[serde(default)]
 pub struct PsrlConfig {
     pub ps_manager_addr: String,
-    /// Allow instance migration
-    pub enable_mig_strategy: bool,
     /// Candidate sorting function
     pub candidate_sort_key: CandidateSortKey,
     /// When true, the same prompt will run on the same worker.
     pub enable_group_sticky_routing: bool,
-    /// KV-cache transfer on migration (A → B).
+    /// KV-cache transfer when a request is re-routed (A → B).
     pub kv_transfer: KvTransferConfig,
 }
 
@@ -107,7 +105,6 @@ impl Default for PsrlConfig {
     fn default() -> Self {
         Self {
             ps_manager_addr: String::new(),
-            enable_mig_strategy: false,
             candidate_sort_key: CandidateSortKey::Version,
             enable_group_sticky_routing: false,
             kv_transfer: KvTransferConfig::default(),
@@ -2009,8 +2006,8 @@ mod tests {
     fn test_psrl_config_defaults() {
         let cfg = PsrlConfig::default();
         assert_eq!(cfg.ps_manager_addr, "");
-        assert!(!cfg.enable_mig_strategy);
         assert_eq!(cfg.candidate_sort_key, CandidateSortKey::Version);
         assert!(!cfg.enable_group_sticky_routing);
+        assert!(!cfg.kv_transfer.enable);
     }
 }

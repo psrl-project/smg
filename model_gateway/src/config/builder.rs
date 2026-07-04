@@ -333,11 +333,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn psrl_enable_mig_strategy(mut self, v: bool) -> Self {
-        self.config.psrl.enable_mig_strategy = v;
-        self
-    }
-
     pub fn psrl_candidate_sort_key(mut self, v: CandidateSortKey) -> Self {
         self.config.psrl.candidate_sort_key = v;
         self
