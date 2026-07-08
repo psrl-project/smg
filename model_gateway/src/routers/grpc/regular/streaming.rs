@@ -47,7 +47,7 @@ use crate::{
     },
 };
 
-/// Shared streaming processor for both single and dual dispatch modes
+/// Shared streaming processor for both single and prefill/decode dispatch modes
 #[derive(Clone)]
 pub(crate) struct StreamingProcessor {
     tool_parser_factory: ToolParserFactory,
@@ -143,7 +143,11 @@ impl StreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::PrefillDecode {
+                prefill,
+                decode,
+                pd_timing,
+            } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
                 #[expect(
@@ -152,7 +156,7 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result = processor
-                        .process_dual_streaming_chunks(
+                        .process_prefill_decode_streaming_chunks(
                             prefill,
                             *decode,
                             dispatch,
@@ -160,6 +164,7 @@ impl StreamingProcessor {
                             stop_params,
                             chat_request,
                             &tx,
+                            pd_timing,
                         )
                         .await;
 
@@ -195,12 +200,38 @@ impl StreamingProcessor {
     /// Process streaming chunks from a single stream (Regular mode)
     pub async fn process_streaming_chunks(
         &self,
+        grpc_stream: ProtoStream,
+        dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        original_request: Arc<ChatCompletionRequest>,
+        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<(), String> {
+        self.process_streaming_chunks_inner(
+            grpc_stream,
+            dispatch,
+            tokenizer,
+            stop_params,
+            original_request,
+            tx,
+            None,
+        )
+        .await
+    }
+
+    /// Inner implementation shared by single-mode and PD prefill/decode streaming.
+    /// `pd_timing` is `Some` only in PD mode and yields honest PD TTFT
+    /// (prefill start to first decode token).
+    #[expect(clippy::too_many_arguments)]
+    async fn process_streaming_chunks_inner(
+        &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<(), String> {
         // Metrics timing
         let start_time = Instant::now();
@@ -221,6 +252,7 @@ impl StreamingProcessor {
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
 
         // Parser state (lazy initialization per index)
         type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
@@ -257,8 +289,9 @@ impl StreamingProcessor {
         // the template injected `<think>` in the prefill — parsers should start
         // in reasoning mode.
         let thinking_override = utils::should_mark_reasoning_started(
-            utils::extract_thinking_from_kwargs(
+            utils::resolve_user_thinking(
                 original_request.chat_template_kwargs.as_ref(),
+                original_request.reasoning_effort.as_deref(),
                 tokenizer.as_ref(),
             ),
             tokenizer.as_ref(),
@@ -317,6 +350,14 @@ impl StreamingProcessor {
                     // Track TTFT immediately on first chunk received from backend
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
+                        if let Some(timing) = &pd_timing {
+                            Metrics::record_pd_ttft(
+                                self.backend_type,
+                                model,
+                                timing.runtime,
+                                timing.prefill_start.elapsed(),
+                            );
+                        }
                     }
 
                     let index = chunk.index();
@@ -504,6 +545,7 @@ impl StreamingProcessor {
                     completion_tokens.record_complete(&complete);
 
                     cached_tokens.insert(index, complete.cached_tokens());
+                    reasoning_tokens.insert(index, complete.reasoning_tokens());
                     finish_reasons.insert(index, complete.finish_reason().to_string());
 
                     matched_stops.insert(index, complete.matched_stop_json());
@@ -578,12 +620,14 @@ impl StreamingProcessor {
                 let total_prompt: u32 = prompt_tokens.values().sum();
                 let total_completion: u32 = completion_tokens.total();
                 let total_cached: u32 = cached_tokens.values().sum();
+                let total_reasoning: u32 = reasoning_tokens.values().sum();
 
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
                     .usage(
                         Usage::from_counts(total_prompt, total_completion)
-                            .with_cached_tokens(total_cached),
+                            .with_cached_tokens(total_cached)
+                            .with_reasoning_tokens(total_reasoning),
                     )
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();
@@ -616,9 +660,9 @@ impl StreamingProcessor {
         Ok(())
     }
 
-    /// Process dual streaming chunks (prefill + decode) - PD mode
+    /// Process prefill/decode streaming chunks (prefill + decode) - PD mode
     #[expect(clippy::too_many_arguments)]
-    pub async fn process_dual_streaming_chunks(
+    pub async fn process_prefill_decode_streaming_chunks(
         &self,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -627,6 +671,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pd_timing: context::PdTiming,
     ) -> Result<(), String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
         if original_request.logprobs {
@@ -644,16 +689,18 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 2-5: Process decode stream (same as single mode)
+        // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
+        // so the first decode token yields honest PD TTFT.
         // Note: decode_stream will be marked completed inside process_streaming_chunks
         let result = self
-            .process_streaming_chunks(
+            .process_streaming_chunks_inner(
                 decode_stream,
                 dispatch,
                 tokenizer,
                 stop_params,
                 original_request,
                 tx,
+                Some(pd_timing),
             )
             .await;
 
@@ -713,7 +760,11 @@ impl StreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::PrefillDecode {
+                prefill,
+                decode,
+                pd_timing,
+            } => {
                 // For PD mode, need to handle prefill stream for input_logprobs
                 let tokenizer = tokenizer.clone();
                 #[expect(
@@ -721,8 +772,8 @@ impl StreamingProcessor {
                     reason = "streaming task is fire-and-forget; client disconnect terminates it"
                 )]
                 tokio::spawn(async move {
-                    let result = Self::process_generate_streaming_dual(
-                        tokenizer, prefill, *decode, ctx, &tx,
+                    let result = Self::process_generate_prefill_decode_streaming(
+                        tokenizer, prefill, *decode, ctx, &tx, pd_timing,
                     )
                     .await;
 
@@ -811,7 +862,8 @@ impl StreamingProcessor {
                             "prompt_tokens": chunk.prompt_tokens(),
                             "weight_version": &ctx.weight_version,
                             "completion_tokens": current_completion_tokens,
-                            "cached_tokens": chunk.cached_tokens()
+                            "cached_tokens": chunk.cached_tokens(),
+                            "reasoning_tokens": chunk.reasoning_tokens()
                         },
                         "index": index
                     });
@@ -841,6 +893,7 @@ impl StreamingProcessor {
                             "weight_version": &ctx.weight_version,
                             "completion_tokens": completion_tokens,
                             "cached_tokens": complete.cached_tokens(),
+                            "reasoning_tokens": complete.reasoning_tokens(),
                             "e2e_latency": e2e_latency
                         },
                         "index": index
@@ -868,13 +921,14 @@ impl StreamingProcessor {
         Ok(())
     }
 
-    /// Process dual streaming for generate endpoint (PD mode with logprobs support)
-    async fn process_generate_streaming_dual(
+    /// Process prefill/decode streaming for generate endpoint (PD mode with logprobs support)
+    async fn process_generate_prefill_decode_streaming(
         tokenizer: Arc<dyn Tokenizer>,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pd_timing: context::PdTiming,
     ) -> Result<(), String> {
         // Collect input_logprobs from prefill stream if requested
         let input_token_logprobs = if ctx.return_logprob {
@@ -899,7 +953,8 @@ impl StreamingProcessor {
             None
         };
 
-        // Process decode stream with input_logprobs prepended
+        // Process decode stream with input_logprobs prepended. Pass pd_timing so
+        // the first decode token yields honest PD TTFT.
         // Note: decode_stream will be marked completed inside the function
         let result = Self::process_generate_streaming_with_input_logprobs(
             tokenizer,
@@ -907,6 +962,7 @@ impl StreamingProcessor {
             ctx,
             input_token_logprobs,
             tx,
+            Some(pd_timing),
         )
         .await;
 
@@ -926,6 +982,7 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -946,6 +1003,14 @@ impl StreamingProcessor {
                     // Track TTFT immediately on first chunk received from backend
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
+                        if let Some(timing) = &pd_timing {
+                            Metrics::record_pd_ttft(
+                                ctx.backend_type,
+                                &ctx.model,
+                                timing.runtime,
+                                timing.prefill_start.elapsed(),
+                            );
+                        }
                     }
 
                     let index = chunk.index();
@@ -1003,7 +1068,8 @@ impl StreamingProcessor {
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": current_output_logprobs,
                             "completion_tokens": current_completion_tokens,
-                            "cached_tokens": chunk.cached_tokens()
+                            "cached_tokens": chunk.cached_tokens(),
+                            "reasoning_tokens": chunk.reasoning_tokens()
                         },
                         "index": index
                     });
@@ -1047,6 +1113,7 @@ impl StreamingProcessor {
                             "output_token_logprobs": final_output_logprobs,
                             "completion_tokens": completion_tokens,
                             "cached_tokens": complete.cached_tokens(),
+                            "reasoning_tokens": complete.reasoning_tokens(),
                             "e2e_latency": e2e_latency
                         },
                         "index": index
@@ -1534,7 +1601,12 @@ impl StreamingProcessor {
                     // No data: [DONE] — Anthropic uses message_stop instead
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::PrefillDecode {
+                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
+                prefill,
+                decode,
+                ..
+            } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
                 #[expect(
@@ -1543,7 +1615,7 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result = processor
-                        .process_dual_messages_streaming_chunks(
+                        .process_prefill_decode_messages_streaming_chunks(
                             prefill,
                             *decode,
                             dispatch,
@@ -2211,12 +2283,12 @@ impl StreamingProcessor {
         Ok(())
     }
 
-    /// Process dual streaming chunks for Messages API (PD mode).
+    /// Process prefill/decode streaming chunks for Messages API (PD mode).
     ///
     /// Consumes prefill stream then delegates to
     /// [`Self::process_messages_streaming_chunks`] with the decode stream.
     #[expect(clippy::too_many_arguments)]
-    pub async fn process_dual_messages_streaming_chunks(
+    pub async fn process_prefill_decode_messages_streaming_chunks(
         &self,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -2302,7 +2374,12 @@ impl StreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::PrefillDecode {
+                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
+                prefill,
+                decode,
+                ..
+            } => {
                 let processor = self.clone();
                 #[expect(
                     clippy::disallowed_methods,
@@ -2310,7 +2387,7 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result = processor
-                        .process_dual_completion_streaming_chunks(
+                        .process_prefill_decode_completion_streaming_chunks(
                             prefill,
                             *decode,
                             dispatch,
@@ -2404,6 +2481,7 @@ impl StreamingProcessor {
         // messages rather than summing (same prompt tokenized once, not per-choice).
         let mut total_prompt = 0u32;
         let mut total_cached = 0u32;
+        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
         let mut total_completion = CompletionTokenTracker::new();
 
         while let Some(response) = grpc_stream.next().await {
@@ -2527,6 +2605,7 @@ impl StreamingProcessor {
                     let index = complete.index();
                     total_prompt = total_prompt.max(complete.prompt_tokens());
                     total_cached = total_cached.max(complete.cached_tokens());
+                    reasoning_tokens.insert(index, complete.reasoning_tokens());
                     total_completion.record_complete(&complete);
 
                     if stopped_indices.contains(&index) {
@@ -2663,6 +2742,7 @@ impl StreamingProcessor {
         grpc_stream.mark_completed();
 
         if include_usage {
+            let total_reasoning: u32 = reasoning_tokens.values().sum();
             let usage_chunk = CompletionStreamResponse {
                 id: request_id.clone(),
                 object: "text_completion".to_string(),
@@ -2670,11 +2750,14 @@ impl StreamingProcessor {
                 choices: vec![],
                 model: model.clone(),
                 system_fingerprint: system_fingerprint.map(String::from),
-                usage: Some(
-                    Usage::from_counts(total_prompt, total_completion.total())
-                        .with_cached_tokens(total_cached),
-                ),
+                usage: Some(Self::build_completion_streaming_usage(
+                    total_prompt,
+                    total_completion.total(),
+                    total_cached,
+                    total_reasoning,
+                )),
             };
+
             Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
             let _ = tx.send(Ok(Bytes::from(sse_buffer.clone())));
         }
@@ -2692,10 +2775,10 @@ impl StreamingProcessor {
         Ok(())
     }
 
-    /// PD dual-dispatch variant: consume prefill stream, then delegate decode
+    /// PD prefill/decode variant: consume prefill stream, then delegate decode
     /// stream to [`Self::process_completion_streaming_chunks`].
     #[expect(clippy::too_many_arguments)]
-    async fn process_dual_completion_streaming_chunks(
+    async fn process_prefill_decode_completion_streaming_chunks(
         &self,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -2754,5 +2837,44 @@ impl StreamingProcessor {
             buffer.extend_from_slice(error_msg.as_bytes());
         }
         buffer.extend_from_slice(b"\n\n");
+    }
+
+    fn build_completion_streaming_usage(
+        total_prompt: u32,
+        total_completion: u32,
+        total_cached: u32,
+        total_reasoning: u32,
+    ) -> Usage {
+        Usage::from_counts(total_prompt, total_completion)
+            .with_cached_tokens(total_cached)
+            .with_reasoning_tokens(total_reasoning)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_streaming_usage_includes_reasoning_tokens() {
+        let usage = StreamingProcessor::build_completion_streaming_usage(10, 5, 4, 3);
+
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|details| details.cached_tokens),
+            Some(4)
+        );
+        assert_eq!(
+            usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+            Some(3)
+        );
     }
 }

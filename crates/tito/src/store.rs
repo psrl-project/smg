@@ -206,7 +206,6 @@ pub struct PrefixMatch {
     pub matched_message_num: usize,
 }
 
-
 /// `running_hasher` is the [`PrefixHasher`] state after folding both the
 /// render context and every message in the lookup `messages` slice.
 ///
@@ -355,7 +354,7 @@ impl TitoStore {
     /// Returns `Err(TitoError::AssistantInAppended)` if a HIT candidate would
     /// require an assistant turn inside the appended slice (client sequencing
     /// bug).
-    /// 
+    ///
     /// On a miss, the running hasher and parent hash are still populated,
     /// so the caller can store a root node for the session without paying
     /// for a second full message walk.
@@ -567,11 +566,7 @@ impl TitoStore {
     /// Called by chat preparation before dispatching turn k.  The store
     /// returns an *advisory* value; the caller may still override it with
     /// a partial-rollout-injected loopback offset.
-    pub fn next_routed_experts_prompt_start(
-        &self,
-        session_id: &str,
-        trajectory_id: u64,
-    ) -> u32 {
+    pub fn next_routed_experts_prompt_start(&self, session_id: &str, trajectory_id: u64) -> u32 {
         let Some(arc) = self.get_session_arc(session_id) else {
             return 0;
         };
@@ -1311,10 +1306,7 @@ mod tests {
     // (`hash_messages_with_context` + `compute_parent_hash`) would have
     // produced, so the on-disk prefix tree stays compatible.
 
-    fn extend_for_assistant(
-        lookup: &PrefixLookup,
-        assistant: &ChatMessage,
-    ) -> PrefixHash {
+    fn extend_for_assistant(lookup: &PrefixLookup, assistant: &ChatMessage) -> PrefixHash {
         let mut hasher = lookup.running_hasher.clone();
         hash_message_into(&mut hasher, assistant);
         finalize_hash(&hasher)
@@ -1410,14 +1402,7 @@ mod tests {
         let reference = make_store();
         reference.create_session("s");
         reference
-            .store(
-                "s",
-                &all_msgs,
-                vec![1, 2, 3],
-                record(3, "stop"),
-                &ctx,
-                42,
-            )
+            .store("s", &all_msgs, vec![1, 2, 3], record(3, "stop"), &ctx, 42)
             .unwrap();
 
         // Reused: caller passes hashes obtained from the lookup.
@@ -1466,11 +1451,7 @@ mod tests {
             record(2, "stop"),
             &ctx,
         );
-        let query = vec![
-            user_msg("hi"),
-            assistant_msg("hello"),
-            user_msg("more"),
-        ];
+        let query = vec![user_msg("hi"), assistant_msg("hello"), user_msg("more")];
 
         let legacy_hit = store.find_prefix("s1", &query, &ctx).unwrap();
         let lookup = store.find_prefix_with_lookup("s1", &query, &ctx).unwrap();

@@ -1,10 +1,14 @@
+# Cap grpcio-tools at 1.81.x so the bundled protoc emits protobuf-6 gencode.
+# 1.82.x emits protobuf-7 gencode, which the protobuf 6.x runtime (pinned via
+# grpcio-health-checking/reflection in ci_install_e2e_deps.sh) refuses to load.
+# Drop the cap once the whole stack moves to protobuf 7.
 [build-system]
-requires = ["setuptools>=68.0", "grpcio-tools>=1.81.1"]
+requires = ["setuptools>=77.0", "grpcio-tools>=1.81.1,<1.82"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-proto"
-version = "0.4.11"
+version = "0.4.12"
 description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,7 +16,8 @@ dependencies = [
     "protobuf>=5.26.0",
 ]
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "Chang Su", email = "mckvtl@gmail.com"},
     {name = "Simo Lin", email = "linsimo.mark@gmail.com"},
@@ -24,7 +29,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
 

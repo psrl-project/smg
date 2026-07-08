@@ -278,7 +278,11 @@ pub fn assistants_diagnostic_summary(messages: &[ChatMessage]) -> String {
 
         match reasoning_content {
             None => out.push_str(" rc=None"),
-            Some(s) => out.push_str(&format!(" rc=Some({},{})", s.len(), short_sha(s.as_bytes()))),
+            Some(s) => out.push_str(&format!(
+                " rc=Some({},{})",
+                s.len(),
+                short_sha(s.as_bytes())
+            )),
         }
 
         match tool_calls {

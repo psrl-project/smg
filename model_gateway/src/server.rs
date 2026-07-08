@@ -55,6 +55,7 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
+        common::realtime::ws::RealtimeQueryParams,
         conversations,
         grpc::routing_loop::{
             controller::{
@@ -63,7 +64,6 @@ use crate::{
             },
             runtime::{run_routing_loop, RoutingLoopRuntime},
         },
-        openai::realtime::ws::RealtimeQueryParams,
         parse, responses as response_handlers,
         router_manager::RouterManager,
         tokenize, RouterTrait,
@@ -579,13 +579,9 @@ async fn create_worker(
 
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListWorkersQuery>,
+    Query(_query): Query<ListWorkersQuery>,
 ) -> Response {
-    state
-        .context
-        .worker_service
-        .list_workers()
-        .into_response()
+    state.context.worker_service.list_workers().into_response()
 }
 
 async fn get_worker(
@@ -738,7 +734,6 @@ async fn v1_tokenizers_remove(
 ) -> Response {
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
-
 
 /// POST /tito/sessions — create a new TITO session and return its ID.
 async fn tito_create_session(State(state): State<Arc<AppState>>) -> Response {

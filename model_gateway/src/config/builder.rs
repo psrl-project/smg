@@ -4,10 +4,10 @@ use smg_mcp::McpConfig;
 
 use super::{
     CandidateSortKey, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvTransferConfig, MetricsConfig,
-    OracleConfig, PolicyConfig, PostgresConfig, PsrlConfig, RedisConfig, RequestSortKey,
-    RetryConfig, RouterConfig, RoutingLoopConfig, RoutingMode, TokenizerCacheConfig,
-    TraceConfig, WorkerSelectionStrategy,
+    HealthCheckConfig, HistoryBackend, KvTransferConfig, MetricsConfig, OracleConfig, PolicyConfig,
+    PostgresConfig, PsrlConfig, RedisConfig, RequestSortKey, RetryConfig, RouterConfig,
+    RoutingKeyOverrideConfig, RoutingLoopConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    WorkerSelectionStrategy,
 };
 use crate::worker::ConnectionMode;
 
@@ -258,6 +258,11 @@ impl RouterConfigBuilder {
 
     pub fn engine_stats_staleness_threshold_ms(mut self, threshold_ms: u64) -> Self {
         self.config.engine_stats_staleness_threshold_ms = threshold_ms;
+        self
+    }
+
+    pub fn engine_metrics(mut self, enabled: bool) -> Self {
+        self.config.engine_metrics = enabled;
         self
     }
 
@@ -642,6 +647,11 @@ impl RouterConfigBuilder {
 
     pub fn dp_aware(mut self, enable: bool) -> Self {
         self.config.dp_aware = enable;
+        self
+    }
+
+    pub fn routing_key_override(mut self, config: RoutingKeyOverrideConfig) -> Self {
+        self.config.routing_key_override = config;
         self
     }
 

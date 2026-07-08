@@ -39,6 +39,9 @@ pub enum WorkerType {
     Prefill,
     /// Decode worker for PD disaggregated mode.
     Decode,
+    /// Encode worker for EPD disaggregated mode: runs the vision tower and
+    /// ships image embeddings to a prefill worker over Mooncake.
+    Encode,
 }
 
 impl std::fmt::Display for WorkerType {
@@ -47,6 +50,7 @@ impl std::fmt::Display for WorkerType {
             WorkerType::Regular => write!(f, "regular"),
             WorkerType::Prefill => write!(f, "prefill"),
             WorkerType::Decode => write!(f, "decode"),
+            WorkerType::Encode => write!(f, "encode"),
         }
     }
 }
@@ -61,6 +65,8 @@ impl std::str::FromStr for WorkerType {
             Ok(WorkerType::Prefill)
         } else if s.eq_ignore_ascii_case("decode") {
             Ok(WorkerType::Decode)
+        } else if s.eq_ignore_ascii_case("encode") {
+            Ok(WorkerType::Encode)
         } else {
             Err(format!("Unknown worker type: {s}"))
         }
@@ -215,19 +221,25 @@ impl RuntimeType {
     pub fn is_specified(self) -> bool {
         !matches!(self, RuntimeType::Unspecified)
     }
+
+    /// Static string form, identical to `Display`. For hot-path metric labels
+    /// that must avoid per-call allocation/interning.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeType::Unspecified => "unspecified",
+            RuntimeType::Sglang => "sglang",
+            RuntimeType::Vllm => "vllm",
+            RuntimeType::Trtllm => "trtllm",
+            RuntimeType::Mlx => "mlx",
+            RuntimeType::TokenSpeed => "tokenspeed",
+            RuntimeType::External => "external",
+        }
+    }
 }
 
 impl std::fmt::Display for RuntimeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RuntimeType::Unspecified => write!(f, "unspecified"),
-            RuntimeType::Sglang => write!(f, "sglang"),
-            RuntimeType::Vllm => write!(f, "vllm"),
-            RuntimeType::Trtllm => write!(f, "trtllm"),
-            RuntimeType::Mlx => write!(f, "mlx"),
-            RuntimeType::TokenSpeed => write!(f, "tokenspeed"),
-            RuntimeType::External => write!(f, "external"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -537,12 +549,12 @@ impl<'de> Deserialize<'de> for WorkerModels {
 
 /// JsonSchema: wire format is `Vec<ModelCard>`.
 impl JsonSchema for WorkerModels {
-    fn schema_name() -> String {
-        "WorkerModels".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WorkerModels".into()
     }
 
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        Vec::<ModelCard>::json_schema(gen)
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        Vec::<ModelCard>::json_schema(generator)
     }
 }
 
@@ -1104,6 +1116,21 @@ pub struct SchedulerLoadSnapshot {
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
+    /// PD disaggregation signals, populated only when the backend reports a
+    /// `disagg` section. `None` for HTTP or older engines. Canonical schema
+    /// other engines map into; SGLang derives the queue depths from its
+    /// per-stage DisaggregationMetrics counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_speed_gb_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_queue_reqs: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_queue_reqs: Option<i32>,
+    /// "prefill", "decode", or "null" as reported by the backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disagg_mode: Option<String>,
 }
 
 /// Full load response for a single worker across all DP ranks.
@@ -1127,6 +1154,20 @@ impl WorkerLoadResponse {
     /// Total used tokens summed across all DP ranks.
     pub fn total_used_tokens(&self) -> i64 {
         self.loads.iter().map(|l| l.num_used_tokens as i64).sum()
+    }
+
+    /// Whether this response carries real absolute per-rank token counts
+    /// (as opposed to a ratio-only snapshot synthesized from Prometheus
+    /// `/metrics`, which knows KV *usage* but not token capacity).
+    ///
+    /// A running engine always reports its KV token capacity, so a positive
+    /// `max_total_num_tokens` on any rank marks the absolute-token fields
+    /// (`num_used_tokens`, `dp_rank_loads`, `total_used_tokens`) as
+    /// meaningful. Callers that need absolute tokens — the `/get_loads`
+    /// scalar and the DP-rank load cache — should gate on this so a
+    /// ratio-only snapshot is not read as "0 tokens used".
+    pub fn has_absolute_token_data(&self) -> bool {
+        self.loads.iter().any(|l| l.max_total_num_tokens > 0)
     }
 
     /// Total queued (waiting, uncached) tokens summed across all DP ranks.

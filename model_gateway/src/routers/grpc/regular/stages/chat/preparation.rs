@@ -1,10 +1,10 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
 use std::sync::Arc;
-use llm_multimodal::Modality;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use llm_multimodal::Modality;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ToolChoice, ToolChoiceValue},
@@ -73,7 +73,15 @@ impl ChatPreparationStage {
         // templates insert it per image instead of stripping image parts.  The remaining
         // fields are reused by process_multimodal to avoid duplicate lookups.
         let is_multimodal = multimodal::has_multimodal_content(&request.messages);
-        let (image_placeholder, mm_context) = if is_multimodal {
+        let (image_placeholder, mm_context): (
+            Option<String>,
+            Option<(
+                Arc<multimodal::MultimodalComponents>,
+                String,
+                String,
+                String,
+            )>,
+        ) = if is_multimodal {
             if let Some(mm_components) = ctx.components.multimodal.as_ref() {
                 let model_id = ctx.input.model_id.clone();
                 let entry = ctx
@@ -119,15 +127,13 @@ impl ChatPreparationStage {
                     )
                 })?;
 
-                (
-                    placeholder,
-                    Some((
-                        Arc::clone(mm_components),
-                        model_id,
-                        tokenizer_id,
-                        tokenizer_source,
-                    )),
-                )
+                let mm_context = Some((
+                    Arc::clone(mm_components),
+                    model_id,
+                    tokenizer_id,
+                    tokenizer_source,
+                ));
+                (placeholder, mm_context)
             } else {
                 error!(
                     function = "ChatPreparationStage::execute",
@@ -360,20 +366,17 @@ impl ChatPreparationStage {
             "TITO find_prefix: assistants diagnostic"
         );
 
-        let lookup: PrefixLookup = match store.find_prefix_with_lookup(
-            &session_id,
-            messages,
-            &render_context,
-        ) {
-            Ok(lookup) => lookup,
-            Err(e) => {
-                warn!(session_id = %session_id, error = %e, "TITO find_prefix error");
-                return Err(error::bad_request(
-                    "tito_invalid_appended_messages",
-                    e.to_string(),
-                ));
-            }
-        };
+        let lookup: PrefixLookup =
+            match store.find_prefix_with_lookup(&session_id, messages, &render_context) {
+                Ok(lookup) => lookup,
+                Err(e) => {
+                    warn!(session_id = %session_id, error = %e, "TITO find_prefix error");
+                    return Err(error::bad_request(
+                        "tito_invalid_appended_messages",
+                        e.to_string(),
+                    ));
+                }
+            };
 
         // Stash the running hasher state and parent hash into the TITO context
         // so the response stage can derive the leaf hash by extending this
@@ -396,10 +399,10 @@ impl ChatPreparationStage {
         // The gateway picks `prompt_start` for every turn from the
         // trajectory's RE offset store, so each turn captures only
         // the *new* token positions appended since the previous turn.
-        let re_prompt_start =
-            store.next_routed_experts_prompt_start(&session_id, trajectory_id);
-        ctx.state.partial_rollout_overrides.routed_experts_prompt_start =
-            Some(re_prompt_start);
+        let re_prompt_start = store.next_routed_experts_prompt_start(&session_id, trajectory_id);
+        ctx.state
+            .partial_rollout_overrides
+            .routed_experts_prompt_start = Some(re_prompt_start);
 
         let prefix_match = match lookup.matched {
             Some(pm) => {

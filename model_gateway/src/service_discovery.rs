@@ -92,8 +92,9 @@ pub struct ServiceDiscoveryConfig {
     pub check_interval: Duration,
     pub port: u16,
     pub namespace: Option<String>,
-    // PD mode specific configuration
-    pub pd_mode: bool,
+    // Disaggregated mode specific configuration
+    pub disaggregated_mode: bool,
+    pub encode_selector: HashMap<String, String>,
     pub prefill_selector: HashMap<String, String>,
     pub decode_selector: HashMap<String, String>,
     // Bootstrap port annotation specific to mooncake implementation
@@ -109,14 +110,23 @@ impl ServiceDiscoveryConfig {
     /// Build a label selector string for K8s list calls.
     ///
     /// In regular mode, uses the worker selector directly.
-    /// In PD mode, uses labels common to both prefill and decode selectors
-    /// so a single list call covers both pod types. If there are no common
+    /// In disaggregated mode, uses labels common to role selectors so a single
+    /// list call covers all selected pod types. If there are no common
     /// labels, returns an empty string (no server-side filtering).
     fn list_label_selector(&self) -> String {
-        if self.pd_mode {
-            self.prefill_selector
+        if self.disaggregated_mode {
+            let selectors = self.disaggregated_selectors();
+            let Some(first) = selectors.first() else {
+                return String::new();
+            };
+            first
                 .iter()
-                .filter(|(k, v)| self.decode_selector.get(*k) == Some(*v))
+                .filter(|(k, v)| {
+                    selectors
+                        .iter()
+                        .skip(1)
+                        .all(|selector| selector.get(*k) == Some(*v))
+                })
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -127,6 +137,17 @@ impl ServiceDiscoveryConfig {
                 .collect::<Vec<_>>()
                 .join(",")
         }
+    }
+
+    fn disaggregated_selectors(&self) -> Vec<&HashMap<String, String>> {
+        [
+            &self.encode_selector,
+            &self.prefill_selector,
+            &self.decode_selector,
+        ]
+        .into_iter()
+        .filter(|selector| !selector.is_empty())
+        .collect()
     }
 
     /// Build a label selector string for router pod K8s list/watch calls.
@@ -166,7 +187,8 @@ impl Default for ServiceDiscoveryConfig {
             check_interval: Duration::from_secs(60),
             port: 8000,
             namespace: None,
-            pd_mode: false,
+            disaggregated_mode: false,
+            encode_selector: HashMap::new(),
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -179,6 +201,7 @@ impl Default for ServiceDiscoveryConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PodType {
+    Encode,
     Prefill,
     Decode,
     Regular,
@@ -231,13 +254,15 @@ impl PodInfo {
     }
 
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
-        if config.pd_mode {
-            if config.prefill_selector.is_empty() && config.decode_selector.is_empty() {
-                warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
+        if config.disaggregated_mode {
+            let selectors = config.disaggregated_selectors();
+            if selectors.is_empty() {
+                warn!("Disaggregated mode enabled but all role selectors are empty");
                 return false;
             }
-            Self::matches_selector(pod, &config.prefill_selector)
-                || Self::matches_selector(pod, &config.decode_selector)
+            selectors
+                .iter()
+                .any(|selector| Self::matches_selector(pod, selector))
         } else {
             if config.selector.is_empty() {
                 warn!("Regular mode enabled but selector is empty");
@@ -273,8 +298,10 @@ impl PodInfo {
         let pod_status = status.phase.unwrap_or_else(|| "Unknown".to_string());
 
         let pod_type = if let Some(config) = config {
-            if config.pd_mode {
-                if Self::matches_selector(pod, &config.prefill_selector) {
+            if config.disaggregated_mode {
+                if Self::matches_selector(pod, &config.encode_selector) {
+                    Some(PodType::Encode)
+                } else if Self::matches_selector(pod, &config.prefill_selector) {
                     Some(PodType::Prefill)
                 } else if Self::matches_selector(pod, &config.decode_selector) {
                     Some(PodType::Decode)
@@ -288,7 +315,7 @@ impl PodInfo {
             None
         };
 
-        let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill)) {
+        let bootstrap_port = if matches!(&pod_type, Some(PodType::Encode | PodType::Prefill)) {
             if let Some(config) = config {
                 pod.metadata
                     .annotations
@@ -373,7 +400,14 @@ pub async fn start_service_discovery(
     let client = Client::try_default().await?;
 
     // Log the appropriate selectors based on mode
-    if config.pd_mode {
+    if config.disaggregated_mode {
+        let encode_selector = config
+            .encode_selector
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
         let prefill_selector = config
             .prefill_selector
             .iter()
@@ -389,8 +423,8 @@ pub async fn start_service_discovery(
             .join(",");
 
         info!(
-            "Starting K8s service discovery | PD mode | prefill: '{}' | decode: '{}'",
-            prefill_selector, decode_selector
+            "Starting K8s service discovery | disaggregated mode | encode: '{}' | prefill: '{}' | decode: '{}'",
+            encode_selector, prefill_selector, decode_selector
         );
     } else {
         let label_selector = config
@@ -584,7 +618,7 @@ pub async fn start_service_discovery(
                                     tracked_pods_inner,
                                     app_context_inner,
                                     port,
-                                    config_inner.pd_mode,
+                                    config_inner.disaggregated_mode,
                                 )
                                 .await;
                             }
@@ -626,7 +660,7 @@ async fn handle_pod_event(
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
-    pd_mode: bool,
+    disaggregated_mode: bool,
 ) {
     let worker_url = pod_info.worker_url(port);
 
@@ -686,8 +720,9 @@ async fn handle_pod_event(
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
-            let worker_type = if pd_mode {
+            let worker_type = if disaggregated_mode {
                 match &pod_info.pod_type {
+                    Some(PodType::Encode) => WorkerType::Encode,
                     Some(PodType::Prefill) => WorkerType::Prefill,
                     Some(PodType::Decode) => WorkerType::Decode,
                     _ => WorkerType::Regular,
@@ -696,9 +731,9 @@ async fn handle_pod_event(
                 WorkerType::Regular
             };
 
-            let bootstrap_port = if pd_mode {
+            let bootstrap_port = if disaggregated_mode {
                 match &pod_info.pod_type {
-                    Some(PodType::Prefill) => pod_info.bootstrap_port,
+                    Some(PodType::Encode | PodType::Prefill) => pod_info.bootstrap_port,
                     _ => None,
                 }
             } else {
@@ -1006,7 +1041,7 @@ async fn reconcile_pods(
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            config.pd_mode,
+            config.disaggregated_mode,
         )
         .await;
         let post = tracked_pods.lock().map(|t| t.len()).unwrap_or(0);
@@ -1269,7 +1304,7 @@ mod tests {
         use crate::{
             config::RouterConfig, middleware::TokenBucket,
             observability::inflight_tracker::InFlightRequestTracker,
-            routers::openai::realtime::RealtimeRegistry, worker::WorkerService,
+            routers::common::realtime::RealtimeRegistry, worker::WorkerService,
         };
 
         let router_config = RouterConfig::builder()
@@ -1287,8 +1322,9 @@ mod tests {
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             worker_registry: worker_registry.clone(),
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
+            policy_registry: Arc::new(crate::policies::PolicyRegistry::with_override(
                 router_config.policy.clone(),
+                router_config.routing_key_override.clone(),
             )),
             reasoning_parser_factory: None,
             tool_parser_factory: None,
@@ -1346,7 +1382,8 @@ mod tests {
             check_interval: Duration::from_secs(60),
             port: 8080,
             namespace: None,
-            pd_mode: true,
+            disaggregated_mode: true,
+            encode_selector: HashMap::new(),
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -1354,6 +1391,17 @@ mod tests {
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
         }
+    }
+
+    fn create_epd_config() -> ServiceDiscoveryConfig {
+        let mut config = create_pd_config();
+        config
+            .encode_selector
+            .insert("app".to_string(), "sglang".to_string());
+        config
+            .encode_selector
+            .insert("component".to_string(), "encode".to_string());
+        config
     }
 
     #[test]
@@ -1373,10 +1421,24 @@ mod tests {
         regular_config
             .selector
             .insert("app".to_string(), "sglang".to_string());
-        regular_config.pd_mode = false;
+        regular_config.disaggregated_mode = false;
 
         let regular_pod = create_pd_k8s_pod("worker-pod", "10.0.0.4", "worker", None);
         assert!(PodInfo::should_include(&regular_pod, &regular_config));
+    }
+
+    #[test]
+    fn test_pod_info_should_include_epd_encode_pod() {
+        let config = create_epd_config();
+
+        let encode_pod = create_pd_k8s_pod("encode-pod", "10.0.0.5", "encode", Some(8091));
+        assert!(PodInfo::should_include(&encode_pod, &config));
+
+        let prefill_pod = create_pd_k8s_pod("prefill-pod", "10.0.0.1", "prefill", Some(8081));
+        assert!(PodInfo::should_include(&prefill_pod, &config));
+
+        let decode_pod = create_pd_k8s_pod("decode-pod", "10.0.0.2", "decode", None);
+        assert!(PodInfo::should_include(&decode_pod, &config));
     }
 
     #[test]
@@ -1387,7 +1449,8 @@ mod tests {
         assert_eq!(config.check_interval, Duration::from_secs(60));
         assert_eq!(config.port, 8000);
         assert!(config.namespace.is_none());
-        assert!(!config.pd_mode);
+        assert!(!config.disaggregated_mode);
+        assert!(config.encode_selector.is_empty());
         assert!(config.prefill_selector.is_empty());
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
@@ -1395,10 +1458,12 @@ mod tests {
 
     #[test]
     fn test_pod_type_enum() {
+        let encode = PodType::Encode;
         let prefill = PodType::Prefill;
         let decode = PodType::Decode;
         let regular = PodType::Regular;
 
+        assert_eq!(format!("{encode:?}"), "Encode");
         assert_eq!(format!("{prefill:?}"), "Prefill");
         assert_eq!(format!("{decode:?}"), "Decode");
         assert_eq!(format!("{regular:?}"), "Regular");
@@ -1437,6 +1502,20 @@ mod tests {
     }
 
     #[test]
+    fn test_pod_info_from_pod_with_epd_config_encode() {
+        let k8s_pod = create_pd_k8s_pod("encode-pod", "10.0.0.5", "encode", Some(8091));
+        let config = create_epd_config();
+
+        let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.name, "encode-pod");
+        assert_eq!(pod_info.ip, "10.0.0.5");
+        assert_eq!(pod_info.status, "Running");
+        assert!(pod_info.is_ready);
+        assert_eq!(pod_info.pod_type, Some(PodType::Encode));
+        assert_eq!(pod_info.bootstrap_port, Some(8091));
+    }
+
+    #[test]
     fn test_pod_info_from_pod_with_pd_config_decode() {
         let k8s_pod = create_pd_k8s_pod("decode-pod", "10.0.0.2", "decode", None);
         let config = create_pd_config();
@@ -1454,7 +1533,7 @@ mod tests {
     fn test_pod_info_from_pod_with_pd_config_regular_mode() {
         let k8s_pod = create_pd_k8s_pod("regular-pod", "10.0.0.3", "worker", None);
         let mut config = create_pd_config();
-        config.pd_mode = false;
+        config.disaggregated_mode = false;
 
         let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
         assert_eq!(pod_info.name, "regular-pod");
@@ -1662,7 +1741,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            false, // pd_mode = false
+            false, // disaggregated_mode = false
         )
         .await;
 
@@ -1721,7 +1800,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true for PD pod
+            true, // disaggregated_mode = true for PD pod
         )
         .await;
 
@@ -1756,7 +1835,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true for PD pod
+            true, // disaggregated_mode = true for PD pod
         )
         .await;
 
@@ -1860,12 +1939,12 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            false, // pd_mode = false
+            false, // disaggregated_mode = false
         )
         .await;
 
         // With fully async control plane, pod is tracked and job is queued
-        // In regular mode (pd_mode=false), worker_type defaults to Regular
+        // In regular mode (disaggregated_mode=false), worker_type defaults to Regular
         // Worker registration and validation happen in background job
         assert!(tracked_pods.lock().unwrap().contains(&pod_info));
 
@@ -1896,7 +1975,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true
+            true, // disaggregated_mode = true
         )
         .await;
 
@@ -2145,7 +2224,7 @@ mod tests {
         ServiceDiscoveryConfig {
             enabled: true,
             selector,
-            pd_mode: false,
+            disaggregated_mode: false,
             ..Default::default()
         }
     }
@@ -2507,7 +2586,7 @@ mod tests {
         selector.insert("app".to_string(), "sglang".to_string());
         let config = ServiceDiscoveryConfig {
             selector,
-            pd_mode: false,
+            disaggregated_mode: false,
             ..Default::default()
         };
         assert_eq!(config.list_label_selector(), "app=sglang");
@@ -2522,12 +2601,19 @@ mod tests {
         decode.insert("app".to_string(), "sglang".to_string());
         decode.insert("component".to_string(), "decode".to_string());
         let config = ServiceDiscoveryConfig {
-            pd_mode: true,
+            disaggregated_mode: true,
             prefill_selector: prefill,
             decode_selector: decode,
             ..Default::default()
         };
         // Only the common label "app=sglang" should be in the selector.
+        assert_eq!(config.list_label_selector(), "app=sglang");
+    }
+
+    #[test]
+    fn test_list_label_selector_epd_mode_common_labels() {
+        let config = create_epd_config();
+
         assert_eq!(config.list_label_selector(), "app=sglang");
     }
 
@@ -2538,7 +2624,7 @@ mod tests {
         let mut decode = HashMap::new();
         decode.insert("role".to_string(), "decode".to_string());
         let config = ServiceDiscoveryConfig {
-            pd_mode: true,
+            disaggregated_mode: true,
             prefill_selector: prefill,
             decode_selector: decode,
             ..Default::default()
@@ -2571,7 +2657,7 @@ mod tests {
         selector.insert("app".to_string(), "sglang".to_string());
         let config = ServiceDiscoveryConfig {
             selector,
-            pd_mode: false,
+            disaggregated_mode: false,
             ..Default::default()
         };
         let watcher_config = build_watcher_config("worker", &config.list_label_selector());
@@ -2587,11 +2673,19 @@ mod tests {
         decode.insert("app".to_string(), "sglang".to_string());
         decode.insert("component".to_string(), "decode".to_string());
         let config = ServiceDiscoveryConfig {
-            pd_mode: true,
+            disaggregated_mode: true,
             prefill_selector: prefill,
             decode_selector: decode,
             ..Default::default()
         };
+        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
+        assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
+    }
+
+    #[test]
+    fn test_build_watcher_config_for_epd_mode_pushes_intersection() {
+        let config = create_epd_config();
+
         let watcher_config = build_watcher_config("worker", &config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }
@@ -2603,7 +2697,7 @@ mod tests {
         let mut decode = HashMap::new();
         decode.insert("role".to_string(), "decode".to_string());
         let config = ServiceDiscoveryConfig {
-            pd_mode: true,
+            disaggregated_mode: true,
             prefill_selector: prefill,
             decode_selector: decode,
             ..Default::default()

@@ -4,9 +4,23 @@
 //! supported backend, allowing the router to work with any backend
 //! transparently.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs::{read_dir, remove_file, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    process,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use futures_util::StreamExt;
+use memmap2::MmapOptions;
+#[cfg(target_os = "linux")]
+use rustix::fs::FallocateFlags;
 use smg_grpc_client::{
     mlx_engine::AbortOnDropStream as MlxStream,
     mlx_proto::{self as mlx},
@@ -21,6 +35,17 @@ use smg_grpc_client::{
     vllm_engine::AbortOnDropStream as VllmStream,
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
 };
+
+/// Backend-neutral encode->prefill bootstrap info for one multimodal item.
+///
+/// Backend wrappers translate this into their own proto shape when supported.
+#[derive(Clone, Debug)]
+pub(crate) struct EncodeItemBootstrapInfo {
+    pub item_index: u32,
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+    pub bootstrap_room: i64,
+}
 
 // =====================
 // Multimodal Data
@@ -75,18 +100,20 @@ pub struct TrtllmMultimodalData {
     pub image_data: Vec<Vec<u8>>,
 }
 
-/// TokenSpeed multimodal data: preprocessed tensors with patch-only placeholders.
+/// TokenSpeed multimodal data: preprocessed encoder input with patch-only placeholders.
 #[derive(Debug)]
 pub struct TokenSpeedMultimodalData {
     pub items: Vec<TokenSpeedMultimodalItem>,
+    /// Resolved per-request decision: may large multimodal tensors use the SHM
+    /// transport? Computed upstream from the transport mode and (for `auto`)
+    /// worker locality, so `into_proto` does not re-read the environment.
+    pub shm_enabled: bool,
 }
 
 #[derive(Debug)]
 pub struct TokenSpeedMultimodalItem {
     pub modality: TokenSpeedModality,
-    pub encoder_input: Vec<u8>,
-    pub encoder_input_shape: Vec<u32>,
-    pub encoder_input_dtype: String,
+    pub encoder_input: TokenSpeedTensor,
     pub model_specific_tensors: HashMap<String, TensorBytes>,
     pub placeholder_token_id: Option<u32>,
     pub mm_placeholders: Vec<(u32, u32)>,
@@ -106,6 +133,47 @@ pub struct TensorBytes {
     pub data: Vec<u8>,
     pub shape: Vec<u32>,
     pub dtype: String,
+}
+
+/// TokenSpeed tensor with storage that can be either inline bytes or an
+/// already-published SHM handle. The latter lets SMG serialize large encoder
+/// inputs directly into SHM instead of building a temporary Vec<u8> first.
+#[derive(Debug, Clone)]
+pub struct TokenSpeedTensor {
+    pub storage: TokenSpeedTensorStorage,
+    pub shape: Vec<u32>,
+    pub dtype: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum TokenSpeedTensorStorage {
+    Inline(Vec<u8>),
+    Shm(tokenspeed::ShmHandle),
+}
+
+impl TokenSpeedTensor {
+    pub fn inline(data: Vec<u8>, shape: Vec<u32>, dtype: String) -> Self {
+        Self {
+            storage: TokenSpeedTensorStorage::Inline(data),
+            shape,
+            dtype,
+        }
+    }
+
+    pub fn shm(handle: tokenspeed::ShmHandle, shape: Vec<u32>, dtype: String) -> Self {
+        Self {
+            storage: TokenSpeedTensorStorage::Shm(handle),
+            shape,
+            dtype,
+        }
+    }
+
+    pub fn nbytes(&self) -> usize {
+        match &self.storage {
+            TokenSpeedTensorStorage::Inline(data) => data.len(),
+            TokenSpeedTensorStorage::Shm(handle) => handle.nbytes as usize,
+        }
+    }
 }
 
 impl SglangMultimodalData {
@@ -203,19 +271,21 @@ impl TrtllmMultimodalData {
 }
 
 impl TokenSpeedMultimodalData {
-    /// Convert to TokenSpeed proto MultimodalInputs.
+    /// Convert to TokenSpeed proto MultimodalInputs. The EPD prefill leg drops
+    /// each item's encoder_input afterward via `clear_mm_pixel_values`.
     pub fn into_proto(self) -> tokenspeed::MultimodalInputs {
+        let shm_enabled = self.shm_enabled;
         let items = self
             .items
             .into_iter()
-            .map(TokenSpeedMultimodalItem::into_proto)
+            .map(|item| item.into_proto(shm_enabled))
             .collect();
         tokenspeed::MultimodalInputs { items }
     }
 }
 
 impl TokenSpeedMultimodalItem {
-    fn into_proto(self) -> tokenspeed::MultimodalItem {
+    fn into_proto(self, shm_enabled: bool) -> tokenspeed::MultimodalItem {
         let placeholders = self
             .mm_placeholders
             .into_iter()
@@ -225,8 +295,10 @@ impl TokenSpeedMultimodalItem {
         let model_specific_tensors = self
             .model_specific_tensors
             .into_iter()
-            .map(|(k, v)| (k, tensor_bytes_to_tokenspeed(v)))
+            .map(|(k, v)| (k, tensor_bytes_to_tokenspeed(v, shm_enabled)))
             .collect::<HashMap<_, _>>();
+
+        let encoder_input = Some(tokenspeed_tensor_to_proto(self.encoder_input, shm_enabled));
 
         tokenspeed::MultimodalItem {
             modality: match self.modality {
@@ -235,11 +307,7 @@ impl TokenSpeedMultimodalItem {
                 TokenSpeedModality::Video => tokenspeed::Modality::Video as i32,
             },
             content_hash: self.content_hash,
-            encoder_input: Some(tensor_bytes_to_tokenspeed(TensorBytes {
-                data: self.encoder_input,
-                shape: self.encoder_input_shape,
-                dtype: self.encoder_input_dtype,
-            })),
+            encoder_input,
             model_specific_tensors,
             placeholders,
             placeholder_token_id: self.placeholder_token_id,
@@ -247,13 +315,427 @@ impl TokenSpeedMultimodalItem {
     }
 }
 
-fn tensor_bytes_to_tokenspeed(value: TensorBytes) -> tokenspeed::TensorData {
-    let data = value.data;
+fn tokenspeed_tensor_to_proto(
+    value: TokenSpeedTensor,
+    shm_enabled: bool,
+) -> tokenspeed::TensorData {
+    use crate::observability::metrics::Metrics;
+    let TokenSpeedTensor {
+        storage,
+        shape,
+        dtype,
+    } = value;
+    let payload = match storage {
+        // Inline storage is metered inside tokenspeed_tensor_payload.
+        TokenSpeedTensorStorage::Inline(data) => tokenspeed_tensor_payload(data, shm_enabled),
+        // Encoder input already written directly to SHM upstream — meter it here.
+        TokenSpeedTensorStorage::Shm(handle) => {
+            Metrics::record_mm_tensor("tokenspeed", "shm", handle.nbytes as usize);
+            tokenspeed::tensor_data::Payload::Shm(handle)
+        }
+    };
+
     tokenspeed::TensorData {
-        shape: value.shape,
-        dtype: value.dtype,
-        payload: Some(tokenspeed::tensor_data::Payload::Inline(data)),
+        shape,
+        dtype,
+        payload: Some(payload),
     }
+}
+
+fn tensor_bytes_to_tokenspeed(value: TensorBytes, shm_enabled: bool) -> tokenspeed::TensorData {
+    let TensorBytes { data, shape, dtype } = value;
+
+    tokenspeed::TensorData {
+        shape,
+        dtype,
+        payload: Some(tokenspeed_tensor_payload(data, shm_enabled)),
+    }
+}
+
+fn tokenspeed_tensor_payload(data: Vec<u8>, shm_enabled: bool) -> tokenspeed::tensor_data::Payload {
+    use crate::observability::metrics::Metrics;
+    let log_timing = log_tokenspeed_mm_timing_enabled();
+    let nbytes = data.len();
+    if !shm_enabled {
+        if log_timing {
+            tracing::info!(nbytes, "smg_mm_timing tokenspeed_tensor_payload_inline");
+        }
+        Metrics::record_mm_tensor("tokenspeed", "inline", nbytes);
+        return tokenspeed::tensor_data::Payload::Inline(data);
+    }
+
+    let min_bytes = tokenspeed_mm_shm_min_bytes();
+    if nbytes < min_bytes {
+        if log_timing {
+            tracing::info!(
+                nbytes,
+                min_bytes,
+                "smg_mm_timing tokenspeed_tensor_payload_inline_below_threshold"
+            );
+        }
+        Metrics::record_mm_tensor("tokenspeed", "inline", nbytes);
+        return tokenspeed::tensor_data::Payload::Inline(data);
+    }
+
+    let started = Instant::now();
+    match write_tokenspeed_shm(&data) {
+        Ok(handle) => {
+            if log_timing {
+                tracing::info!(
+                    nbytes,
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "smg_mm_timing tokenspeed_shm_write"
+                );
+            }
+            Metrics::record_mm_tensor("tokenspeed", "shm", nbytes);
+            tokenspeed::tensor_data::Payload::Shm(handle)
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                nbytes,
+                "Failed to create TokenSpeed SHM tensor payload; falling back to inline"
+            );
+            Metrics::record_mm_shm_write_failure("tokenspeed");
+            Metrics::record_mm_tensor("tokenspeed", "inline", nbytes);
+            tokenspeed::tensor_data::Payload::Inline(data)
+        }
+    }
+}
+
+fn log_tokenspeed_mm_timing_enabled() -> bool {
+    std::env::var("SMG_LOG_MM_TIMING")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Multimodal tensor transport mode for the TokenSpeed backend.
+///
+/// This only governs multimodal tensor payloads (encoder inputs and
+/// model-specific tensors); prompt `input_ids` are always sent inline. Set via
+/// `SMG_TOKENSPEED_MM_TENSOR_TRANSPORT`.
+pub fn tokenspeed_mm_tensor_transport_mode() -> String {
+    std::env::var("SMG_TOKENSPEED_MM_TENSOR_TRANSPORT")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Minimum multimodal tensor size (bytes) before the SHM transport is used.
+/// Set via `SMG_TOKENSPEED_MM_SHM_MIN_BYTES`. Defaults to 64 KiB.
+pub fn tokenspeed_mm_shm_min_bytes() -> usize {
+    std::env::var("SMG_TOKENSPEED_MM_SHM_MIN_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64 * 1024)
+}
+
+static TOKENSPEED_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn write_tokenspeed_shm(data: &[u8]) -> std::io::Result<tokenspeed::ShmHandle> {
+    write_tokenspeed_shm_with(data.len(), |output| {
+        output.copy_from_slice(data);
+        Ok(())
+    })
+}
+
+/// Whether SMG can actually create+write files under `/dev/shm`. Probed once;
+/// when false the SHM transport cannot work, so `auto`/`shm` must stay inline.
+pub fn tokenspeed_shm_dev_writable() -> bool {
+    static WRITABLE: OnceLock<bool> = OnceLock::new();
+    *WRITABLE.get_or_init(|| {
+        let name = format!("smg-tokenspeed-probe-{}", process::id());
+        let path = tokenspeed_shm_path(&name);
+        // `create_new` (no clobber) + owner-only mode: /dev/shm is world-writable,
+        // so plain create(truncate) is open to symlink/clobber attacks and the
+        // file would otherwise inherit umask and be world-readable.
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let ok = opts
+            .open(&path)
+            .and_then(|mut file| file.write_all(b"x"))
+            .is_ok();
+        let _ = remove_file(&path);
+        if !ok {
+            tracing::warn!(
+                path = %path.display(),
+                "/dev/shm is not writable; TokenSpeed SHM tensor transport will fall back to inline"
+            );
+        }
+        ok
+    })
+}
+
+/// Best-effort, run-once sweep of `/dev/shm` for TokenSpeed payload files left
+/// behind by a *previous* SMG process that crashed between writing a segment and
+/// the consumer unlinking it. Files are named `smg-tokenspeed-<pid>-...`; we only
+/// remove those whose producer pid is no longer alive (and never our own).
+fn sweep_orphan_tokenspeed_shm_once() {
+    static SWEEP: OnceLock<()> = OnceLock::new();
+    SWEEP.get_or_init(|| {
+        let dir = Path::new("/dev/shm");
+        let Ok(entries) = read_dir(dir) else {
+            return;
+        };
+        let my_pid = process::id();
+        let mut removed = 0u32;
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix("smg-tokenspeed-") else {
+                continue;
+            };
+            // pid is the first '-'-separated field after the prefix.
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            // Skip our own files and any still-live producer (pid recycling is a
+            // safe miss: we just keep the file rather than risk deleting a live one).
+            if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
+                continue;
+            }
+            if remove_file(dir.join(name)).is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::warn!(
+                count = removed,
+                "Swept orphaned TokenSpeed SHM files from dead producer processes"
+            );
+        }
+    });
+}
+
+// TODO: pack all of a request's tensors (encoder_input + model_specific) into
+// ONE /dev/shm segment at running offsets instead of one file per tensor
+// (ShmHandle.offset already exists, always 0 here). Needs consumer
+// ShmTensorHandle offset support + a per-segment refcount so the segment is
+// unlinked exactly once after all its tensors are consumed. Cleanliness / fewer
+// files, not a measured speed win (tmpfs makes per-file syscalls negligible).
+#[expect(
+    unsafe_code,
+    reason = "mapping a new, exclusively owned, fixed-length SHM file"
+)]
+pub fn write_tokenspeed_shm_with(
+    nbytes: usize,
+    write_fn: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+) -> std::io::Result<tokenspeed::ShmHandle> {
+    sweep_orphan_tokenspeed_shm_once();
+    let name = next_tokenspeed_shm_name();
+    let path = tokenspeed_shm_path(&name);
+    // create_new (no clobber) + owner-only mode in world-writable /dev/shm.
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&path)?;
+    let result = if nbytes == 0 {
+        write_fn(&mut [])
+    } else {
+        reserve_tokenspeed_shm_file(&file, nbytes).and_then(|()| {
+            // SAFETY: this process exclusively owns the newly created file,
+            // reserves its full length before mapping, and does not expose or
+            // truncate it until the callback and mapping have both dropped.
+            let mut mapping = unsafe { MmapOptions::new().len(nbytes).map_mut(&file)? };
+            write_fn(&mut mapping)
+        })
+    };
+    if let Err(error) = result {
+        let _ = remove_file(&path);
+        return Err(error);
+    }
+
+    Ok(tokenspeed::ShmHandle {
+        name,
+        offset: 0,
+        nbytes: nbytes as u64,
+        owner_id: format!("smg:{}", process::id()),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_tokenspeed_shm_file(file: &std::fs::File, nbytes: usize) -> std::io::Result<()> {
+    match rustix::fs::fallocate(file, FallocateFlags::empty(), 0, nbytes as u64) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error == rustix::io::Errno::OPNOTSUPP || error == rustix::io::Errno::NOSYS =>
+        {
+            file.set_len(nbytes as u64)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reserve_tokenspeed_shm_file(file: &std::fs::File, nbytes: usize) -> std::io::Result<()> {
+    file.set_len(nbytes as u64)
+}
+
+pub fn collect_tokenspeed_multimodal_inputs_shm_handles(
+    inputs: &tokenspeed::MultimodalInputs,
+) -> Vec<tokenspeed::ShmHandle> {
+    let mut handles = Vec::new();
+    for item in &inputs.items {
+        collect_optional_tokenspeed_tensor_shm_handles(item.encoder_input.as_ref(), &mut handles);
+        for tensor in item.model_specific_tensors.values() {
+            collect_tokenspeed_tensor_shm_handles(tensor, &mut handles);
+        }
+    }
+    handles
+}
+
+pub fn collect_tokenspeed_generate_request_shm_handles(
+    request: &tokenspeed::GenerateRequest,
+) -> Vec<tokenspeed::ShmHandle> {
+    request
+        .mm_inputs
+        .as_ref()
+        .map(collect_tokenspeed_multimodal_inputs_shm_handles)
+        .unwrap_or_default()
+}
+
+pub fn cleanup_tokenspeed_shm_handles(handles: &[tokenspeed::ShmHandle]) {
+    for handle in handles {
+        let Some(name) = validate_tokenspeed_shm_name_for_cleanup(&handle.name) else {
+            tracing::warn!(
+                name = %handle.name,
+                "Skipping cleanup for invalid TokenSpeed SHM name"
+            );
+            continue;
+        };
+        let path = tokenspeed_shm_path(name);
+        match remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    path = %path.display(),
+                    "Failed to cleanup TokenSpeed SHM file"
+                );
+            }
+        }
+    }
+}
+
+/// Build a TokenSpeed proto `GenerateRequest` from the already-converted
+/// multimodal proto, unlinking any `/dev/shm` segments it references if `build`
+/// fails — so a build error doesn't leak SHM files before the send-path cleanup
+/// can run. Keeping this engine-specific SHM lifecycle in the protocol layer
+/// lets the per-engine dispatch in `client.rs` stay a thin, neutral wrapper.
+pub(crate) fn finish_tokenspeed_request(
+    tokenspeed_mm: Option<tokenspeed::MultimodalInputs>,
+    build: impl FnOnce(
+        Option<tokenspeed::MultimodalInputs>,
+    ) -> Result<tokenspeed::GenerateRequest, String>,
+) -> Result<ProtoGenerateRequest, String> {
+    let shm_handles = tokenspeed_mm
+        .as_ref()
+        .map(collect_tokenspeed_multimodal_inputs_shm_handles)
+        .unwrap_or_default();
+    match build(tokenspeed_mm) {
+        Ok(req) => Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req))),
+        Err(error) => {
+            cleanup_tokenspeed_shm_handles(&shm_handles);
+            Err(error)
+        }
+    }
+}
+
+/// Unlink the `/dev/shm` segments backing the encoder inputs of intermediate
+/// `items` (plus an optional just-built `pending` tensor that hasn't been pushed
+/// yet). Used when multimodal assembly aborts partway: the successfully built
+/// `TokenSpeedTensor::Shm` segments would otherwise be dropped without their
+/// handles ever reaching the send-path cleanup hooks, leaking files until the
+/// next process sweep. Only the encoder input uses SHM (model-specific tensors
+/// stay inline). MUST run on the error path only — the success path keeps the
+/// files alive for the worker and unlinks them after the RPC.
+pub(crate) fn cleanup_tokenspeed_items_encoder_shm(
+    items: &[TokenSpeedMultimodalItem],
+    pending: Option<&TokenSpeedTensor>,
+) {
+    let mut handles = Vec::new();
+    let mut push = |tensor: &TokenSpeedTensor| {
+        if let TokenSpeedTensorStorage::Shm(handle) = &tensor.storage {
+            handles.push(handle.clone());
+        }
+    };
+    for item in items {
+        push(&item.encoder_input);
+    }
+    if let Some(tensor) = pending {
+        push(tensor);
+    }
+    if !handles.is_empty() {
+        cleanup_tokenspeed_shm_handles(&handles);
+    }
+}
+
+fn collect_optional_tokenspeed_tensor_shm_handles(
+    tensor: Option<&tokenspeed::TensorData>,
+    handles: &mut Vec<tokenspeed::ShmHandle>,
+) {
+    let Some(tensor) = tensor else {
+        return;
+    };
+    collect_tokenspeed_tensor_shm_handles(tensor, handles);
+}
+
+fn collect_tokenspeed_tensor_shm_handles(
+    tensor: &tokenspeed::TensorData,
+    handles: &mut Vec<tokenspeed::ShmHandle>,
+) {
+    if let Some(tokenspeed::tensor_data::Payload::Shm(handle)) = &tensor.payload {
+        handles.push(handle.clone());
+    }
+}
+
+/// Prefix for every `/dev/shm` payload this transport creates
+/// (see [`next_tokenspeed_shm_name`]). Cleanup only ever unlinks names
+/// carrying this prefix so it cannot remove unrelated `/dev/shm` entries.
+const TOKENSPEED_SHM_NAME_PREFIX: &str = "smg-tokenspeed-";
+
+fn validate_tokenspeed_shm_name_for_cleanup(name: &str) -> Option<&str> {
+    let name = name.strip_prefix('/').unwrap_or(name);
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." || name.contains('\0') {
+        return None;
+    }
+    // Only unlink names this transport created; never touch arbitrary
+    // top-level /dev/shm entries.
+    if !name.starts_with(TOKENSPEED_SHM_NAME_PREFIX) {
+        return None;
+    }
+    Some(name)
+}
+
+fn next_tokenspeed_shm_name() -> String {
+    let seq = TOKENSPEED_SHM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{}{}-{}-{}",
+        TOKENSPEED_SHM_NAME_PREFIX,
+        process::id(),
+        nanos,
+        seq
+    )
+}
+
+fn tokenspeed_shm_path(name: &str) -> PathBuf {
+    PathBuf::from("/dev/shm").join(name)
 }
 
 // =====================
@@ -414,9 +896,7 @@ impl ProtoRoutedExperts {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RoutedExpertsError {
-    #[error(
-        "routed_experts shape mismatch: accumulator={accumulator:?}, segment={segment:?}"
-    )]
+    #[error("routed_experts shape mismatch: accumulator={accumulator:?}, segment={segment:?}")]
     ShapeMismatch {
         accumulator: ProtoRoutedExpertsShape,
         segment: ProtoRoutedExpertsShape,
@@ -747,17 +1227,21 @@ impl ProtoGenerateRequest {
         self.clone()
     }
 
-    /// Strip multimodal inputs from the request.
+    /// Drop raw multimodal encoder tensors while keeping item metadata.
     ///
-    /// Used for the decode worker in PD disaggregation — the decode worker only
-    /// needs the KV cache from prefill, not the image pixel data. This avoids
-    /// transmitting ~40MB of pixel tensors to a worker that ignores them.
-    pub fn clear_mm_inputs(&mut self) {
+    /// Used by the EPD prefill leg: image embeddings arrive from encode workers,
+    /// but prefill still needs placeholders/model-specific metadata to slot them.
+    pub fn clear_mm_pixel_values(&mut self) {
         match self {
             Self::Sglang(req) => req.mm_inputs = None,
             Self::Vllm(req) => req.mm_inputs = None,
-            Self::TokenSpeed(req) => req.mm_inputs = None,
-            // TRT-LLM and MLX protos have no mm_inputs field
+            Self::TokenSpeed(req) => {
+                if let Some(mm) = req.mm_inputs.as_mut() {
+                    for item in &mut mm.items {
+                        item.encoder_input = None;
+                    }
+                }
+            }
             Self::Trtllm(_) | Self::Mlx(_) => {}
         }
     }
@@ -818,6 +1302,64 @@ impl ProtoGenerateRequest {
             Self::Vllm(req) => req.kv_transfer_params_json = Some(json),
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 tracing::warn!("set_kv_transfer_params_json called on non-vLLM request, ignoring");
+            }
+        }
+    }
+
+    /// Set encode->prefill bootstrap info for backends that receive image embeddings
+    /// out-of-band from encode workers.
+    pub(crate) fn set_encode_bootstrap_info(&mut self, items: Vec<EncodeItemBootstrapInfo>) {
+        match self {
+            Self::TokenSpeed(req) => {
+                let items = items
+                    .into_iter()
+                    .map(|item| tokenspeed::EncodeItemBootstrapInfo {
+                        item_index: item.item_index,
+                        bootstrap_host: item.bootstrap_host,
+                        bootstrap_port: item.bootstrap_port,
+                        bootstrap_room: item.bootstrap_room,
+                    })
+                    .collect();
+                req.encode_bootstrap_info = Some(tokenspeed::EncodeBootstrapInfo { items });
+            }
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {
+                tracing::warn!(
+                    "set_encode_bootstrap_info called on a backend without encode bootstrap info, ignoring"
+                );
+            }
+        }
+    }
+
+    /// Clear prefill-only encode bootstrap info from the decode-side request.
+    pub(crate) fn clear_encode_bootstrap_info(&mut self) {
+        match self {
+            Self::TokenSpeed(req) => req.encode_bootstrap_info = None,
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
+        }
+    }
+
+    /// Set the PD prefill->decode KV rendezvous params (TokenSpeed only).
+    ///
+    /// The gateway sends identical params to both the prefill and decode worker:
+    /// the prefill hosts the Mooncake bootstrap server at (`bootstrap_host`,
+    /// `bootstrap_port`) and the decode worker discovers it there, keyed by
+    /// `bootstrap_room`.
+    pub fn set_kv_bootstrap_info(
+        &mut self,
+        bootstrap_host: String,
+        bootstrap_port: i32,
+        bootstrap_room: i64,
+    ) {
+        match self {
+            Self::TokenSpeed(req) => {
+                req.kv_bootstrap_info = Some(tokenspeed::KvBootstrapInfo {
+                    bootstrap_host,
+                    bootstrap_port,
+                    bootstrap_room,
+                });
+            }
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {
+                tracing::warn!("set_kv_bootstrap_info called on non-TokenSpeed request, ignoring");
             }
         }
     }
@@ -1058,6 +1600,14 @@ impl ProtoGenerateStreamChunk {
             Self::Trtllm(c) => c.cached_tokens,
             Self::Mlx(c) => c.cached_tokens,
             Self::TokenSpeed(c) => c.cached_tokens,
+        }
+    }
+
+    /// Get reasoning tokens (cumulative).
+    pub fn reasoning_tokens(&self) -> u32 {
+        match self {
+            Self::Sglang(c) => c.reasoning_tokens,
+            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
         }
     }
 }
@@ -1396,7 +1946,10 @@ impl ProtoGenerateComplete {
     /// Get routed experts
     pub fn routed_experts(&self) -> Option<ProtoRoutedExperts> {
         match self {
-            Self::Vllm(c) => c.routed_experts.as_ref().and_then(ProtoRoutedExperts::from_proto),
+            Self::Vllm(c) => c
+                .routed_experts
+                .as_ref()
+                .and_then(ProtoRoutedExperts::from_proto),
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
@@ -1416,6 +1969,14 @@ impl ProtoGenerateComplete {
             Self::Trtllm(c) => c.cached_tokens,
             Self::Mlx(c) => c.cached_tokens,
             Self::TokenSpeed(c) => c.cached_tokens,
+        }
+    }
+
+    /// Get reasoning tokens.
+    pub fn reasoning_tokens(&self) -> u32 {
+        match self {
+            Self::Sglang(c) => c.reasoning_tokens,
+            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
         }
     }
 
@@ -1665,14 +2226,17 @@ mod tests {
         let proto = TokenSpeedMultimodalData {
             items: vec![TokenSpeedMultimodalItem {
                 modality: TokenSpeedModality::Image,
-                encoder_input: vec![42; 8],
-                encoder_input_shape: vec![1, 2],
-                encoder_input_dtype: "float32".to_string(),
+                encoder_input: TokenSpeedTensor::inline(
+                    vec![42; 8],
+                    vec![1, 2],
+                    "float32".to_string(),
+                ),
                 model_specific_tensors,
                 placeholder_token_id: Some(151655),
                 mm_placeholders: vec![(4, 2)],
                 content_hash: vec![7; 32],
             }],
+            shm_enabled: false,
         }
         .into_proto();
 
@@ -1704,14 +2268,17 @@ mod tests {
         let proto = TokenSpeedMultimodalData {
             items: vec![TokenSpeedMultimodalItem {
                 modality: TokenSpeedModality::Video,
-                encoder_input: vec![42; 8],
-                encoder_input_shape: vec![1, 2],
-                encoder_input_dtype: "float32".to_string(),
+                encoder_input: TokenSpeedTensor::inline(
+                    vec![42; 8],
+                    vec![1, 2],
+                    "float32".to_string(),
+                ),
                 model_specific_tensors,
                 placeholder_token_id: Some(151656),
                 mm_placeholders: vec![(4, 2)],
                 content_hash: vec![7; 32],
             }],
+            shm_enabled: false,
         }
         .into_proto();
 
@@ -1730,11 +2297,14 @@ mod tests {
 
     #[test]
     fn tokenspeed_tensor_data_uses_clean_payload_tags() {
-        let tensor = tensor_bytes_to_tokenspeed(TensorBytes {
-            data: vec![0xaa, 0xbb],
-            shape: vec![2, 3],
-            dtype: "uint32".to_string(),
-        });
+        let tensor = tensor_bytes_to_tokenspeed(
+            TensorBytes {
+                data: vec![0xaa, 0xbb],
+                shape: vec![2, 3],
+                dtype: "uint32".to_string(),
+            },
+            false,
+        );
 
         assert_eq!(
             tensor.encode_to_vec(),
@@ -1744,6 +2314,58 @@ mod tests {
                 0x1a, 0x02, 0xaa, 0xbb, // inline = 3
             ]
         );
+    }
+
+    #[test]
+    fn tokenspeed_shm_encoder_input_into_proto_uses_shm_payload() {
+        let proto = TokenSpeedMultimodalData {
+            items: vec![TokenSpeedMultimodalItem {
+                modality: TokenSpeedModality::Image,
+                encoder_input: TokenSpeedTensor::shm(
+                    tokenspeed::ShmHandle {
+                        name: "smg-test-shm".to_string(),
+                        offset: 0,
+                        nbytes: 8,
+                        owner_id: "smg:test".to_string(),
+                    },
+                    vec![1, 2],
+                    "bfloat16".to_string(),
+                ),
+                model_specific_tensors: HashMap::new(),
+                placeholder_token_id: Some(151655),
+                mm_placeholders: vec![(4, 2)],
+                content_hash: vec![7; 32],
+            }],
+            shm_enabled: true,
+        }
+        .into_proto();
+
+        let tensor = proto.items[0].encoder_input.as_ref().unwrap();
+        assert_eq!(tensor.shape, vec![1, 2]);
+        assert_eq!(tensor.dtype, "bfloat16");
+        match tensor.payload.as_ref() {
+            Some(tokenspeed::tensor_data::Payload::Shm(handle)) => {
+                assert_eq!(handle.name, "smg-test-shm");
+                assert_eq!(handle.nbytes, 8);
+            }
+            _ => panic!("expected shm TensorData payload"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn tokenspeed_shm_writer_exposes_complete_mapped_payload() {
+        let expected = [0x12, 0x34, 0x56, 0x78];
+        let handle = write_tokenspeed_shm_with(expected.len(), |output| {
+            output.copy_from_slice(&expected);
+            Ok(())
+        })
+        .unwrap();
+        let payload = std::fs::read(tokenspeed_shm_path(&handle.name));
+        cleanup_tokenspeed_shm_handles(std::slice::from_ref(&handle));
+
+        assert_eq!(payload.unwrap(), expected);
+        assert!(!tokenspeed_shm_path(&handle.name).exists());
     }
 
     fn inline_tensor_data(tensor: &tokenspeed::TensorData) -> &[u8] {

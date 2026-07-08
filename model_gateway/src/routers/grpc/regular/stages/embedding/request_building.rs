@@ -10,8 +10,8 @@ use crate::routers::{
     grpc::{
         client::GrpcClient,
         common::stages::PipelineStage,
-        context::{RequestContext, RequestType},
-        proto_wrapper::{ProtoEmbedRequest, ProtoRequest},
+        context::{ExecutionPlan, RequestContext, RequestType},
+        proto_wrapper::ProtoEmbedRequest,
     },
 };
 
@@ -96,9 +96,19 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
                     "MLX embedding is not supported via gRPC",
                 ));
             }
+            GrpcClient::TokenSpeed(_) => {
+                error!(
+                    function = "EmbeddingRequestBuildingStage::execute",
+                    "TokenSpeed embedding not supported"
+                );
+                return Err(error::not_implemented(
+                    "unsupported_backend",
+                    "TokenSpeed embedding is not supported via gRPC",
+                ));
+            }
         };
 
-        ctx.state.proto_request = Some(ProtoRequest::Embed(proto_req));
+        ctx.state.execution_plan = Some(ExecutionPlan::embed(proto_req));
         Ok(None)
     }
 

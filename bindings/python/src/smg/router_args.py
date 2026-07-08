@@ -52,6 +52,7 @@ class RouterArgs:
     request_budget: int = 1024  # KV-cache page size in tokens for throughput_optimal policy
     max_num_waiting_reqs_after_preemption: int = 1000  # Max waiting requests after preemption for throughput_optimal policy
     dp_aware: bool = False
+    routing_key_override: bool = False
     dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     connection_mode: str | None = None # Connection mode: http or grpc (only effective in non-IGW mode)
@@ -512,6 +513,11 @@ class RouterArgs:
             f"--{prefix}dp-aware",
             action="store_true",
             help="Enable data parallelism aware schedule",
+        )
+        routing_group.add_argument(
+            f"--{prefix}routing-key-override",
+            action="store_true",
+            help="Honor X-SMG-Routing-Key for sticky routing on any policy",
         )
         routing_group.add_argument(
             f"--{prefix}dp-minimum-tokens-scheduler",

@@ -15,11 +15,12 @@ use tracing::{debug, info, warn};
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     BucketPolicy, CacheAwarePolicy, CacheAwareV1Policy, DPRankLoadPolicy, LoadBalancingPolicy,
-    PolicyFactory,
+    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo,
 };
 use crate::{
-    config::types::PolicyConfig,
+    config::types::{PolicyConfig, RoutingKeyOverrideConfig},
     policies::cache_aware::LoadReceiver,
+    routers::common::header_utils::extract_routing_key,
     worker::{KvEventMonitor, Worker},
 };
 
@@ -41,6 +42,9 @@ pub struct PolicyRegistry {
     /// Decode policy for PD mode (set once at startup, lock-free reads via OnceLock)
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
+    /// Encode policy for EPD mode (set once at startup, lock-free reads via OnceLock)
+    encode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
+
     /// Optional KV event monitor for event-driven cache-aware routing.
     /// When set, new CacheAwarePolicy instances are injected with this monitor.
     kv_event_monitor: Arc<RwLock<Option<Arc<KvEventMonitor>>>>,
@@ -52,12 +56,33 @@ pub struct PolicyRegistry {
 
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
+
+    /// Shared sticky selector for the `X-SMG-Routing-Key` override. `Some` when the
+    /// override is enabled; consulted (instead of the configured policy) for keyed
+    /// requests via [`PolicyRegistry::select_worker`].
+    routing_key_sticky: Option<Arc<ManualPolicy>>,
 }
 
 impl PolicyRegistry {
-    /// Create a new PolicyRegistry with a default policy
+    /// Create a new PolicyRegistry with a default policy (no routing-key override).
     pub fn new(default_policy_config: PolicyConfig) -> Self {
+        Self::with_override(default_policy_config, RoutingKeyOverrideConfig::default())
+    }
+
+    /// Create a PolicyRegistry. When `routing_key_override.enabled`, builds a shared
+    /// sticky selector consulted for keyed requests in [`Self::select_worker`].
+    pub fn with_override(
+        default_policy_config: PolicyConfig,
+        routing_key_override: RoutingKeyOverrideConfig,
+    ) -> Self {
         let default_policy = Self::create_policy_from_config(&default_policy_config);
+        let routing_key_sticky = routing_key_override.enabled.then(|| {
+            Arc::new(ManualPolicy::with_config(ManualConfig {
+                eviction_interval_secs: routing_key_override.eviction_interval_secs,
+                max_idle_secs: routing_key_override.max_idle_secs,
+                assignment_mode: routing_key_override.assignment_mode,
+            }))
+        });
 
         Self {
             model_policies: Arc::new(DashMap::new()),
@@ -65,10 +90,38 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
+            encode_policy: Arc::new(OnceLock::new()),
             kv_event_monitor: Arc::new(RwLock::new(None)),
             load_rx: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
+            routing_key_sticky,
         }
+    }
+
+    /// Select a worker, applying the `X-SMG-Routing-Key` sticky override when it is
+    /// enabled, the request carries the header, and the configured policy does not
+    /// already honor the key (`manual` / `consistent_hashing`). Otherwise delegates
+    /// to `policy`. `policy.name()` stays the real policy (for metrics).
+    pub fn select_worker(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        if let Some(sticky) = self.routing_key_sticky.as_ref() {
+            if Self::routing_key_override_applies(policy.name())
+                && extract_routing_key(info.headers).is_some()
+            {
+                return sticky.select_worker(workers, info);
+            }
+        }
+        policy.select_worker(workers, info)
+    }
+
+    /// Policies that already honor `X-SMG-Routing-Key` keep their own handling; all
+    /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
+    fn routing_key_override_applies(name: &str) -> bool {
+        !matches!(name, "manual" | "consistent_hashing")
     }
 
     /// Set KV event monitor (thread-safe, can be called after initialization).
@@ -87,6 +140,9 @@ impl PolicyRegistry {
             Self::maybe_inject_monitor(p, monitor.as_ref());
         }
         if let Some(p) = self.decode_policy.get() {
+            Self::maybe_inject_monitor(p, monitor.as_ref());
+        }
+        if let Some(p) = self.encode_policy.get() {
             Self::maybe_inject_monitor(p, monitor.as_ref());
         }
         for entry in self.model_policies.iter() {
@@ -118,6 +174,9 @@ impl PolicyRegistry {
             Self::maybe_inject_load_rx(p, rx.as_ref());
         }
         if let Some(p) = self.decode_policy.get() {
+            Self::maybe_inject_load_rx(p, rx.as_ref());
+        }
+        if let Some(p) = self.encode_policy.get() {
             Self::maybe_inject_load_rx(p, rx.as_ref());
         }
         for entry in self.model_policies.iter() {
@@ -344,6 +403,13 @@ impl PolicyRegistry {
         let _ = self.decode_policy.set(policy);
     }
 
+    /// Set the encode policy for EPD mode (lock-free, set once at startup)
+    pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        // OnceLock::set returns Err if already set, which we ignore since
+        // the policy should only be set once at startup
+        let _ = self.encode_policy.set(policy);
+    }
+
     /// Get the prefill policy for PD mode, or default if not set (lock-free)
     pub fn get_prefill_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         self.prefill_policy
@@ -358,6 +424,23 @@ impl PolicyRegistry {
             .get()
             .map(Arc::clone)
             .unwrap_or_else(|| self.get_default_policy())
+    }
+
+    /// Get the encode policy for EPD mode. Falls back to consistent_hashing so
+    /// repeated multimodal items keep stable affinity even when the main policy is
+    /// load-oriented or random.
+    pub fn get_encode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
+        self.encode_policy.get().map(Arc::clone).unwrap_or_else(|| {
+            PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing).unwrap_or_else(
+                |err| {
+                    warn!(
+                        error = %err,
+                        "Failed to create encode fallback policy; using default policy"
+                    );
+                    self.get_default_policy()
+                },
+            )
+        })
     }
 
     /// Get all load-aware policies that need periodic load updates (lock-free).
@@ -375,9 +458,10 @@ impl PolicyRegistry {
             policies.push(Arc::clone(&self.default_policy));
         }
 
-        // Get prefill and decode policies (lock-free via OnceLock::get)
+        // Get prefill, decode, and encode policies (lock-free via OnceLock::get)
         let prefill_policy_opt = self.prefill_policy.get();
         let decode_policy_opt = self.decode_policy.get();
+        let encode_policy_opt = self.encode_policy.get();
 
         if let Some(policy) = prefill_policy_opt {
             if is_load_aware(policy.name()) && !Arc::ptr_eq(policy, &self.default_policy) {
@@ -389,6 +473,16 @@ impl PolicyRegistry {
             if is_load_aware(policy.name())
                 && !Arc::ptr_eq(policy, &self.default_policy)
                 && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
+            {
+                policies.push(Arc::clone(policy));
+            }
+        }
+
+        if let Some(policy) = encode_policy_opt {
+            if is_load_aware(policy.name())
+                && !Arc::ptr_eq(policy, &self.default_policy)
+                && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
+                && !decode_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
             {
                 policies.push(Arc::clone(policy));
             }
@@ -464,6 +558,7 @@ impl PolicyRegistry {
         for (worker_type, policy) in [
             ("prefill", self.prefill_policy.get()),
             ("decode", self.decode_policy.get()),
+            ("encode", self.encode_policy.get()),
         ] {
             if let Some(policy) = policy {
                 if policy.name() == "cache_aware" {
@@ -611,6 +706,91 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         }))
+    }
+
+    fn headers_with_key(key: &str) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-smg-routing-key", key.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn override_eligibility_skips_key_native_policies() {
+        // Policies that already honor X-SMG-Routing-Key are skipped; others (incl.
+        // prefix_hash, which routes by tokens) get the sticky override.
+        assert!(PolicyRegistry::routing_key_override_applies("cache_aware"));
+        assert!(PolicyRegistry::routing_key_override_applies("prefix_hash"));
+        assert!(PolicyRegistry::routing_key_override_applies("least_load"));
+        assert!(!PolicyRegistry::routing_key_override_applies("manual"));
+        assert!(!PolicyRegistry::routing_key_override_applies(
+            "consistent_hashing"
+        ));
+    }
+
+    #[test]
+    fn override_routes_keyed_request_stickily() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+            worker("http://w3", WorkerType::Regular),
+        ];
+        let headers = headers_with_key("session-A");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let first = reg.select_worker(&policy, &workers, &info).unwrap();
+        for _ in 0..5 {
+            assert_eq!(reg.select_worker(&policy, &workers, &info), Some(first));
+        }
+    }
+
+    #[test]
+    fn override_without_key_uses_configured_policy() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo::default(); // no key header
+                                                // RoundRobin alternates -> proves the configured policy is used, not sticky.
+        let a = reg.select_worker(&policy, &workers, &info).unwrap();
+        let b = reg.select_worker(&policy, &workers, &info).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn override_disabled_ignores_key() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin); // override off
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let headers = headers_with_key("session-A");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        // Override off -> the key is ignored, RoundRobin alternates.
+        let a = reg.select_worker(&policy, &workers, &info).unwrap();
+        let b = reg.select_worker(&policy, &workers, &info).unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]

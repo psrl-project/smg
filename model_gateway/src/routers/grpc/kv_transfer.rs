@@ -23,6 +23,7 @@
 use std::{sync::Arc, time::Duration};
 
 use dashmap::DashMap;
+use kv_index::{compute_request_content_hashes, Tier};
 use metrics::{counter, histogram};
 use smg_grpc_client::vllm_proto::{PinKvRequest, TransferKvRequest, UnpinKvRequest};
 use tokio::sync::Semaphore;
@@ -32,7 +33,6 @@ use crate::{
     config::types::{KvTransferConfig, KvTransferMode},
     worker::{KvEventMonitor, Worker, UNKNOWN_MODEL_ID},
 };
-use kv_index::{compute_request_content_hashes, Tier};
 
 /// Worker label carrying the LMCache instance id used as the transfer destination.
 const LABEL_LMCACHE_INSTANCE_ID: &str = "lmcache_instance_id";
@@ -202,7 +202,11 @@ impl KvTransferCoordinator {
                     num_tokens = resp.num_tokens,
                     "KV transfer succeeded"
                 );
-                record_result(if resp.num_tokens > 0 { "ok" } else { "src_miss" });
+                record_result(if resp.num_tokens > 0 {
+                    "ok"
+                } else {
+                    "src_miss"
+                });
             }
             Ok(Ok(resp)) => {
                 warn!(src = src.url(), error = %resp.error, "KV transfer failed");

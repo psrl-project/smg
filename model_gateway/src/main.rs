@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use rand::{distr::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
         DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
         OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RequestSortKey, RetryConfig,
-        RouterConfig, RoutingMode, SchemaConfig, TokenizerCacheConfig, TraceConfig,
+        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TokenizerCacheConfig,
+        TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -22,13 +23,17 @@ use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::MeshServerConfig;
 use tracing::info;
 
-fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
+/// Parse repeated `<flag> <url> [bootstrap_port|none]` occurrences into
+/// (url, optional bootstrap port) pairs. The trailing port is optional, so
+/// these flags are hand-parsed (clap cannot express the optional positional)
+/// and stripped from argv before `Cli::parse_from`.
+fn parse_url_port_args(flag: &str) -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
-    let mut prefill_entries = Vec::new();
+    let mut entries = Vec::new();
     let mut i = 0;
 
     while i < args.len() {
-        if args[i] == "--prefill" && i + 1 < args.len() {
+        if args[i] == flag && i + 1 < args.len() {
             let url = args[i + 1].clone();
             let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
                 if let Ok(port) = args[i + 2].parse::<u16>() {
@@ -43,14 +48,22 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
             } else {
                 None
             };
-            prefill_entries.push((url, bootstrap_port));
+            entries.push((url, bootstrap_port));
             i += 2;
         } else {
             i += 1;
         }
     }
 
-    prefill_entries
+    entries
+}
+
+fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
+    parse_url_port_args("--prefill")
+}
+
+fn parse_encode_args() -> Vec<(String, Option<u16>)> {
+    parse_url_port_args("--encode")
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -247,6 +260,11 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
+    /// Honor X-SMG-Routing-Key for sticky routing on any policy (reuses the
+    /// manual eviction/idle/assignment knobs for the sticky map)
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    routing_key_override: bool,
+
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
@@ -264,6 +282,12 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
+    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC + TokenSpeed only).
+    /// Encode workers run the vision tower and ship embeddings to prefill over Mooncake;
+    /// prefill/decode reuse the PD path. Encode urls are given via `--encode <url> [bootstrap_port]`.
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    epd_disaggregation: bool,
+
     /// Decode server URLs (can be specified multiple times)
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
     decode: Vec<String>,
@@ -275,6 +299,10 @@ struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "cache_aware_v1", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
+
+    /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
+    #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
+    encode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
@@ -291,6 +319,11 @@ struct CliArgs {
     /// Maximum accepted age for pushed engine stats snapshots in milliseconds (0 disables)
     #[arg(long, default_value_t = 0, help_heading = "Load Monitoring")]
     engine_stats_staleness_threshold_ms: u64,
+
+    /// Re-export engine GetLoads signals (incl. PD) as smg_engine_* Prometheus
+    /// gauges, polling even without a load-aware routing policy.
+    #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
+    engine_metrics: bool,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -316,6 +349,10 @@ struct CliArgs {
     /// Kubernetes namespace to watch for pods
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
     service_discovery_namespace: Option<String>,
+
+    /// Label selector for encode server pods in EPD mode
+    #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
+    encode_selector: Vec<String>,
 
     /// Label selector for prefill server pods in PD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -1014,10 +1051,6 @@ impl CliArgs {
         }))
     }
 
-    #[expect(
-        clippy::panic,
-        reason = "unreachable: clap value_parser restricts valid assignment modes"
-    )]
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
@@ -1056,21 +1089,35 @@ impl CliArgs {
                 mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                 default_throughput: self.least_load_default_throughput,
             },
+            "bucket" => PolicyConfig::Bucket {
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                bucket_adjust_interval_secs: 5,
+            },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
             },
+            "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: match self.assignment_mode.as_str() {
-                    "random" => ManualAssignmentMode::Random,
-                    "min_load" => ManualAssignmentMode::MinLoad,
-                    "min_group" => ManualAssignmentMode::MinGroup,
-                    other => panic!("Unknown assignment mode: {other}"),
-                },
+                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
             },
             _ => PolicyConfig::RoundRobin,
+        }
+    }
+
+    #[expect(
+        clippy::panic,
+        reason = "unreachable: clap value_parser restricts valid assignment modes"
+    )]
+    fn parse_assignment_mode(mode: &str) -> ManualAssignmentMode {
+        match mode {
+            "random" => ManualAssignmentMode::Random,
+            "min_load" => ManualAssignmentMode::MinLoad,
+            "min_group" => ManualAssignmentMode::MinGroup,
+            other => panic!("Unknown assignment mode: {other}"),
         }
     }
 
@@ -1222,6 +1269,7 @@ impl CliArgs {
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
@@ -1236,6 +1284,15 @@ impl CliArgs {
         } else if matches!(self.backend, Some(Backend::Gemini)) {
             RoutingMode::Gemini {
                 worker_urls: self.worker_urls.clone(),
+            }
+        } else if self.epd_disaggregation {
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls: self.decode.clone(),
+                encode_policy: self.encode_policy.as_ref().map(|p| self.parse_policy(p)),
+                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
@@ -1259,6 +1316,7 @@ impl CliArgs {
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
                 selector: Self::parse_selector(&self.selector),
+                encode_selector: Self::parse_selector(&self.encode_selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -1291,6 +1349,17 @@ impl CliArgs {
                 ..
             } => {
                 for (url, _) in prefill_urls {
+                    all_urls.push(url.clone());
+                }
+                all_urls.extend(decode_urls.clone());
+            }
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                ..
+            } => {
+                for (url, _) in encode_urls.iter().chain(prefill_urls.iter()) {
                     all_urls.push(url.clone());
                 }
                 all_urls.extend(decode_urls.clone());
@@ -1348,8 +1417,8 @@ impl CliArgs {
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .engine_stats_staleness_threshold_ms(self.engine_stats_staleness_threshold_ms)
+            .engine_metrics(self.engine_metrics)
             .max_concurrent_requests(self.max_concurrent_requests)
-            .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
             .enable_routing_loop(self.enable_routing_loop)
             .routing_loop_check_interval_ms(self.routing_loop_check_interval_ms)
@@ -1420,6 +1489,12 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .routing_key_override(RoutingKeyOverrideConfig {
+                enabled: self.routing_key_override,
+                eviction_interval_secs: self.eviction_interval,
+                max_idle_secs: self.max_idle_secs,
+                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
+            })
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
@@ -1469,7 +1544,8 @@ impl CliArgs {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                pd_mode: self.pd_disaggregation,
+                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
+                encode_selector: Self::parse_selector(&self.encode_selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -1553,13 +1629,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let prefill_urls = parse_prefill_args();
+    let encode_urls = parse_encode_args();
 
     let mut filtered_args: Vec<String> = Vec::new();
     let raw_args: Vec<String> = std::env::args().collect();
     let mut i = 0;
 
     while i < raw_args.len() {
-        if raw_args[i] == "--prefill" && i + 1 < raw_args.len() {
+        if (raw_args[i] == "--prefill" || raw_args[i] == "--encode") && i + 1 < raw_args.len() {
             i += 2;
             if i < raw_args.len()
                 && !raw_args[i].starts_with("--")
@@ -1593,6 +1670,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "OpenAI Backend".to_string()
     } else if matches!(cli_args.backend, Some(Backend::Anthropic)) {
         "Anthropic Backend".to_string()
+    } else if cli_args.epd_disaggregation {
+        "EPD Disaggregated".to_string()
     } else if cli_args.pd_disaggregation {
         "PD Disaggregated".to_string()
     } else if let Some(backend) = &cli_args.backend {
@@ -1610,9 +1689,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Prefill nodes: {prefill_urls:?}");
             println!("Decode nodes: {:?}", cli_args.decode);
         }
+
+        if cli_args.epd_disaggregation {
+            println!("Encode nodes: {encode_urls:?}");
+            println!("Prefill nodes: {prefill_urls:?}");
+            println!("Decode nodes: {:?}", cli_args.decode);
+        }
     }
 
-    let router_config = cli_args.to_router_config(prefill_urls)?;
+    let router_config = cli_args.to_router_config(prefill_urls, encode_urls)?;
     router_config.validate()?;
 
     let server_config = cli_args.to_server_config(router_config)?;
@@ -1664,7 +1749,7 @@ mod tests {
     fn health_check_port_flows_into_both_configs() {
         let cli = cli_args_from(&["--health-check-port", "8081"]);
 
-        let router_config = cli.to_router_config(vec![]).unwrap();
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(
             router_config.health_check_port,
             Some(8081),
@@ -1685,11 +1770,44 @@ mod tests {
     fn health_check_port_defaults_to_none_in_both_configs() {
         let cli = cli_args_from(&[]);
 
-        let router_config = cli.to_router_config(vec![]).unwrap();
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.health_check_port, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.health_check_port, None);
+    }
+
+    /// `--engine-metrics` must flow into `RouterConfig` and survive nesting
+    /// into `ServerConfig.router_config` — the consumer (load monitor) reads it
+    /// off `RouterConfig`. Two-path config-plumbing guard.
+    #[test]
+    fn engine_metrics_flows_into_both_configs() {
+        let cli = cli_args_from(&["--engine-metrics"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.engine_metrics,
+            "engine_metrics must reach RouterConfig via to_router_config"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(
+            server_config.router_config.engine_metrics,
+            "engine_metrics must survive into ServerConfig via to_server_config"
+        );
+    }
+
+    /// Default is off: the flag stays false through both conversions so
+    /// existing deployments keep the routing-gated polling behavior.
+    #[test]
+    fn engine_metrics_defaults_to_false_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.engine_metrics);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.engine_metrics);
     }
 
     /// clap rejects out-of-range probe ports at parse time (the `u16`
@@ -1710,7 +1828,7 @@ mod tests {
     fn runtime_worker_threads_flows_into_both_configs() {
         let cli = cli_args_from(&["--runtime-worker-threads", "3"]);
 
-        let router_config = cli.to_router_config(vec![]).unwrap();
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.runtime_worker_threads, Some(3));
 
         let server_config = cli.to_server_config(router_config).unwrap();
@@ -1727,7 +1845,7 @@ mod tests {
     fn runtime_worker_threads_default_to_none_in_both_configs() {
         let cli = cli_args_from(&[]);
 
-        let router_config = cli.to_router_config(vec![]).unwrap();
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.runtime_worker_threads, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();

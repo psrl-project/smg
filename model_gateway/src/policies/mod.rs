@@ -222,6 +222,28 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     }
 }
 
+/// Which PD leg a selection is for. `Single` is non-PD (the default) and keeps
+/// routing-key stickiness byte-identical to pre-leg behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkerLeg {
+    #[default]
+    Single,
+    Prefill,
+    Decode,
+}
+
+impl WorkerLeg {
+    /// Prefix used to namespace sticky routing IDs per leg. `Single` is empty so
+    /// non-PD entries are unchanged.
+    pub fn routing_id_prefix(self) -> &'static str {
+        match self {
+            WorkerLeg::Single => "",
+            WorkerLeg::Prefill => "prefill:",
+            WorkerLeg::Decode => "decode:",
+        }
+    }
+}
+
 /// Information passed to policy for worker selection
 #[derive(Debug, Clone, Default)]
 pub struct SelectWorkerInfo<'a> {
@@ -256,6 +278,9 @@ pub struct SelectWorkerInfo<'a> {
     ///
     /// `None` means all workers are treated as equal priority (default behaviour).
     pub priority_groups: Option<&'a [i64]>,
+    /// Which PD leg this selection is for (default `Single`); namespaces
+    /// header-based sticky routing so prefill and decode stick independently.
+    pub leg: WorkerLeg,
 }
 
 #[cfg(test)]
@@ -343,5 +368,14 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn test_select_worker_info_leg_defaults_to_single() {
+        let info = SelectWorkerInfo::default();
+        assert_eq!(info.leg, WorkerLeg::Single);
+        assert_eq!(WorkerLeg::Single.routing_id_prefix(), "");
+        assert_eq!(WorkerLeg::Prefill.routing_id_prefix(), "prefill:");
+        assert_eq!(WorkerLeg::Decode.routing_id_prefix(), "decode:");
     }
 }

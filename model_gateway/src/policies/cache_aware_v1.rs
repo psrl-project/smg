@@ -53,7 +53,7 @@ use dashmap::DashMap;
 use kv_index::{compute_request_content_hashes, Tier, TieredIndexer, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
@@ -1102,5 +1102,3 @@ impl Default for CacheAwareV1Policy {
         Self::new()
     }
 }
-
-

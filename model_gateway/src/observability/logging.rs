@@ -1,7 +1,6 @@
 //! Logging infrastructure with non-blocking file I/O.
 
-use std::path::PathBuf;
-use std::fs::File;
+use std::{fs::File, path::PathBuf};
 
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;

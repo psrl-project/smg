@@ -370,6 +370,8 @@ impl PyPostgresConfig {
 struct Router {
     host: String,
     port: u16,
+    health_check_port: Option<u16>,
+    routing_key_override: bool,
     worker_urls: Vec<String>,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
@@ -503,6 +505,14 @@ struct Router {
     enable_tito: bool,
     tito_debug: bool,
     tito_gc_threshold: Option<usize>,
+    /// New parameters MUST be appended here (not inserted mid-list) to avoid
+    /// breaking external Python callers that pass `_Router(...)` positionally.
+    drain_settle_secs: u64,
+    enable_wasm: bool,
+    encode_selector: HashMap<String, String>,
+    epd_disaggregation: bool,
+    encode_urls: Option<Vec<(String, Option<u16>)>>,
+    encode_policy: Option<PolicyType>,
 }
 
 impl Router {
@@ -526,6 +536,19 @@ impl Router {
                 "Invalid value for {field}='{host}': invalid mesh socket address '{addr}': {e}"
             ))
         })
+    }
+
+    fn parse_assignment_mode(&self) -> Result<config::ManualAssignmentMode, config::ConfigError> {
+        match self.assignment_mode.as_str() {
+            "random" => Ok(config::ManualAssignmentMode::Random),
+            "min_load" => Ok(config::ManualAssignmentMode::MinLoad),
+            "min_group" => Ok(config::ManualAssignmentMode::MinGroup),
+            other => Err(config::ConfigError::InvalidValue {
+                field: "assignment_mode".to_string(),
+                value: other.to_string(),
+                reason: "expected 'random', 'min_load', or 'min_group'".to_string(),
+            }),
+        }
     }
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
@@ -579,18 +602,7 @@ impl Router {
                 PolicyType::Manual => ConfigPolicyConfig::Manual {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_idle_secs: self.max_idle_secs,
-                    assignment_mode: match self.assignment_mode.as_str() {
-                        "random" => config::ManualAssignmentMode::Random,
-                        "min_load" => config::ManualAssignmentMode::MinLoad,
-                        "min_group" => config::ManualAssignmentMode::MinGroup,
-                        other => {
-                            return Err(config::ConfigError::InvalidValue {
-                                field: "assignment_mode".to_string(),
-                                value: other.to_string(),
-                                reason: "expected 'random', 'min_load', or 'min_group'".to_string(),
-                            });
-                        }
-                    },
+                    assignment_mode: self.parse_assignment_mode()?,
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
@@ -633,6 +645,27 @@ impl Router {
             RoutingMode::Anthropic {
                 worker_urls: self.worker_urls.clone(),
             }
+        } else if self.epd_disaggregation {
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: self.encode_urls.clone().unwrap_or_default(),
+                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                decode_urls: self.decode_urls.clone().unwrap_or_default(),
+                encode_policy: self
+                    .encode_policy
+                    .as_ref()
+                    .map(convert_policy)
+                    .transpose()?,
+                prefill_policy: self
+                    .prefill_policy
+                    .as_ref()
+                    .map(convert_policy)
+                    .transpose()?,
+                decode_policy: self
+                    .decode_policy
+                    .as_ref()
+                    .map(convert_policy)
+                    .transpose()?,
+            }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
@@ -663,6 +696,7 @@ impl Router {
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
                 selector: self.selector.clone(),
+                encode_selector: self.encode_selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
@@ -856,6 +890,12 @@ impl Router {
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .dp_aware(self.dp_aware)
+            .routing_key_override(config::RoutingKeyOverrideConfig {
+                enabled: self.routing_key_override,
+                eviction_interval_secs: self.eviction_interval_secs,
+                max_idle_secs: self.max_idle_secs,
+                assignment_mode: self.parse_assignment_mode()?,
+            })
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
@@ -1013,6 +1053,17 @@ impl Router {
         enable_tito = false,
         tito_debug = false,
         tito_gc_threshold = None,
+        drain_settle_secs = 5,
+        enable_wasm = false,
+        // Appended last (not inserted mid-list) so every pre-existing
+        // positional argument keeps its index for callers that construct
+        // `_Router(...)` positionally. See the struct-field note above.
+        health_check_port = None,
+        routing_key_override = false,
+        encode_selector = HashMap::new(),
+        epd_disaggregation = false,
+        encode_urls = None,
+        encode_policy = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1151,8 +1202,24 @@ impl Router {
         enable_tito: bool,
         tito_debug: bool,
         tito_gc_threshold: Option<usize>,
+        drain_settle_secs: u64,
+        enable_wasm: bool,
+        // Appended last to match the `#[pyo3(signature)]` order above and
+        // preserve positional-argument compatibility.
+        health_check_port: Option<u16>,
+        routing_key_override: bool,
+        encode_selector: HashMap<String, String>,
+        epd_disaggregation: bool,
+        encode_urls: Option<Vec<(String, Option<u16>)>>,
+        encode_policy: Option<PolicyType>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
+
+        if let Some(ref encode_urls) = encode_urls {
+            for (url, _) in encode_urls {
+                all_urls.push(url.clone());
+            }
+        }
 
         if let Some(ref prefill_urls) = prefill_urls {
             for (url, _) in prefill_urls {
@@ -1173,6 +1240,8 @@ impl Router {
         Ok(Router {
             host,
             port,
+            health_check_port,
+            routing_key_override,
             worker_urls,
             policy,
             worker_startup_timeout_secs,
@@ -1302,6 +1371,12 @@ impl Router {
             enable_tito,
             tito_debug,
             tito_gc_threshold,
+            drain_settle_secs,
+            enable_wasm,
+            encode_selector,
+            epd_disaggregation,
+            encode_urls,
+            encode_policy,
         })
     }
 
@@ -1335,7 +1410,8 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                pd_mode: self.pd_disaggregation,
+                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
+                encode_selector: self.encode_selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
@@ -1379,7 +1455,7 @@ impl Router {
                     .map(|c| c.to_auth_control_plane_config()),
                 mesh_server_config: if self.enable_mesh {
                     let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
-                        use rand::{distr::Alphanumeric, Rng};
+                        use rand::{distr::Alphanumeric, RngExt};
                         let random_string: String = (0..4)
                             .map(|_| rand::rng().sample(Alphanumeric) as char)
                             .collect();

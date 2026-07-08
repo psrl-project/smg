@@ -58,8 +58,9 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
         // Verify the declared connection mode.
         match connection_mode {
             ConnectionMode::Http => {
-                try_http_reachable(&url, timeout, client).await.map_err(|e| {
-                    WorkflowError::StepFailed {
+                try_http_reachable(&url, timeout, client)
+                    .await
+                    .map_err(|e| WorkflowError::StepFailed {
                         step_id: StepId::new("detect_connection_mode"),
                         message: format!(
                             "HTTP health check failed for {} \
@@ -67,16 +68,16 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
                                 registration payload): {e}",
                             config.url
                         ),
-                    }
-                })?;
+                    })?;
                 debug!(
                     "{} confirmed reachable via HTTP (as declared in payload)",
                     config.url
                 );
             }
             ConnectionMode::Grpc => {
-                try_grpc_reachable(&url, timeout).await.map_err(|e| {
-                    WorkflowError::StepFailed {
+                try_grpc_reachable(&url, timeout)
+                    .await
+                    .map_err(|e| WorkflowError::StepFailed {
                         step_id: StepId::new("detect_connection_mode"),
                         message: format!(
                             "gRPC health check failed for {} \
@@ -84,8 +85,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
                                 registration payload): {e}",
                             config.url
                         ),
-                    }
-                })?;
+                    })?;
                 debug!(
                     "{} confirmed reachable via gRPC (as declared in payload)",
                     config.url

@@ -332,7 +332,7 @@ pub(crate) fn merge_into_partial_state(
 /// Reset `ctx` so it is ready for the next loopback iteration.
 ///
 /// Clears the per-iteration stage outputs that must be re-computed
-/// (worker selection, client, request, dispatch, load-guards, execution
+/// (worker selection, client, execution plan, dispatch, load-guards, execution
 /// result) and restores `preparation` from the snapshot stashed by
 /// `dispatch_entry_with_partial_rollout` before the loop began —
 /// `request_building` consumes the live `preparation` via `.take()`, so
@@ -341,7 +341,7 @@ pub(crate) fn merge_into_partial_state(
 pub(crate) fn reset_ctx_for_loopback(ctx: &mut RequestContext) {
     ctx.state.workers = None;
     ctx.state.clients = None;
-    ctx.state.proto_request = None;
+    ctx.state.execution_plan = None;
     ctx.state.dispatch = None;
     ctx.state.load_guards = None;
     // Restore preparation from the snapshot for the next iteration's
@@ -597,11 +597,8 @@ mod tests {
         // Iter 1: tokens but no RE (engine not yet capturing).  This is
         // legal at face value — the (None, None, tokens > 0) arm returns
         // Ok because the engine simply isn't producing RE.
-        merge_into_partial_state(
-            &mut state,
-            &make_drained_full(&[1, 2], None, None, "abort"),
-        )
-        .unwrap();
+        merge_into_partial_state(&mut state, &make_drained_full(&[1, 2], None, None, "abort"))
+            .unwrap();
         // Iter 2: a segment arrives — but prior tokens are already in
         // state.token_ids → LateArrival, because the prompt segment
         // covering iter 1 is permanently lost.
@@ -624,11 +621,9 @@ mod tests {
             &make_drained_full(&[1, 2], None, Some(s), "abort"),
         )
         .unwrap();
-        let err = merge_into_partial_state(
-            &mut state,
-            &make_drained_full(&[3, 4], None, None, "stop"),
-        )
-        .unwrap_err();
+        let err =
+            merge_into_partial_state(&mut state, &make_drained_full(&[3, 4], None, None, "stop"))
+                .unwrap_err();
         assert!(matches!(err, RoutedExpertsError::MissingSegment { .. }));
     }
 
@@ -638,11 +633,8 @@ mod tests {
     #[test]
     fn re_no_segments_no_accumulator_is_ok() {
         let mut state = PartialRolloutState::default();
-        merge_into_partial_state(
-            &mut state,
-            &make_drained_full(&[1, 2], None, None, "stop"),
-        )
-        .unwrap();
+        merge_into_partial_state(&mut state, &make_drained_full(&[1, 2], None, None, "stop"))
+            .unwrap();
         assert!(state.routed_experts.is_none());
     }
 

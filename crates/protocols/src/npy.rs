@@ -85,7 +85,10 @@ fn build_header(shape: &[u64], dtype: NpyDtype) -> Vec<u8> {
     let pad_spaces = padded - unpadded;
 
     let header_text_len = dict.len() + pad_spaces + 1; // dict + padding + '\n'
-    debug_assert!(header_text_len <= u16::MAX as usize, "header too large for npy v1.0");
+    debug_assert!(
+        header_text_len <= u16::MAX as usize,
+        "header too large for npy v1.0"
+    );
 
     let mut out = Vec::with_capacity(prefix_fixed + header_text_len);
     out.extend_from_slice(MAGIC);

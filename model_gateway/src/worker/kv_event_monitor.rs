@@ -189,7 +189,9 @@ impl KvEventMonitor {
                 .filter(|(u, _)| u == worker_url)
                 .cloned()
                 .collect();
-            keys.into_iter().filter_map(|k| handles.remove(&k)).collect()
+            keys.into_iter()
+                .filter_map(|k| handles.remove(&k))
+                .collect()
         };
 
         if subscriptions.is_empty() {
@@ -605,9 +607,11 @@ impl KvEventMonitor {
             .map(|&h| SequenceHash::from(h))
             .collect();
 
-        indexer
-            .tier(tier)
-            .apply_removed(state.worker_id(tier), &seq_hashes, state.blocks_mut(tier));
+        indexer.tier(tier).apply_removed(
+            state.worker_id(tier),
+            &seq_hashes,
+            state.blocks_mut(tier),
+        );
     }
 }
 
@@ -792,7 +796,12 @@ mod tests {
         let indexer = TieredIndexer::new(64);
         let mut state = WorkerTierState::new(&indexer, "http://w1:8000");
         KvEventMonitor::apply_stored(
-            &stored_event(&[(1, &[10, 20, 30, 40]), (2, &[50, 60, 70, 80])], 4, None, None),
+            &stored_event(
+                &[(1, &[10, 20, 30, 40]), (2, &[50, 60, 70, 80])],
+                4,
+                None,
+                None,
+            ),
             &indexer,
             &mut state,
         );
@@ -820,7 +829,12 @@ mod tests {
             &mut state,
         );
         KvEventMonitor::apply_stored(
-            &stored_event(&[(2, &[5, 6, 7, 8]), (3, &[9, 10, 11, 12])], 4, None, Some(1)), // LMCache
+            &stored_event(
+                &[(2, &[5, 6, 7, 8]), (3, &[9, 10, 11, 12])],
+                4,
+                None,
+                Some(1),
+            ), // LMCache
             &indexer,
             &mut state,
         );

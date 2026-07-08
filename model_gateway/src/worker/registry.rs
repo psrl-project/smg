@@ -19,7 +19,6 @@ use std::{
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use openai_protocol::worker::WorkerStatus;
-
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -70,7 +69,6 @@ pub enum WorkerOrigin {
     /// Imported from a remote peer via mesh synchronization.
     Mesh,
 }
-
 
 /// Side-effect-free worker snapshot for subscriber bootstrap or lag recovery.
 #[derive(Debug, Clone)]
@@ -472,6 +470,7 @@ impl WorkerRegistry {
         let mut healthy_count = 0;
         let mut total_load = 0;
         let mut regular_count = 0;
+        let mut encode_count = 0;
         let mut prefill_count = 0;
         let mut decode_count = 0;
         let mut http_count = 0;
@@ -489,6 +488,7 @@ impl WorkerRegistry {
 
             match worker.worker_type() {
                 WorkerType::Regular => regular_count += 1,
+                WorkerType::Encode => encode_count += 1,
                 WorkerType::Prefill => prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
             }
@@ -512,6 +512,7 @@ impl WorkerRegistry {
             unhealthy_workers: total_workers.saturating_sub(healthy_count),
             total_load,
             regular_workers: regular_count,
+            encode_workers: encode_count,
             prefill_workers: prefill_count,
             decode_workers: decode_count,
             http_workers: http_count,
@@ -728,7 +729,6 @@ impl WorkerRegistry {
                 .push(worker_id.clone());
         }
 
-
         let _ = self.event_tx.send(WorkerEvent::Replaced {
             worker_id: worker_id.clone(),
             old: old_worker,
@@ -943,7 +943,6 @@ impl WorkerRegistry {
             }
             Metrics::remove_worker_metrics(worker.url());
 
-
             let _ = self.event_tx.send(WorkerEvent::Removed {
                 worker_id: worker_id.clone(),
                 worker: worker.clone(),
@@ -1127,7 +1126,11 @@ impl WorkerRegistry {
         // Track origin: local registrations (sync_mesh=true) are published
         // to the mesh by WorkerSyncAdapter; mesh imports (sync_mesh=false)
         // must never be re-published.
-        let origin = if sync_mesh { WorkerOrigin::Local } else { WorkerOrigin::Mesh };
+        let origin = if sync_mesh {
+            WorkerOrigin::Local
+        } else {
+            WorkerOrigin::Mesh
+        };
         self.worker_origins.insert(worker_id.clone(), origin);
 
         // Broadcast under the lock so event order per worker_id is
@@ -1313,7 +1316,6 @@ impl WorkerRegistry {
     }
 }
 
-
 /// Statistics for the worker registry
 #[derive(Debug, Clone)]
 pub struct WorkerRegistryStats {
@@ -1329,6 +1331,8 @@ pub struct WorkerRegistryStats {
     pub total_load: usize,
     /// Number of regular (non-PD) workers
     pub regular_workers: usize,
+    /// Number of encode workers (EPD mode)
+    pub encode_workers: usize,
     /// Number of prefill workers (PD mode)
     pub prefill_workers: usize,
     /// Number of decode workers (PD mode)
@@ -1435,7 +1439,30 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_id_reservation_registers_worker_under_manual_id() {
+    fn test_stats_counts_encode_workers() {
+        let registry = WorkerRegistry::new();
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://encode-worker:8080")
+                .worker_type(WorkerType::Encode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+
+        registry.register(worker).unwrap();
+
+        let stats = registry.stats();
+        assert_eq!(stats.total_workers, 1);
+        assert_eq!(stats.encode_workers, 1);
+        assert_eq!(stats.prefill_workers, 0);
+        assert_eq!(stats.decode_workers, 0);
+        assert_eq!(stats.regular_workers, 0);
+        assert_eq!(stats.grpc_workers, 1);
+    }
+
+    #[test]
+    fn origin_tracks_local_and_mesh_registrations() {
         let registry = WorkerRegistry::new();
         let manual_id = WorkerId::from_string("replica-0".to_string());
         let worker_url = "http://manual-worker:8080";

@@ -937,6 +937,7 @@ impl WorkerManager {
                     WorkerType::Regular => None,
                     WorkerType::Prefill => Some("prefill".to_string()),
                     WorkerType::Decode => Some("decode".to_string()),
+                    WorkerType::Encode => Some("encode".to_string()),
                 };
                 let connection_mode = worker.connection_mode();
                 let client = client.clone();
@@ -949,8 +950,11 @@ impl WorkerManager {
                         }
                         ConnectionMode::Grpc => WorkerMonitor::fetch_grpc_load(&worker).await,
                     };
+                    // `load` is the absolute used-token count. Report it only
+                    // when the backend actually provides absolute tokens
                     let load = details
                         .as_ref()
+                        .filter(|d| d.has_absolute_token_data())
                         .map(|d| d.total_used_tokens() as isize)
                         .unwrap_or(-1);
                     WorkerLoadInfo {

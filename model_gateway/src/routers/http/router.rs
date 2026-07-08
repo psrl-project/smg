@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{error::Error as _, sync::Arc, time::Instant};
 
 use axum::{
     body::{to_bytes, Body},
@@ -16,6 +16,10 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
+    realtime_session::{
+        RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
+        RealtimeTranscriptionSessionCreateRequest,
+    },
     rerank::{RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
@@ -41,14 +45,23 @@ use crate::{
     routers::{
         common::{
             header_utils,
+            realtime::{
+                rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
+                ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
+            },
             retry::{is_retryable_status, RetryExecutor},
+            worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
+        openai::strip_default_sglang_fields,
         RouterTrait,
     },
     worker::{AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType},
 };
+
+/// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
+const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -56,6 +69,9 @@ pub struct Router {
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     retry_config: RetryConfig,
+    realtime_registry: Arc<RealtimeRegistry>,
+    webrtc_bind_addr: Option<std::net::IpAddr>,
+    webrtc_stun_server: Option<String>,
 }
 
 impl std::fmt::Debug for Router {
@@ -65,7 +81,7 @@ impl std::fmt::Debug for Router {
             .field("policy_registry", &self.policy_registry)
             .field("client", &self.client)
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -81,6 +97,9 @@ impl Router {
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
+            realtime_registry: ctx.realtime_registry.clone(),
+            webrtc_bind_addr: ctx.webrtc_bind_addr,
+            webrtc_stun_server: ctx.webrtc_stun_server.clone(),
         })
     }
 
@@ -177,7 +196,8 @@ impl Router {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let idx = policy.select_worker(
+        let idx = self.policy_registry.select_worker(
+            &policy,
             &available,
             &SelectWorkerInfo {
                 request_text: text,
@@ -186,6 +206,7 @@ impl Router {
                 hash_ring,
                 response_token_count: None,
                 priority_groups: None,
+                leg: crate::policies::WorkerLeg::Single,
             },
         )?;
 
@@ -198,6 +219,28 @@ impl Router {
         );
 
         Some((available[idx].clone(), policy))
+    }
+
+    /// Select a local, realtime-capable worker for the given model.
+    ///
+    /// Uses the shared [`WorkerSelector`] (least-loaded) filtered to regular
+    /// HTTP workers advertising the `realtime` label, so realtime traffic
+    /// never lands on a worker that can't serve it.
+    async fn select_realtime_worker(
+        &self,
+        model_id: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Result<Arc<dyn Worker>, Response> {
+        WorkerSelector::new(&self.worker_registry, &self.client)
+            .select_worker(&SelectWorkerRequest {
+                model_id,
+                headers,
+                worker_type: Some(WorkerType::Regular),
+                connection_mode: Some(ConnectionMode::Http),
+                require_realtime_capable: true,
+                ..Default::default()
+            })
+            .await
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -570,7 +613,8 @@ impl Router {
 
         let policy = self.policy_registry.get_policy_or_default(model_id);
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
-        let idx = match policy.select_worker(
+        let idx = match self.policy_registry.select_worker(
+            &policy,
             &available,
             &SelectWorkerInfo {
                 request_text: Some(&text),
@@ -579,9 +623,10 @@ impl Router {
                 hash_ring,
                 response_token_count: None,
                 priority_groups: None,
+                leg: crate::policies::WorkerLeg::Single,
             },
         ) {
-            Some(i) => i,
+            Some(idx) => idx,
             None => {
                 let resp = error::service_unavailable(
                     "no_available_workers",
@@ -865,7 +910,7 @@ impl Router {
             }
         };
 
-        let json_val = match worker.prepare_request(json_val) {
+        let mut json_val = match worker.prepare_request(json_val) {
             Ok(prepared) => prepared,
             Err(e) => {
                 return error::bad_request(
@@ -874,6 +919,7 @@ impl Router {
                 );
             }
         };
+        strip_default_sglang_fields(&mut json_val);
 
         let mut request_builder = self.client.post(&endpoint_url).json(&json_val);
 
@@ -1244,6 +1290,146 @@ impl RouterTrait for Router {
         }
     }
 
+    async fn route_realtime_session(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RealtimeSessionCreateRequest,
+    ) -> Response {
+        let model = body.model.as_deref().unwrap_or_default();
+        let worker = self.select_realtime_worker(model, headers).await;
+        forward_realtime_rest(
+            RealtimeLabels::HTTP,
+            &self.client,
+            worker,
+            headers,
+            body,
+            model,
+            "/v1/realtime/sessions",
+            metrics_labels::ENDPOINT_REALTIME_SESSIONS,
+        )
+        .await
+    }
+
+    async fn route_realtime_client_secret(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RealtimeClientSecretCreateRequest,
+    ) -> Response {
+        let model = body.session.model.as_deref().unwrap_or_default();
+        let worker = self.select_realtime_worker(model, headers).await;
+        forward_realtime_rest(
+            RealtimeLabels::HTTP,
+            &self.client,
+            worker,
+            headers,
+            body,
+            model,
+            "/v1/realtime/client_secrets",
+            metrics_labels::ENDPOINT_REALTIME_CLIENT_SECRETS,
+        )
+        .await
+    }
+
+    async fn route_realtime_transcription_session(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RealtimeTranscriptionSessionCreateRequest,
+    ) -> Response {
+        let model = body.model.as_deref().unwrap_or_default();
+        let worker = self.select_realtime_worker(model, headers).await;
+        forward_realtime_rest(
+            RealtimeLabels::HTTP,
+            &self.client,
+            worker,
+            headers,
+            body,
+            model,
+            "/v1/realtime/transcription_sessions",
+            metrics_labels::ENDPOINT_REALTIME_TRANSCRIPTION,
+        )
+        .await
+    }
+
+    async fn route_realtime_ws(&self, req: Request<Body>, model: &str) -> Response {
+        let (parts, _body) = req.into_parts();
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_WEBSOCKET,
+            model,
+            metrics_labels::ENDPOINT_REALTIME,
+            "false",
+        );
+
+        let auth_header = header_utils::extract_auth_header(Some(&parts.headers), None);
+        let worker = self
+            .select_realtime_worker(model, Some(&parts.headers))
+            .await;
+
+        handle_realtime_ws(
+            RealtimeLabels::HTTP,
+            parts,
+            model.to_owned(),
+            worker,
+            auth_header,
+            Arc::clone(&self.realtime_registry),
+        )
+        .await
+    }
+
+    async fn route_realtime_webrtc(&self, req: Request<Body>, model: &str) -> Response {
+        let (parts, body) = req.into_parts();
+        let body = match to_bytes(body, WEBRTC_REQUEST_BODY_LIMIT).await {
+            Ok(b) => b,
+            Err(e) => {
+                if e.source()
+                    .and_then(|s| s.downcast_ref::<http_body_util::LengthLimitError>())
+                    .is_some()
+                {
+                    return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                }
+                return error::bad_request("invalid_body", format!("Failed to read body: {e}"));
+            }
+        };
+
+        let parsed = match webrtc::parse_webrtc_request(&parts, &body, model).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_WEBRTC,
+            &parsed.model,
+            metrics_labels::ENDPOINT_REALTIME,
+            "false",
+        );
+
+        let auth_header = header_utils::extract_auth_header(Some(&parts.headers), None);
+        let worker = self
+            .select_realtime_worker(&parsed.model, Some(&parts.headers))
+            .await;
+
+        let bind_addr = self
+            .webrtc_bind_addr
+            .unwrap_or_else(|| std::net::Ipv4Addr::UNSPECIFIED.into());
+
+        handle_realtime_webrtc(
+            RealtimeLabels::HTTP,
+            parts.headers,
+            parsed,
+            worker,
+            auth_header,
+            self.client.clone(),
+            bind_addr,
+            self.webrtc_stun_server.clone(),
+            Arc::clone(&self.realtime_registry),
+        )
+        .await
+    }
+
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -1285,6 +1471,9 @@ mod tests {
             policy_registry,
             client: Client::new(),
             retry_config: RetryConfig::default(),
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
         }
     }
 

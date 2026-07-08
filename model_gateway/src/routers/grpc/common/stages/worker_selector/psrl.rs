@@ -32,7 +32,7 @@ use super::WorkerSelectorStrategy;
 use crate::{
     config::types::CandidateSortKey,
     observability::metrics::{metrics_labels, Metrics},
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
         error,
         grpc::{
@@ -488,6 +488,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                     hash_ring,
                     priority_groups: Some(&priority_groups),
                     response_token_count: meta.response_token_count,
+                    leg: WorkerLeg::Single,
                 },
             )?;
             sorted_candidates[idx].increment_load();
@@ -805,7 +806,8 @@ mod tests {
     async fn commit_pins_unversioned_request_to_synced_version() {
         let runtime = make_runtime();
         let selector = make_selector(&runtime);
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
         let instance = selector.worker_instance_id(&worker);
         runtime.instance_to_version_after_sync.insert(instance, 5);
 
@@ -822,7 +824,8 @@ mod tests {
     async fn commit_keeps_versioned_request_unchanged() {
         let runtime = make_runtime();
         let selector = make_selector(&runtime);
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
         let instance = selector.worker_instance_id(&worker);
         runtime.instance_to_version_after_sync.insert(instance, 5);
 

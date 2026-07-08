@@ -114,8 +114,9 @@ impl ResponseProcessor {
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
                 if utils::should_mark_reasoning_started(
-                    utils::extract_thinking_from_kwargs(
+                    utils::resolve_user_thinking(
                         original_request.chat_template_kwargs.as_ref(),
+                        original_request.reasoning_effort.as_deref(),
                         tokenizer.as_ref(),
                     ),
                     tokenizer.as_ref(),
@@ -204,11 +205,9 @@ impl ResponseProcessor {
         // Step 5: Build ChatCompletionMessage (proper response message type)
         let chat_message = ChatCompletionMessage {
             role: "assistant".to_string(),
-            content: if processed_text.is_empty() {
-                None
-            } else {
-                Some(processed_text)
-            },
+            // Whitespace-only residual (e.g. "\n\n" between </think> and <tool_call>)
+            // must be None, not Some("\n\n") — see normalize_assistant_content.
+            content: normalize_assistant_content(processed_text),
             tool_calls,
             reasoning_content: reasoning_text,
         };
@@ -232,7 +231,7 @@ impl ResponseProcessor {
     ///
     /// This is the parsing half of the non-streaming chat path; the caller is responsible for
     /// turning the resulting choices into a [`ChatCompletionResponse`] via [`Self::build_chat_response`].
-    /// 
+    ///
     /// Splitting parse/build lets side-channel consumers (e.g. TITO capture) reuse the same
     /// `ChatCompletionMessage` without re-running the stop decoder + tool/reasoning parsers,
     /// which is critical because parsers such as `parse_tool_calls` mint a fresh tool-call ID per
@@ -481,6 +480,7 @@ impl ResponseProcessor {
                 output_token_logprobs,
                 completion_tokens: complete.completion_tokens(),
                 cached_tokens: complete.cached_tokens(),
+                reasoning_tokens: Some(complete.reasoning_tokens()),
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
                 routed_experts: complete
@@ -714,8 +714,8 @@ impl ResponseProcessor {
             });
         }
 
-        // Text block (if non-empty)
-        if !processed_text.is_empty() {
+        // Text block (only if non-whitespace; a bare "\n\n" residual must not become one).
+        if !processed_text.trim().is_empty() {
             content_blocks.push(messages::ContentBlock::Text {
                 text: processed_text,
                 citations: None,
@@ -904,5 +904,31 @@ impl ResponseProcessor {
             usage: Some(Usage::from_counts(total_prompt, total_completion)),
             system_fingerprint: dispatch.weight_version.clone(),
         })
+    }
+}
+
+/// Residual assistant text → OpenAI `content`. Whitespace-only (the `"\n\n"` left
+/// after reasoning + tool-call extraction) becomes `None`, not `Some("\n\n")`, which
+/// would otherwise diverge multi-turn conversations. Real content is kept verbatim.
+fn normalize_assistant_content(text: String) -> Option<String> {
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[cfg(test)]
+mod content_normalization_tests {
+    use super::normalize_assistant_content;
+
+    #[test]
+    fn whitespace_only_is_none_real_text_kept_verbatim() {
+        assert_eq!(normalize_assistant_content("\n\n".to_string()), None);
+        assert_eq!(normalize_assistant_content("  \t".to_string()), None);
+        assert_eq!(
+            normalize_assistant_content("\n\nDone.".to_string()),
+            Some("\n\nDone.".to_string())
+        );
     }
 }

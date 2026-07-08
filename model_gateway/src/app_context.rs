@@ -20,13 +20,12 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     routers::{
-        common::openai_bridge::FormatRegistry,
+        common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
         grpc::{
             multimodal::MultimodalConfigRegistry,
             preemption_subscriber::PreemptionMonitor,
             routing_loop::runtime::{run_routing_loop, InstanceVersionMap, RoutingLoopRuntime},
         },
-        openai::realtime::RealtimeRegistry,
         router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
@@ -574,7 +573,10 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::new(config.policy.clone())));
+        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
+            config.policy.clone(),
+            config.routing_key_override.clone(),
+        )));
         self
     }
 
@@ -632,6 +634,7 @@ impl AppContextBuilder {
                 .clone(),
             client.clone(),
             config.load_monitor_interval_secs,
+            config.engine_metrics,
         )));
         Ok(self)
     }
@@ -746,7 +749,6 @@ impl Default for AppContextBuilder {
         Self::new()
     }
 }
-
 
 /// Initialize the routing loop runtime for an `AppContext` whose configuration
 /// has `routing_loop.enabled = true`.

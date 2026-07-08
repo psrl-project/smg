@@ -456,7 +456,7 @@ fn extract_turn_record(
 
 /// Build the [`ChatMessage::Assistant`] view of a server-parsed
 /// [`ChatCompletionMessage`].
-/// 
+///
 /// The same `ChatCompletionMessage` must feed both the response that
 /// goes back to the client *and* the assistant turn
 /// that gets hashed into the TITO prefix tree.
