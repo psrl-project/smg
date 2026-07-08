@@ -295,6 +295,7 @@ pub(crate) enum PreparationOutput {
     Generate {
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_intermediate: Option<super::multimodal::MultimodalIntermediate>,
     },
     Embedding {
         original_text: String,

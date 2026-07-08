@@ -30,9 +30,11 @@ use ndarray::{ArrayD, ArrayViewD, Axis, Slice};
 use openai_protocol::{
     chat::{ChatMessage, MessageContent},
     common::ContentPart,
+    generate::GenerateRequest,
     messages::{ImageSource, InputContent, InputContentBlock, InputMessage, Role},
 };
 use rayon::prelude::*;
+use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::routers::grpc::{
@@ -52,7 +54,7 @@ use crate::routers::grpc::{
 #[derive(Debug, Clone)]
 pub(crate) struct MultimodalModelConfig {
     /// Model config.json (HuggingFace format)
-    pub config: serde_json::Value,
+    pub config: Value,
     /// Preprocessor config (preprocessor_config.json)
     pub preprocessor_config: PreProcessorConfig,
     /// Video-specific preprocessor config, when provided by the model repo.
@@ -122,7 +124,7 @@ impl MultimodalConfigRegistry {
             })?;
 
         let config_path = base_dir.join("config.json");
-        let config: serde_json::Value = std::fs::read_to_string(&config_path)
+        let config: Value = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config.json at {}", config_path.display()))
             .and_then(|s| {
                 serde_json::from_str(&s).with_context(|| {
@@ -212,7 +214,7 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
 
     let processor_config = match std::fs::read_to_string(&processor_path)
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
     {
         Some(config) => config,
         None => {
@@ -378,6 +380,33 @@ pub(crate) fn has_multimodal_content(messages: &[ChatMessage]) -> bool {
     !chat_modalities(messages).is_empty()
 }
 
+/// Check if a native `/generate` request carries multimodal media.
+pub(crate) fn has_multimodal_content_generate(request: &GenerateRequest) -> bool {
+    request
+        .image_data
+        .as_ref()
+        .is_some_and(value_has_media_refs)
+        || request
+            .video_data
+            .as_ref()
+            .is_some_and(value_has_media_refs)
+        || request
+            .audio_data
+            .as_ref()
+            .is_some_and(value_has_media_refs)
+}
+
+pub(crate) fn has_unsupported_generate_modality(request: &GenerateRequest) -> bool {
+    request
+        .video_data
+        .as_ref()
+        .is_some_and(value_has_media_refs)
+        || request
+            .audio_data
+            .as_ref()
+            .is_some_and(value_has_media_refs)
+}
+
 /// Extract multimodal content parts from OpenAI chat messages,
 /// converting protocol `ContentPart` to multimodal crate `MediaContentPart`.
 fn extract_content_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
@@ -418,6 +447,85 @@ fn extract_content_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
     }
 
     parts
+}
+
+/// Extract image refs from native `/generate` image_data.
+fn extract_content_parts_generate(request: &GenerateRequest) -> Vec<MediaContentPart> {
+    let mut parts = Vec::new();
+    if let Some(image_data) = request.image_data.as_ref() {
+        push_generate_image_value(image_data, &mut parts, None);
+    }
+    parts
+}
+
+fn value_has_media_refs(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(s) => !s.is_empty(),
+        Value::Array(values) => values.iter().any(value_has_media_refs),
+        Value::Object(map) => !map.is_empty(),
+        _ => false,
+    }
+}
+
+fn push_generate_image_value(
+    value: &Value,
+    parts: &mut Vec<MediaContentPart>,
+    inherited_detail: Option<ImageDetail>,
+) {
+    match value {
+        Value::String(url) if !url.is_empty() => {
+            parts.push(MediaContentPart::ImageUrl {
+                url: url.clone(),
+                detail: inherited_detail,
+                uuid: None,
+            });
+        }
+        Value::Array(values) => {
+            for item in values {
+                push_generate_image_value(item, parts, inherited_detail);
+            }
+        }
+        Value::Object(map) => {
+            let detail = map
+                .get("detail")
+                .and_then(Value::as_str)
+                .and_then(parse_detail)
+                .or(inherited_detail);
+
+            if let Some(image_url) = map.get("image_url") {
+                match image_url {
+                    Value::String(url) => {
+                        push_generate_image_value(&Value::String(url.clone()), parts, detail)
+                    }
+                    Value::Object(image_url_map) => {
+                        let nested_detail = image_url_map
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .and_then(parse_detail)
+                            .or(detail);
+                        if let Some(url) = image_url_map.get("url").and_then(Value::as_str) {
+                            push_generate_image_value(
+                                &Value::String(url.to_string()),
+                                parts,
+                                nested_detail,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            for key in ["url", "image", "path"] {
+                if let Some(url) = map.get(key).and_then(Value::as_str) {
+                    push_generate_image_value(&Value::String(url.to_string()), parts, detail);
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Parse OpenAI detail string to multimodal ImageDetail enum.
@@ -519,6 +627,29 @@ pub(crate) async fn process_multimodal_messages(
     .await
 }
 
+/// Process multimodal content from native `/generate` image_data.
+pub(crate) async fn process_multimodal_generate(
+    request: &GenerateRequest,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    token_ids: Vec<u32>,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+) -> Result<MultimodalOutput> {
+    let content_parts = extract_content_parts_generate(request);
+    process_multimodal_parts(
+        content_parts,
+        model_id,
+        tokenizer,
+        token_ids,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+    )
+    .await
+}
+
 /// Process multimodal content: fetch images, preprocess pixels, expand tokens, collect hashes.
 ///
 /// Single entry point called from preparation.rs. Handles the full pipeline:
@@ -544,6 +675,35 @@ pub(crate) async fn process_multimodal(
     .await
 }
 
+/// Process multimodal content in a TITO hit.
+///
+/// `token_ids` is the full merged prompt: historical prefix tokens are already
+/// reusable, while current-turn placeholders start at or after
+/// `replacement_scan_start`.
+pub(crate) async fn process_multimodal_incremental(
+    messages: &[ChatMessage],
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    token_ids: Vec<u32>,
+    replacement_scan_start: usize,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+) -> Result<MultimodalOutput> {
+    let content_parts = extract_content_parts(messages);
+    process_multimodal_parts_with_scan_start(
+        content_parts,
+        model_id,
+        tokenizer,
+        token_ids,
+        replacement_scan_start,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+    )
+    .await
+}
+
 /// Shared multimodal processing core.
 ///
 /// Takes pre-extracted `MediaContentPart`s (from either chat or messages pipeline)
@@ -553,6 +713,29 @@ async fn process_multimodal_parts(
     model_id: &str,
     tokenizer: &dyn TokenizerTrait,
     token_ids: Vec<u32>,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+) -> Result<MultimodalOutput> {
+    process_multimodal_parts_with_scan_start(
+        content_parts,
+        model_id,
+        tokenizer,
+        token_ids,
+        0,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+    )
+    .await
+}
+
+async fn process_multimodal_parts_with_scan_start(
+    content_parts: Vec<MediaContentPart>,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    token_ids: Vec<u32>,
+    replacement_scan_start: usize,
     components: &MultimodalComponents,
     tokenizer_id: &str,
     tokenizer_source: &str,
@@ -782,6 +965,7 @@ async fn process_multimodal_parts(
 
     let expanded = expand_tokens(
         &token_ids,
+        replacement_scan_start,
         search_token_id,
         placeholder_token_id,
         &prompt_replacements,
@@ -867,6 +1051,7 @@ struct ExpandedTokens {
 /// in a single pass — no extra iteration needed.
 fn expand_tokens(
     token_ids: &[u32],
+    replacement_scan_start: usize,
     placeholder_token_id: Option<u32>,
     im_token_id: Option<u32>,
     replacements: &[PromptReplacement],
@@ -881,12 +1066,14 @@ fn expand_tokens(
         };
     };
 
+    let scan_start = replacement_scan_start.min(token_ids.len());
     let mut expanded = Vec::with_capacity(token_ids.len());
+    expanded.extend_from_slice(&token_ids[..scan_start]);
     let mut placeholders = Vec::new();
     let mut patch_offsets: Option<Vec<(u32, u32)>> = im_token_id.map(|_| Vec::new());
     let mut replacement_idx = 0;
 
-    for &token in token_ids {
+    for &token in &token_ids[scan_start..] {
         if token == placeholder_id && replacement_idx < replacements.len() {
             let repl = &replacements[replacement_idx];
             let offset = expanded.len();
@@ -2179,7 +2366,7 @@ mod tests {
             tokens: vec![50, 50, 50, 50], // Expand to 4 tokens
         }];
 
-        let result = expand_tokens(&token_ids, Some(100), None, &replacements);
+        let result = expand_tokens(&token_ids, 0, Some(100), None, &replacements);
 
         assert_eq!(result.token_ids, vec![1, 2, 50, 50, 50, 50, 3, 4]);
         assert_eq!(result.placeholders.len(), 1);
@@ -2191,7 +2378,7 @@ mod tests {
     #[test]
     fn test_expand_tokens_no_placeholder() {
         let token_ids = vec![1, 2, 3];
-        let result = expand_tokens(&token_ids, None, None, &[]);
+        let result = expand_tokens(&token_ids, 0, None, None, &[]);
 
         assert_eq!(result.token_ids, vec![1, 2, 3]);
         assert!(result.placeholders.is_empty());
@@ -2214,7 +2401,7 @@ mod tests {
             },
         ];
 
-        let result = expand_tokens(&token_ids, Some(100), None, &replacements);
+        let result = expand_tokens(&token_ids, 0, Some(100), None, &replacements);
 
         assert_eq!(result.token_ids, vec![1, 50, 50, 2, 60, 60, 60, 3]);
         assert_eq!(result.placeholders.len(), 2);
@@ -2222,6 +2409,23 @@ mod tests {
         assert_eq!(result.placeholders[0].length, 2);
         assert_eq!(result.placeholders[1].offset, 4);
         assert_eq!(result.placeholders[1].length, 3);
+    }
+
+    #[test]
+    fn test_expand_tokens_incremental_scans_after_prefix() {
+        let token_ids = vec![1, 100, 2, 100, 3];
+        let replacements = vec![PromptReplacement {
+            modality: Modality::Image,
+            placeholder_token: "<image>".to_string(),
+            tokens: vec![60, 60, 60],
+        }];
+
+        let result = expand_tokens(&token_ids, 3, Some(100), None, &replacements);
+
+        assert_eq!(result.token_ids, vec![1, 100, 2, 60, 60, 60, 3]);
+        assert_eq!(result.placeholders.len(), 1);
+        assert_eq!(result.placeholders[0].offset, 3);
+        assert_eq!(result.placeholders[0].length, 3);
     }
 
     #[test]
@@ -2235,7 +2439,7 @@ mod tests {
             tokens: vec![88, 92, 92, 92, 93, 92, 92, 92, 89], // start + patches + sep + patches + end
         }];
 
-        let result = expand_tokens(&token_ids, Some(100), Some(92), &replacements);
+        let result = expand_tokens(&token_ids, 0, Some(100), Some(92), &replacements);
 
         // Full structural range
         assert_eq!(result.placeholders.len(), 1);

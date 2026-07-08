@@ -358,9 +358,16 @@ impl VllmEngineClient {
         body: &GenerateRequest,
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_inputs: Option<proto::MultimodalInputs>,
     ) -> Result<proto::GenerateRequest, String> {
-        let sampling_params =
+        let mut sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
+
+        // Forward return_logprob to vLLM's SamplingParams.logprobs so the engine
+        // actually computes per-token log probabilities during generation.
+        if body.return_logprob.unwrap_or(false) {
+            sampling_params.logprobs = Some(body.top_logprobs_num.unwrap_or(0));
+        }
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -373,7 +380,7 @@ impl VllmEngineClient {
             sampling_params: Some(sampling_params),
             stream: body.stream,
             kv_transfer_params: None,
-            mm_inputs: None,
+            mm_inputs: multimodal_inputs,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
         };

@@ -4,16 +4,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use llm_multimodal::Modality;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::InputIds, generate::GenerateRequest};
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::{PipelineStage, StagePhase},
         context::{PreparationOutput, RequestContext},
-        utils,
+        multimodal, utils,
     },
 };
 
@@ -50,7 +51,7 @@ impl GeneratePreparationStage {
         let tokenizer = utils::resolve_tokenizer(ctx, "GeneratePreparationStage::prepare_generate")
             .map_err(|e| *e)?;
 
-        let (original_text, token_ids) = match self
+        let (original_text, mut token_ids) = match self
             .resolve_generate_input(request, &tokenizer)
             .await
         {
@@ -60,6 +61,100 @@ impl GeneratePreparationStage {
                 return Err(error::bad_request("resolve_input_failed", msg));
             }
         };
+
+        let mut multimodal_intermediate = None;
+        if multimodal::has_multimodal_content_generate(request) {
+            if multimodal::has_unsupported_generate_modality(request) {
+                return Err(error::bad_request(
+                    "multimodal_modality_not_supported",
+                    "SMG /generate gRPC multimodal fast path currently supports image inputs only",
+                ));
+            }
+
+            let mm_components = ctx.components.multimodal.as_ref().ok_or_else(|| {
+                error!(
+                    function = "GeneratePreparationStage::execute",
+                    "Multimodal content detected but multimodal components not initialized"
+                );
+                error::bad_request(
+                    "multimodal_not_supported",
+                    "Multimodal content detected but multimodal processing is not available",
+                )
+            })?;
+
+            let model_id = ctx.input.model_id.clone();
+            let entry = ctx
+                .components
+                .tokenizer_registry
+                .get_by_name(&model_id)
+                .or_else(|| ctx.components.tokenizer_registry.get_by_id(&model_id))
+                .ok_or_else(|| {
+                    error!(
+                        function = "GeneratePreparationStage::execute",
+                        model = %model_id,
+                        "Tokenizer entry not found for multimodal processing"
+                    );
+                    error::bad_request(
+                        "multimodal_config_missing",
+                        format!("Tokenizer not found for model: {model_id}"),
+                    )
+                })?;
+
+            multimodal::resolve_placeholder_token(
+                &model_id,
+                &*tokenizer,
+                mm_components,
+                &entry.id,
+                &entry.source,
+                Modality::Image,
+            )
+            .await
+            .map_err(|e| {
+                error!(
+                    function = "GeneratePreparationStage::execute",
+                    model = %model_id,
+                    error = %e,
+                    "Failed to resolve multimodal placeholder token"
+                );
+                error::internal_error(
+                    "multimodal_placeholder_resolution_failed",
+                    format!("Failed to resolve multimodal placeholder token: {e}"),
+                )
+            })?;
+
+            match multimodal::process_multimodal_generate(
+                request,
+                &model_id,
+                &*tokenizer,
+                token_ids,
+                mm_components,
+                &entry.id,
+                &entry.source,
+            )
+            .await
+            {
+                Ok(output) => {
+                    debug!(
+                        function = "GeneratePreparationStage::execute",
+                        expanded_tokens = output.expanded_token_ids.len(),
+                        "Generate multimodal processing complete"
+                    );
+                    token_ids = output.expanded_token_ids;
+                    multimodal_intermediate = Some(output.intermediate);
+                }
+                Err(e) => {
+                    error!(
+                        function = "GeneratePreparationStage::execute",
+                        error = %e,
+                        "Generate multimodal processing failed"
+                    );
+                    return Err(error::bad_request(
+                        "multimodal_processing_failed",
+                        format!("Multimodal processing failed: {e}"),
+                    ));
+                }
+            }
+        }
 
         // Create stop sequence decoder for generate requests
         let params = request.sampling_params.as_ref();
@@ -75,6 +170,7 @@ impl GeneratePreparationStage {
         ctx.state.preparation = Some(PreparationOutput::Generate {
             original_text,
             token_ids,
+            multimodal_intermediate,
         });
 
         // Store stop decoder

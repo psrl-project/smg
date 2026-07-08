@@ -32,6 +32,12 @@ pub(crate) struct ChatPreparationStage {
     tito_store: Option<Arc<TitoStore>>,
 }
 
+struct TitoTokenizationHit {
+    merged_token_ids: Vec<u32>,
+    matched_message_num: usize,
+    prefix_token_len: usize,
+}
+
 impl ChatPreparationStage {
     pub fn new(tito_store: Option<Arc<TitoStore>>) -> Self {
         Self { tito_store }
@@ -150,84 +156,111 @@ impl ChatPreparationStage {
 
         // Step 2: Attempt TITO incremental tokenization, do full tokenization if TITO fails
         // TITO will ignore `original_text` field and only build `token_ids` field.
-        let tito_token_ids: Option<Vec<u32>> = self.try_tito(
+        let tito_hit = self.try_tito(
             ctx,
             body_ref.as_ref(),
             &tokenizer,
             image_placeholder.as_deref(),
         )?;
 
-        let (mut token_ids, processed_messages) = if let Some(ids) = tito_token_ids {
-            (
-                ids,
-                ProcessedMessages {
-                    text: String::new(),
-                    multimodal_intermediate: None,
-                    stop_sequences: body_ref.stop.clone(),
-                },
-            )
-        } else {
-            // Process messages and apply chat template
-            let processed_messages = match utils::process_chat_messages(
-                &body_ref,
-                &*tokenizer,
-                image_placeholder.as_deref(),
-            ) {
-                Ok(msgs) => msgs,
-                Err(e) => {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                    return Err(error::bad_request("process_messages_failed", e));
-                }
-            };
+        let (mut token_ids, processed_messages, multimodal_messages, replacement_scan_start) =
+            if let Some(hit) = tito_hit {
+                (
+                    hit.merged_token_ids,
+                    ProcessedMessages {
+                        text: String::new(),
+                        multimodal_intermediate: None,
+                        stop_sequences: body_ref.stop.clone(),
+                    },
+                    &request.messages[hit.matched_message_num..],
+                    hit.prefix_token_len,
+                )
+            } else {
+                // Process messages and apply chat template
+                let processed_messages = match utils::process_chat_messages(
+                    &body_ref,
+                    &*tokenizer,
+                    image_placeholder.as_deref(),
+                ) {
+                    Ok(msgs) => msgs,
+                    Err(e) => {
+                        error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                        return Err(error::bad_request("process_messages_failed", e));
+                    }
+                };
 
-            // Tokenize the processed text (no special tokens - chat template already handles them)
-            let encoding = match tokenizer.encode(&processed_messages.text, false) {
-                Ok(encoding) => encoding,
-                Err(e) => {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
-                    return Err(error::internal_error(
-                        "tokenization_failed",
-                        format!("Tokenization failed: {e}"),
-                    ));
-                }
-            };
+                // Tokenize the processed text (no special tokens - chat template already handles them)
+                let encoding = match tokenizer.encode(&processed_messages.text, false) {
+                    Ok(encoding) => encoding,
+                    Err(e) => {
+                        error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
+                        return Err(error::internal_error(
+                            "tokenization_failed",
+                            format!("Tokenization failed: {e}"),
+                        ));
+                    }
+                };
 
-            (encoding.token_ids().to_vec(), processed_messages)
-        };
+                (
+                    encoding.token_ids().to_vec(),
+                    processed_messages,
+                    request.messages.as_slice(),
+                    0,
+                )
+            };
 
         // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash)
         let mut multimodal_intermediate = None;
         if let Some((mm_components, model_id, tokenizer_id, tokenizer_source)) = mm_context {
-            match multimodal::process_multimodal(
-                &request.messages,
-                &model_id,
-                &*tokenizer,
-                token_ids,
-                &mm_components,
-                &tokenizer_id,
-                &tokenizer_source,
-            )
-            .await
-            {
-                Ok(output) => {
-                    debug!(
-                        function = "ChatPreparationStage::execute",
-                        expanded_tokens = output.expanded_token_ids.len(),
-                        "Multimodal processing complete"
-                    );
-                    token_ids = output.expanded_token_ids;
-                    multimodal_intermediate = Some(output.intermediate);
-                }
-                Err(e) => {
-                    error!(
-                        function = "ChatPreparationStage::execute",
-                        error = %e,
-                        "Multimodal processing failed"
-                    );
-                    return Err(error::bad_request(
-                        "multimodal_processing_failed",
-                        format!("Multimodal processing failed: {e}"),
-                    ));
+            let current_turn_has_multimodal =
+                multimodal::has_multimodal_content(multimodal_messages);
+            if replacement_scan_start == 0 || current_turn_has_multimodal {
+                let processing_result = if replacement_scan_start == 0 {
+                    multimodal::process_multimodal(
+                        multimodal_messages,
+                        &model_id,
+                        &*tokenizer,
+                        token_ids,
+                        &mm_components,
+                        &tokenizer_id,
+                        &tokenizer_source,
+                    )
+                    .await
+                } else {
+                    multimodal::process_multimodal_incremental(
+                        multimodal_messages,
+                        &model_id,
+                        &*tokenizer,
+                        token_ids,
+                        replacement_scan_start,
+                        &mm_components,
+                        &tokenizer_id,
+                        &tokenizer_source,
+                    )
+                    .await
+                };
+
+                match processing_result {
+                    Ok(output) => {
+                        debug!(
+                            function = "ChatPreparationStage::execute",
+                            expanded_tokens = output.expanded_token_ids.len(),
+                            "Multimodal processing complete"
+                        );
+                        token_ids = output.expanded_token_ids;
+                        multimodal_intermediate = Some(output.intermediate);
+                    }
+                    Err(e) => {
+                        error!(
+                            function = "ChatPreparationStage::execute",
+                            error = %e,
+                            "Multimodal processing failed"
+                        );
+                        return Err(error::bad_request(
+                            "multimodal_processing_failed",
+                            format!("Multimodal processing failed: {e}"),
+                        ));
+                    }
                 }
             }
         }
@@ -319,7 +352,7 @@ impl ChatPreparationStage {
         request: &ChatCompletionRequest,
         tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
         image_placeholder: Option<&str>,
-    ) -> Result<Option<Vec<u32>>, Response> {
+    ) -> Result<Option<TitoTokenizationHit>, Response> {
         let store = match self.tito_store.as_ref() {
             Some(s) => s,
             None => return Ok(None),
@@ -467,6 +500,10 @@ impl ChatPreparationStage {
             tc.is_tito_hit = true;
             tc.matched_message_num = matched_message_num;
         }
-        Ok(Some(merged_ids))
+        Ok(Some(TitoTokenizationHit {
+            merged_token_ids: merged_ids,
+            matched_message_num,
+            prefix_token_len,
+        }))
     }
 }

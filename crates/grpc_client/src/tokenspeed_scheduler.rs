@@ -217,6 +217,7 @@ impl TokenSpeedSchedulerClient {
         body: &GenerateRequest,
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_inputs: Option<tokenspeed_proto::MultimodalInputs>,
     ) -> Result<tokenspeed_proto::GenerateRequest, String> {
         let sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
@@ -232,7 +233,7 @@ impl TokenSpeedSchedulerClient {
             top_logprobs_num: body.top_logprobs_num.unwrap_or(0),
             token_ids_logprob: body.token_ids_logprob.clone().unwrap_or_default(),
             stream: body.stream,
-            mm_inputs: None,
+            mm_inputs: multimodal_inputs,
             // EPD bootstrap info injected later by the EPD pipeline, if applicable:
             // `encode_bootstrap_info` (E->P embedding) and
             // `kv_bootstrap_info` (P->D KV).
