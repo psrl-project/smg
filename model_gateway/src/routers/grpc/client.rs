@@ -685,36 +685,58 @@ impl GrpcClient {
         body: &GenerateRequest,
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_inputs: Option<MultimodalData>,
     ) -> Result<ProtoGenerateRequest, String> {
         match self {
             Self::Sglang(client) => {
+                let mm = match multimodal_inputs {
+                    Some(MultimodalData::Sglang(data)) => Some(data.into_proto()),
+                    Some(_) => return Err("multimodal payload/backend mismatch for SGLang".into()),
+                    None => None,
+                };
                 let req = client.build_plain_generate_request(
                     request_id,
                     body,
                     original_text,
                     token_ids,
+                    mm,
                 )?;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(client) => {
+                let mm = match multimodal_inputs {
+                    Some(MultimodalData::Vllm(data)) => Some(data.into_proto()),
+                    Some(_) => return Err("multimodal payload/backend mismatch for vLLM".into()),
+                    None => None,
+                };
                 let req = client.build_plain_generate_request(
                     request_id,
                     body,
                     original_text,
                     token_ids,
+                    mm,
                 )?;
                 Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
             }
             Self::Trtllm(client) => {
+                let mm = match multimodal_inputs {
+                    Some(MultimodalData::Trtllm(data)) => Some(data.into_proto()),
+                    Some(_) => return Err("multimodal payload/backend mismatch for TRT-LLM".into()),
+                    None => None,
+                };
                 let req = client.build_plain_generate_request(
                     request_id,
                     body,
                     original_text,
                     token_ids,
+                    mm,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
             Self::Mlx(client) => {
+                if multimodal_inputs.is_some() {
+                    return Err("MLX backend does not support multimodal inputs".to_string());
+                }
                 let req = client.build_plain_generate_request(
                     request_id,
                     body,
@@ -724,13 +746,22 @@ impl GrpcClient {
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
             Self::TokenSpeed(client) => {
-                let req = client.build_plain_generate_request(
-                    request_id,
-                    body,
-                    original_text,
-                    token_ids,
-                )?;
-                Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
+                let mm = match multimodal_inputs {
+                    Some(MultimodalData::TokenSpeed(data)) => Some(data.into_proto(true)),
+                    Some(_) => {
+                        return Err("multimodal payload/backend mismatch for TokenSpeed".into())
+                    }
+                    None => None,
+                };
+                finish_tokenspeed_request(mm, |mm| {
+                    client.build_plain_generate_request(
+                        request_id,
+                        body,
+                        original_text,
+                        token_ids,
+                        mm,
+                    )
+                })
             }
         }
     }

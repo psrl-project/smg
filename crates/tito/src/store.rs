@@ -22,10 +22,35 @@ use crate::{
 pub struct PrefixEntry {
     /// Concatenation of prompt_token_ids + output_ids from the backend response.
     pub token_ids: Arc<Vec<u32>>,
+    /// Same conversation prefix before multimodal anchor expansion, when it
+    /// differs from `token_ids`. Pure-text entries reuse `token_ids` directly.
+    pub reusable_prefix_token_ids: Option<Arc<Vec<u32>>>,
     /// Hash of the parent prefix (None for Turn 1 root children).
     pub parent_hash: Option<PrefixHash>,
     /// Metadata for the assistant turn that produced this node.
     pub turn_record: TurnRecord,
+}
+
+/// Token representations stored for one TITO node.
+pub struct StoredTokenSequences {
+    expanded: Vec<u32>,
+    reusable: Option<Vec<u32>>,
+}
+
+impl StoredTokenSequences {
+    fn shared(token_ids: Vec<u32>) -> Self {
+        Self {
+            expanded: token_ids,
+            reusable: None,
+        }
+    }
+
+    /// Keep a distinct reusable sequence only when multimodal expansion
+    /// actually changed the token IDs.
+    pub fn with_reusable(expanded: Vec<u32>, reusable: Vec<u32>) -> Self {
+        let reusable = (expanded != reusable).then_some(reusable);
+        Self { expanded, reusable }
+    }
 }
 
 /// Internal session state managed behind a Mutex.
@@ -434,9 +459,13 @@ impl TitoStore {
                     prefix_tokens = entry.token_ids.len(),
                     "find_prefix_with_lookup: HIT"
                 );
+                let reusable_prefix_token_ids = entry
+                    .reusable_prefix_token_ids
+                    .as_deref()
+                    .unwrap_or(entry.token_ids.as_ref());
                 return Ok(PrefixLookup {
                     matched: Some(PrefixMatch {
-                        pretokenized_ids: (*entry.token_ids).clone(),
+                        pretokenized_ids: reusable_prefix_token_ids.clone(),
                         matched_message_num: *k,
                     }),
                     running_hasher: hasher,
@@ -493,6 +522,46 @@ impl TitoStore {
         turn_record: TurnRecord,
         trajectory_id: u64,
     ) -> Result<(), TitoError> {
+        self.store_token_sequences(
+            session_id,
+            leaf_hash,
+            parent_hash,
+            StoredTokenSequences::shared(token_ids),
+            turn_record,
+            trajectory_id,
+        )
+    }
+
+    /// Store the expanded training sequence and the unexpanded reusable TITO
+    /// prefix as separate representations of the same conversation node.
+    pub fn store_with_hashes_and_reusable(
+        &self,
+        session_id: &str,
+        leaf_hash: PrefixHash,
+        parent_hash: Option<PrefixHash>,
+        token_ids: StoredTokenSequences,
+        turn_record: TurnRecord,
+        trajectory_id: u64,
+    ) -> Result<(), TitoError> {
+        self.store_token_sequences(
+            session_id,
+            leaf_hash,
+            parent_hash,
+            token_ids,
+            turn_record,
+            trajectory_id,
+        )
+    }
+
+    fn store_token_sequences(
+        &self,
+        session_id: &str,
+        leaf_hash: PrefixHash,
+        parent_hash: Option<PrefixHash>,
+        token_ids: StoredTokenSequences,
+        turn_record: TurnRecord,
+        trajectory_id: u64,
+    ) -> Result<(), TitoError> {
         let arc = self.get_or_create_session_arc(session_id);
         let mut state = arc.lock();
 
@@ -505,7 +574,8 @@ impl TitoStore {
         state.entries.insert(
             leaf_hash,
             PrefixEntry {
-                token_ids: Arc::new(token_ids),
+                token_ids: Arc::new(token_ids.expanded),
+                reusable_prefix_token_ids: token_ids.reusable.map(Arc::new),
                 parent_hash,
                 turn_record,
             },
@@ -1432,6 +1502,89 @@ mod tests {
         assert_eq!(r.trajectory_id, n.trajectory_id);
         assert_eq!(r.accumulated_token_ids, n.accumulated_token_ids);
         assert_eq!(r.turn_records.len(), n.turn_records.len());
+
+        // Pure-text nodes keep one token buffer: incremental lookup falls
+        // back to the expanded/training sequence because both are identical.
+        {
+            let session = reused
+                .get_session_arc("s")
+                .expect("the text session should exist");
+            let state = session.lock();
+            let entry = state
+                .entries
+                .get(&leaf_hash)
+                .expect("the text prefix should be stored");
+            assert!(entry.reusable_prefix_token_ids.is_none());
+        }
+
+        let mut next_request = all_msgs;
+        next_request.push(user_msg("e"));
+        let matched = reused
+            .find_prefix_with_lookup("s", &next_request, &ctx)
+            .unwrap()
+            .matched
+            .expect("the text prefix should remain reusable");
+        assert_eq!(matched.pretokenized_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn stored_token_sequences_deduplicates_identical_reusable_ids() {
+        let token_ids = StoredTokenSequences::with_reusable(vec![1, 2, 3], vec![1, 2, 3]);
+
+        assert_eq!(token_ids.expanded, vec![1, 2, 3]);
+        assert!(token_ids.reusable.is_none());
+    }
+
+    #[test]
+    fn multimodal_prefix_reuses_unexpanded_ids_but_exports_expanded_trajectory() {
+        let store = make_store();
+        let ctx = render_context();
+        let first_turn = vec![user_msg("<image> describe"), assistant_msg("cat")];
+        let leaf_hash = hash_messages_with_context(&first_turn, &ctx);
+        store
+            .store_with_hashes_and_reusable(
+                "mm-session",
+                leaf_hash,
+                None,
+                StoredTokenSequences::with_reusable(
+                    vec![10, 99, 99, 99, 20], // training sequence
+                    vec![10, 42, 20],         // one media anchor
+                ),
+                record(5, "stop"),
+                0,
+            )
+            .unwrap();
+
+        {
+            let session = store
+                .get_session_arc("mm-session")
+                .expect("the multimodal session should exist");
+            let state = session.lock();
+            let entry = state
+                .entries
+                .get(&leaf_hash)
+                .expect("the multimodal prefix should be stored");
+            assert!(entry.reusable_prefix_token_ids.is_some());
+        }
+
+        let next_request = vec![
+            user_msg("<image> describe"),
+            assistant_msg("cat"),
+            user_msg("and this <image>?"),
+        ];
+        let lookup = store
+            .find_prefix_with_lookup("mm-session", &next_request, &ctx)
+            .unwrap();
+        let matched = lookup
+            .matched
+            .expect("the first multimodal turn should match");
+        assert_eq!(matched.pretokenized_ids, vec![10, 42, 20]);
+
+        let trajectories = store.get_all_trajectories("mm-session");
+        assert_eq!(
+            trajectories[0].accumulated_token_ids,
+            vec![10, 99, 99, 99, 20]
+        );
     }
 
     #[test]

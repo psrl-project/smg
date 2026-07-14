@@ -236,8 +236,15 @@ impl SglangSchedulerClient {
         body: &GenerateRequest,
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_inputs: Option<proto::MultimodalInputs>,
     ) -> Result<proto::GenerateRequest, String> {
-        Self::build_plain_generate_request_parts(request_id, body, original_text, token_ids)
+        Self::build_plain_generate_request_parts(
+            request_id,
+            body,
+            original_text,
+            token_ids,
+            multimodal_inputs,
+        )
     }
 
     fn build_plain_generate_request_parts(
@@ -245,6 +252,7 @@ impl SglangSchedulerClient {
         body: &GenerateRequest,
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_inputs: Option<proto::MultimodalInputs>,
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
@@ -265,6 +273,7 @@ impl SglangSchedulerClient {
             logprob_start_len: body.logprob_start_len.unwrap_or(-1),
             top_logprobs_num: body.top_logprobs_num.unwrap_or(0),
             token_ids_logprob: body.token_ids_logprob.clone().unwrap_or_default(),
+            mm_inputs: multimodal_inputs,
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
             log_metrics: body.log_metrics,
@@ -998,6 +1007,7 @@ mod tests {
             &enabled,
             Some("hello".into()),
             vec![1],
+            None,
         )
         .expect("build request");
         assert!(enabled_proto.require_reasoning);
@@ -1012,6 +1022,7 @@ mod tests {
             &disabled,
             Some("hello".into()),
             vec![1],
+            None,
         )
         .expect("build request");
         assert!(!disabled_proto.require_reasoning);
@@ -1026,6 +1037,7 @@ mod tests {
             &non_bool,
             Some("hello".into()),
             vec![1],
+            None,
         )
         .expect("build request");
         assert!(!non_bool_proto.require_reasoning);

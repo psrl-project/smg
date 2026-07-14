@@ -619,6 +619,8 @@ async fn test_unsupported_endpoints() {
         image_data: None,
         video_data: None,
         audio_data: None,
+        multimodal_token_mode: None,
+        preprocessed_mm_inputs: None,
         sampling_params: None,
         return_logprob: Some(false),
         logprob_start_len: None,

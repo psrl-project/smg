@@ -18,10 +18,13 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use base64::Engine as _;
 use llm_multimodal::{
-    AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
-    PreprocessedEncoderInputs, VideoClip,
+    AudioClip, EncoderFieldLayouts, FieldLayout, ImageFrame, Modality, ModelSpecificValue,
+    PlaceholderRange, PreprocessedEncoderInputs, VideoClip,
 };
+use ndarray::ArrayD;
+use openai_protocol::generate::{PreprocessedMultimodalInputs, SerializedMultimodalTensor};
 
 mod assemble;
 mod capability;
@@ -42,11 +45,14 @@ pub(crate) use config::{
     load_preprocessor_config_file, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
-pub(crate) use detect::{media_plan_chat, media_plan_messages};
+pub(crate) use detect::{media_plan_chat, media_plan_generate, media_plan_messages};
 pub(crate) use plan::{
     prepare_placeholder_tokens, validate_rendered_media_anchors, PlaceholderTokens,
 };
-pub(crate) use process::process_multimodal_plan;
+pub(crate) use process::{
+    process_multimodal_plan, process_multimodal_plan_preexpanded,
+    process_multimodal_plan_python_preprocessed,
+};
 pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 
 /// Whether verbose multimodal timing logs are enabled via `SMG_LOG_MM_TIMING`.
@@ -169,4 +175,141 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     pub field_layouts: EncoderFieldLayouts,
     /// Tensor keys that should remain on CPU (vLLM `keep_on_cpu` hint).
     pub keep_on_cpu_keys: Vec<String>,
+}
+
+/// Replace Rust-produced tensors with caller-produced HF tensors while keeping
+/// the fetched raw media (and therefore stable content hashes) authoritative.
+pub(crate) fn apply_python_preprocessed_inputs(
+    intermediate: MultimodalIntermediate,
+    payload: &PreprocessedMultimodalInputs,
+) -> anyhow::Result<MultimodalIntermediate> {
+    let mut batches = intermediate.into_batches();
+    anyhow::ensure!(
+        batches.len() == 1,
+        "Python-preprocessed /generate supports one image batch"
+    );
+    let batch = &mut batches[0];
+    anyhow::ensure!(
+        matches!(batch.media, MediaBatch::Images(_)),
+        "Python-preprocessed inputs require images"
+    );
+    anyhow::ensure!(
+        payload.mm_placeholders.len() == batch.media.len(),
+        "Python placeholders ({}) do not match image count ({})",
+        payload.mm_placeholders.len(),
+        batch.media.len()
+    );
+
+    let pixels = decode_f32_tensor(&payload.pixel_values)?;
+    let mut model_specific = std::collections::HashMap::new();
+    for (key, tensor) in &payload.model_specific_tensors {
+        let value = match tensor.dtype.as_str() {
+            "float32" => ModelSpecificValue::Tensor {
+                data: decode_f32_values(tensor)?,
+                shape: tensor.shape.clone(),
+            },
+            "int64" => ModelSpecificValue::IntTensor {
+                data: decode_i64_values(tensor)?,
+                shape: tensor.shape.clone(),
+            },
+            other => anyhow::bail!("Unsupported Python tensor dtype {other} for {key}"),
+        };
+        model_specific.insert(key.clone(), value);
+    }
+    let item_sizes = batch.preprocessed.item_sizes.clone();
+    batch.preprocessed = PreprocessedEncoderInputs {
+        encoder_input: pixels,
+        feature_token_counts: payload
+            .mm_placeholders
+            .iter()
+            .map(|(_, len)| *len as usize)
+            .collect(),
+        item_sizes,
+        model_specific,
+    };
+    batch.bindings = payload
+        .mm_placeholders
+        .iter()
+        .enumerate()
+        .map(|(item_index, &(offset, length))| {
+            let range = PlaceholderRange {
+                offset: offset as usize,
+                length: length as usize,
+            };
+            PromptBinding {
+                item_index,
+                prompt_ordinal: item_index,
+                structural: range.clone(),
+                patches: vec![range],
+            }
+        })
+        .collect();
+    let encoder_input_layout = payload
+        .flat_keys
+        .get("pixel_values")
+        .map(|sizes_key| FieldLayout::flat(sizes_key.clone()))
+        .unwrap_or(FieldLayout::Batched);
+    let mut model_layouts = std::collections::HashMap::new();
+    for key in &payload.batched_keys {
+        if key != "pixel_values" {
+            model_layouts.insert(key.clone(), FieldLayout::Batched);
+        }
+    }
+    for (key, sizes_key) in &payload.flat_keys {
+        if key != "pixel_values" {
+            model_layouts.insert(key.clone(), FieldLayout::flat(sizes_key.clone()));
+        }
+    }
+    batch.field_layouts = EncoderFieldLayouts::new(encoder_input_layout, model_layouts);
+    batch.keep_on_cpu_keys.clone_from(&payload.keep_on_cpu_keys);
+    MultimodalIntermediate::try_new(batches)
+}
+
+fn decode_bytes(tensor: &SerializedMultimodalTensor) -> anyhow::Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(&tensor.data)
+        .map_err(|error| anyhow::anyhow!("Invalid base64 tensor: {error}"))
+}
+
+fn element_count(shape: &[usize]) -> anyhow::Result<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |acc, value| acc.checked_mul(*value))
+        .ok_or_else(|| anyhow::anyhow!("Tensor shape overflows usize"))
+}
+
+fn expected_bytes(shape: &[usize], element_size: usize) -> anyhow::Result<usize> {
+    element_count(shape)?
+        .checked_mul(element_size)
+        .ok_or_else(|| anyhow::anyhow!("Tensor byte length overflows usize"))
+}
+
+fn decode_f32_values(tensor: &SerializedMultimodalTensor) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(tensor.dtype == "float32", "pixel_values must use float32");
+    let bytes = decode_bytes(tensor)?;
+    anyhow::ensure!(
+        bytes.len() == expected_bytes(&tensor.shape, 4)?,
+        "float32 tensor byte length mismatch"
+    );
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect())
+}
+
+fn decode_i64_values(tensor: &SerializedMultimodalTensor) -> anyhow::Result<Vec<i64>> {
+    let bytes = decode_bytes(tensor)?;
+    anyhow::ensure!(
+        bytes.len() == expected_bytes(&tensor.shape, 8)?,
+        "int64 tensor byte length mismatch"
+    );
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        .collect())
+}
+
+fn decode_f32_tensor(tensor: &SerializedMultimodalTensor) -> anyhow::Result<ArrayD<f32>> {
+    ArrayD::from_shape_vec(tensor.shape.clone(), decode_f32_values(tensor)?)
+        .map_err(|error| anyhow::anyhow!("Invalid pixel_values shape: {error}"))
 }

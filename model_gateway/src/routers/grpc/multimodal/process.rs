@@ -45,6 +45,78 @@ pub(crate) async fn process_multimodal_plan(
     tokenizer_id: &str,
     tokenizer_source: &str,
 ) -> Result<MultimodalOutput> {
+    process_multimodal_plan_with_mode(
+        plan,
+        model_id,
+        tokenizer,
+        token_ids,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+        false,
+        true,
+    )
+    .await
+}
+
+/// Process media while preserving caller-expanded placeholder runs.
+pub(crate) async fn process_multimodal_plan_preexpanded(
+    plan: MediaPlan,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    token_ids: Vec<u32>,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+) -> Result<MultimodalOutput> {
+    process_multimodal_plan_with_mode(
+        plan,
+        model_id,
+        tokenizer,
+        token_ids,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+        true,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn process_multimodal_plan_python_preprocessed(
+    plan: MediaPlan,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    token_ids: Vec<u32>,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+) -> Result<MultimodalOutput> {
+    process_multimodal_plan_with_mode(
+        plan,
+        model_id,
+        tokenizer,
+        token_ids,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+        true,
+        false,
+    )
+    .await
+}
+
+async fn process_multimodal_plan_with_mode(
+    plan: MediaPlan,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    token_ids: Vec<u32>,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+    preexpanded: bool,
+    validate_preexpanded_counts: bool,
+) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
     let media_started = Instant::now();
@@ -276,7 +348,11 @@ pub(crate) async fn process_multimodal_plan(
             replacements: &part.prompt_replacements,
         })
         .collect::<Vec<_>>();
-    let expanded = expand_tokens_for_modalities(&token_ids, &expansions)?;
+    let expanded = if preexpanded {
+        bindings_for_preexpanded(&token_ids, &prepared_parts, validate_preexpanded_counts)?
+    } else {
+        expand_tokens_for_modalities(&token_ids, &expansions)?
+    };
     let placeholder_count = expanded.bindings.iter().map(Vec::len).sum::<usize>();
 
     debug!(
@@ -326,6 +402,73 @@ pub(crate) async fn process_multimodal_plan(
     Ok(MultimodalOutput {
         expanded_token_ids: expanded.token_ids,
         intermediate,
+    })
+}
+
+fn bindings_for_preexpanded(
+    token_ids: &[u32],
+    parts: &[PreparedMultimodalPart],
+    validate_counts: bool,
+) -> Result<ExpandedMultimodalTokens> {
+    let mut all_bindings = Vec::with_capacity(parts.len());
+    let mut ordinal = 0usize;
+    for part in parts {
+        let search_id = part
+            .placeholder_token_id
+            .or(part.search_token_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not resolve placeholder token ID for {}",
+                    part.media.modality()
+                )
+            })?;
+        let mut ranges = Vec::new();
+        let mut i = 0;
+        while i < token_ids.len() {
+            if token_ids[i] != search_id {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < token_ids.len() && token_ids[i] == search_id {
+                i += 1;
+            }
+            ranges.push(PlaceholderRange {
+                offset: start,
+                length: i - start,
+            });
+        }
+        anyhow::ensure!(
+            ranges.len() == part.media.len(),
+            "Preexpanded prompt contains {} {} placeholder runs, but request has {} items",
+            ranges.len(),
+            part.media.modality(),
+            part.media.len()
+        );
+        let mut bindings = Vec::with_capacity(ranges.len());
+        for (item_index, (range, expected)) in ranges
+            .into_iter()
+            .zip(part.preprocessed.feature_token_counts.iter())
+            .enumerate()
+        {
+            if validate_counts {
+                anyhow::ensure!(range.length == *expected,
+                    "{} item {item_index} placeholder length mismatch: prompt has {}, processor requires {}",
+                    part.media.modality(), range.length, expected);
+            }
+            bindings.push(PromptBinding {
+                item_index,
+                prompt_ordinal: ordinal,
+                structural: range.clone(),
+                patches: vec![range],
+            });
+            ordinal += 1;
+        }
+        all_bindings.push(bindings);
+    }
+    Ok(ExpandedMultimodalTokens {
+        token_ids: token_ids.to_vec(),
+        bindings: all_bindings,
     })
 }
 
@@ -803,6 +946,37 @@ mod tests {
         assert_eq!(result.bindings[0][0].structural.length, 2);
         assert_eq!(result.bindings[0][1].structural.offset, 4);
         assert_eq!(result.bindings[0][1].structural.length, 3);
+    }
+
+    #[test]
+    fn tito_multiturn_reexpands_historical_and_incremental_media_anchors() {
+        // Turn 1's reusable TITO prefix retains anchor 100; incremental
+        // tokenization appends turn 2 with another anchor. Full-plan expansion
+        // must bind both images even when the selected worker has no prior KV.
+        let reusable_turn_one = [1, 100, 2, 3];
+        let incremental_turn_two = [4, 100, 5];
+        let merged = reusable_turn_one
+            .into_iter()
+            .chain(incremental_turn_two)
+            .collect::<Vec<_>>();
+        let replacements = vec![
+            PromptReplacement::sequence(Modality::Image, "<image>", vec![50, 50]),
+            PromptReplacement::sequence(Modality::Image, "<image>", vec![60, 60, 60]),
+        ];
+        let expansion = ModalityExpansion {
+            modality: Modality::Image,
+            search_token_id: Some(100),
+            placeholder_token_id: Some(50),
+            replacements: &replacements,
+        };
+
+        let result = expand_tokens_for_modalities(&merged, &[expansion]).unwrap();
+        assert_eq!(result.token_ids, vec![1, 50, 50, 2, 3, 4, 60, 60, 60, 5]);
+        assert_eq!(result.bindings[0].len(), 2);
+        assert_eq!(result.bindings[0][0].item_index, 0);
+        assert_eq!(result.bindings[0][1].item_index, 1);
+        assert_eq!(result.bindings[0][0].prompt_ordinal, 0);
+        assert_eq!(result.bindings[0][1].prompt_ordinal, 1);
     }
 
     #[test]

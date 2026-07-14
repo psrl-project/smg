@@ -182,6 +182,7 @@ impl TrtllmServiceClient {
         body: &GenerateRequest,
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_input: Option<proto::MultimodalInput>,
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_config = Self::build_sampling_config_from_plain(body.sampling_params.as_ref());
         let output_config = proto::OutputConfig {
@@ -238,7 +239,7 @@ impl TrtllmServiceClient {
             embedding_bias: vec![],
             lora_config: None,
             prompt_tuning_config: None,
-            multimodal_input: None,
+            multimodal_input,
             kv_cache_retention: None,
             disaggregated_params: None,
             lookahead_config: None,

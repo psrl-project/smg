@@ -34,7 +34,7 @@ use crate::{
         processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
         transforms::{
             par_threads, pil_to_filter, resize, resize_bicubic_pil, resize_bicubic_pil_rgb,
-            resize_rgb_bytes, rgb_bytes, TransformError,
+            resize_bicubic_torchvision, resize_rgb_bytes, rgb_bytes, TransformError,
         },
     },
 };
@@ -126,7 +126,49 @@ struct QwenVideoPlan {
     lut: [[f32; 256]; 3],
 }
 
-fn normalization_lut(
+fn normalization_lut_transformers_fast(
+    config: &PreProcessorConfig,
+    default_mean: [f64; 3],
+    default_std: [f64; 3],
+) -> [[f32; 256]; 3] {
+    let mean = config
+        .image_mean
+        .as_ref()
+        .filter(|values| values.len() >= 3)
+        .map(|values| [values[0], values[1], values[2]])
+        .unwrap_or(default_mean);
+    let std = config
+        .image_std
+        .as_ref()
+        .filter(|values| values.len() >= 3)
+        .map(|values| [values[0], values[1], values[2]])
+        .unwrap_or(default_std);
+    let do_rescale = config.do_rescale.unwrap_or(true);
+    let rescale_factor_f64 = config.rescale_factor.unwrap_or(1.0 / 255.0);
+    let rescale_factor = rescale_factor_f64 as f32;
+    let do_normalize = config.do_normalize.unwrap_or(true);
+    // Transformers 5.10.1 TorchvisionBackend fuses rescale into normalize in
+    // the uint8 domain. Preserve that operation order for bit-level parity.
+    let inverse_rescale = (1.0_f64 / rescale_factor_f64) as f32;
+    let fused_mean: [f32; 3] =
+        std::array::from_fn(|channel| mean[channel] as f32 * inverse_rescale);
+    let fused_std: [f32; 3] = std::array::from_fn(|channel| std[channel] as f32 * inverse_rescale);
+    std::array::from_fn(|channel| {
+        std::array::from_fn(|value| {
+            if do_normalize && do_rescale {
+                (value as f32 - fused_mean[channel]) / fused_std[channel]
+            } else if do_normalize {
+                (value as f32 - mean[channel] as f32) / std[channel] as f32
+            } else if do_rescale {
+                value as f32 * rescale_factor
+            } else {
+                value as f32
+            }
+        })
+    })
+}
+
+fn normalization_lut_pil_slow(
     config: &PreProcessorConfig,
     default_mean: [f64; 3],
     default_std: [f64; 3],
@@ -414,7 +456,7 @@ impl QwenVLProcessorBase {
             second_per_grid: temporal_patch_size as f32 / sample_fps,
             filter: pil_to_filter(config.resampling.or(Some(3))),
             do_resize: config.do_resize.unwrap_or(true),
-            lut: normalization_lut(config, self.config.mean, self.config.std),
+            lut: normalization_lut_pil_slow(config, self.config.mean, self.config.std),
         })
     }
 
@@ -1094,7 +1136,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let temporal_patch_size = self.config.temporal_patch_size;
         let patch_features = 3 * temporal_patch_size * patch_size * patch_size;
         let do_resize = config.do_resize.unwrap_or(true);
-        let lut = normalization_lut(config, self.config.mean, self.config.std);
+        let lut = normalization_lut_transformers_fast(config, self.config.mean, self.config.std);
 
         let mut image_plans = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
@@ -1151,10 +1193,10 @@ impl VisionPreProcessor for QwenVLProcessorBase {
             // Resize to the image's own target size (skip if dimensions match)
             let resized;
             let img_ref = if plan.needs_resize {
-                // BICUBIC (Qwen default) uses the PIL-compatible path; other
-                // filters keep the SIMD path.
+                // Qwen image preprocessing follows Transformers 5.10.1's
+                // default TorchvisionBackend path. Video retains PIL semantics.
                 resized = if filter == FilterType::CatmullRom {
-                    resize_bicubic_pil(image, plan.target_width, plan.target_height)
+                    resize_bicubic_torchvision(image, plan.target_width, plan.target_height)
                 } else {
                     resize(image, plan.target_width, plan.target_height, filter)
                 };

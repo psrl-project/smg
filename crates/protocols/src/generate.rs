@@ -10,6 +10,41 @@ use super::{
 };
 use crate::validated::Normalizable;
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MultimodalTokenMode {
+    #[default]
+    Unexpanded,
+    Preexpanded,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SerializedMultimodalTensor {
+    pub data: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+}
+
+/// Tensors produced by the caller's Hugging Face processor. Raw `image_data`
+/// remains required so SMG can derive stable content hashes independently of
+/// the request/trajectory identity.
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PreprocessedMultimodalInputs {
+    pub pixel_values: SerializedMultimodalTensor,
+    #[serde(default)]
+    pub model_specific_tensors: HashMap<String, SerializedMultimodalTensor>,
+    #[serde(default)]
+    pub mm_placeholders: Vec<(u32, u32)>,
+    #[serde(default)]
+    pub batched_keys: Vec<String>,
+    #[serde(default)]
+    pub flat_keys: HashMap<String, String>,
+    #[serde(default)]
+    pub keep_on_cpu_keys: Vec<String>,
+}
+
 // ============================================================================
 // SGLang Generate API (native format)
 // ============================================================================
@@ -54,6 +89,14 @@ pub struct GenerateRequest {
     /// Placeholder for future use
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_data: Option<Value>,
+
+    /// Whether multimodal anchors in `input_ids` still need expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_token_mode: Option<MultimodalTokenMode>,
+
+    /// Optional caller-preprocessed tensors. This is independent of token mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preprocessed_mm_inputs: Option<PreprocessedMultimodalInputs>,
 
     /// Sampling parameters (sglang style)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,6 +239,26 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
     if count > 1 {
         return Err(validator::ValidationError::new(
             "Either text or input_ids should be provided.",
+        ));
+    }
+
+    if matches!(
+        req.multimodal_token_mode,
+        Some(MultimodalTokenMode::Preexpanded)
+    ) && req.input_ids.is_none()
+    {
+        return Err(validator::ValidationError::new(
+            "preexpanded multimodal inputs require input_ids",
+        ));
+    }
+    if req.preprocessed_mm_inputs.is_some()
+        && (!matches!(
+            req.multimodal_token_mode,
+            Some(MultimodalTokenMode::Preexpanded)
+        ) || req.image_data.is_none())
+    {
+        return Err(validator::ValidationError::new(
+            "preprocessed_mm_inputs require preexpanded input_ids and image_data",
         ));
     }
 

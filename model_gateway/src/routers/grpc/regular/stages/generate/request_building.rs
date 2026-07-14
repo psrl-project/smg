@@ -9,7 +9,10 @@ use crate::routers::{
     error,
     grpc::{
         common::stages::{helpers, PipelineStage},
-        context::{ClientSelection, ExecutionPlan, ExecutionPlanKind, RequestContext},
+        context::{
+            ClientSelection, ExecutionPlan, ExecutionPlanKind, PreparationOutput, RequestContext,
+        },
+        multimodal::assemble_multimodal_data,
     },
 };
 
@@ -33,7 +36,7 @@ impl GenerateRequestBuildingStage {
 #[async_trait]
 impl PipelineStage for GenerateRequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+        let prep = ctx.state.preparation.take().ok_or_else(|| {
             error!(
                 function = "GenerateRequestBuildingStage::execute",
                 "Preparation not completed"
@@ -70,13 +73,34 @@ impl PipelineStage for GenerateRequestBuildingStage {
             None => format!("gen-{}", Uuid::now_v7()),
         };
 
+        let PreparationOutput::Generate {
+            original_text,
+            token_ids,
+            multimodal_intermediate,
+        } = prep
+        else {
+            return Err(error::internal_error(
+                "wrong_preparation_type",
+                "Expected Generate preparation output",
+            ));
+        };
+        let multimodal_data = match multimodal_intermediate {
+            Some(intermediate) => Some(
+                assemble_multimodal_data(intermediate, builder_client, ctx.state.workers.as_ref())
+                    .await
+                    .map_err(|e| error::bad_request("multimodal_not_supported", e.to_string()))?,
+            ),
+            None => None,
+        };
+
         // Build proto request using centralized dispatch
         let mut proto_request = builder_client
             .build_generate_request(
                 request_id,
                 &generate_request,
-                prep.routing_text().map(String::from),
-                prep.token_ids().to_vec(),
+                original_text,
+                token_ids,
+                multimodal_data,
             )
             .map_err(|e| {
                 error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build generate request");

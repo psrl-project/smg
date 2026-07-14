@@ -358,6 +358,7 @@ impl VllmEngineClient {
         body: &GenerateRequest,
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_inputs: Option<proto::MultimodalInputs>,
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
@@ -373,7 +374,7 @@ impl VllmEngineClient {
             sampling_params: Some(sampling_params),
             stream: body.stream,
             kv_transfer_params: None,
-            mm_inputs: None,
+            mm_inputs: multimodal_inputs,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
         };

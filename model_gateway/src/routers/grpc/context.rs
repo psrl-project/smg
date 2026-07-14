@@ -295,6 +295,7 @@ pub(crate) enum PreparationOutput {
     Generate {
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_intermediate: Option<super::multimodal::MultimodalIntermediate>,
     },
     Embedding {
         original_text: String,
@@ -489,6 +490,9 @@ pub(crate) struct TitoRequestContext {
     /// ChatResponseProcessingStage for TITO capture).
     /// Consumed by `ChatRequestBuildingStage::execute()` before response processing runs.
     pub prompt_token_ids: Vec<u32>,
+    /// Prompt IDs before multimodal anchor expansion, retained for the next
+    /// incremental TITO turn. Pure-text requests reuse `prompt_token_ids`.
+    pub reusable_prompt_token_ids: Option<Vec<u32>>,
     /// Snapshot of the prefix hash.
     /// The response stage extends this in place with the newly-generated
     /// assistant message and finalizes it to derive the leaf hash,

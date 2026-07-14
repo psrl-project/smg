@@ -8,8 +8,10 @@ use llm_multimodal::{ImageDetail, MediaContentPart};
 use openai_protocol::{
     chat::{ChatMessage, MessageContent},
     common::ContentPart,
+    generate::GenerateRequest,
     messages::{ImageSource, InputContent, InputContentBlock, InputMessage, Role},
 };
+use serde_json::Value;
 
 use super::plan::MediaPlan;
 
@@ -71,6 +73,65 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
 /// Build the canonical ordered media plan for Chat Completions input.
 pub(crate) fn media_plan_chat(messages: &[ChatMessage]) -> MediaPlan {
     MediaPlan::new(extract_media_parts(messages))
+}
+
+/// Normalize SGLang-compatible `/generate` image_data into the shared plan.
+pub(crate) fn media_plan_generate(request: &GenerateRequest) -> MediaPlan {
+    let mut parts = Vec::new();
+    if let Some(value) = &request.image_data {
+        push_generate_images(value, None, &mut parts);
+    }
+    MediaPlan::new(parts)
+}
+
+fn push_generate_images(
+    value: &Value,
+    inherited_detail: Option<ImageDetail>,
+    parts: &mut Vec<MediaContentPart>,
+) {
+    match value {
+        Value::String(url) if !url.is_empty() => parts.push(MediaContentPart::ImageUrl {
+            url: url.clone(),
+            detail: inherited_detail,
+            uuid: None,
+        }),
+        Value::Array(values) => {
+            for value in values {
+                push_generate_images(value, inherited_detail, parts);
+            }
+        }
+        Value::Object(map) => {
+            let detail = map
+                .get("detail")
+                .and_then(Value::as_str)
+                .and_then(parse_detail)
+                .or(inherited_detail);
+            if let Some(value) = map.get("image_url") {
+                match value {
+                    Value::String(_) => push_generate_images(value, detail, parts),
+                    Value::Object(nested) => {
+                        let nested_detail = nested
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .and_then(parse_detail)
+                            .or(detail);
+                        if let Some(url) = nested.get("url") {
+                            push_generate_images(url, nested_detail, parts);
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            for key in ["url", "image", "path"] {
+                if let Some(url) = map.get(key) {
+                    push_generate_images(url, detail, parts);
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Parse OpenAI detail string to multimodal ImageDetail enum.
@@ -320,5 +381,21 @@ mod tests {
         assert_eq!(parse_detail("LOW"), Some(ImageDetail::Low));
         assert_eq!(parse_detail("high"), Some(ImageDetail::High));
         assert_eq!(parse_detail("unknown"), None);
+    }
+
+    #[test]
+    fn generate_image_data_normalizes_nested_sglang_shapes() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "model": "qwen",
+            "input_ids": [1, 2],
+            "image_data": [
+                "https://example.com/a.png",
+                {"image_url": {"url": "data:image/png;base64,AA==", "detail": "high"}}
+            ]
+        }))
+        .unwrap();
+        let plan = media_plan_generate(&request);
+        assert_eq!(plan.count(Modality::Image), 2);
+        assert_eq!(plan.modalities(), &[Modality::Image]);
     }
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use llm_multimodal::Modality;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ToolChoice, ToolChoiceValue},
@@ -138,15 +139,26 @@ impl ChatPreparationStage {
             ));
         };
 
-        // Step 2: Attempt TITO incremental tokenization, do full tokenization if TITO fails
-        // Multimodal prompts are deliberately excluded: TITO stores expanded
-        // prompt IDs, while the media plan below requires unexpanded anchors to
-        // rebuild item bindings. Reusing such a prefix would corrupt offsets.
-        let tito_token_ids: Option<Vec<u32>> = if mm_context.is_none() {
-            self.try_tito(ctx, body_ref.as_ref(), &tokenizer, None)?
-        } else {
-            None
-        };
+        // TITO always operates on unexpanded anchors. On a hit the reusable
+        // prefix is merged with only the appended messages; the complete media
+        // plan below then rebuilds bindings/tensors for every historical item.
+        let image_placeholder = placeholder_tokens
+            .as_ref()
+            .and_then(|tokens| tokens.get(Modality::Image));
+        let video_placeholder = placeholder_tokens
+            .as_ref()
+            .and_then(|tokens| tokens.get(Modality::Video));
+        let audio_placeholder = placeholder_tokens
+            .as_ref()
+            .and_then(|tokens| tokens.get(Modality::Audio));
+        let tito_token_ids = self.try_tito(
+            ctx,
+            body_ref.as_ref(),
+            &tokenizer,
+            image_placeholder,
+            video_placeholder,
+            audio_placeholder,
+        )?;
 
         let (mut token_ids, processed_messages) = if let Some(ids) = tito_token_ids {
             (
@@ -210,6 +222,10 @@ impl ChatPreparationStage {
                 error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
             })?;
         }
+
+        // Only multimodal processing can replace media anchors with expanded
+        // model tokens. Pure-text TITO reuses `token_ids` without a second copy.
+        let reusable_prompt_token_ids = mm_context.as_ref().map(|_| token_ids.clone());
 
         // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash)
         let mut multimodal_intermediate = None;
@@ -308,6 +324,7 @@ impl ChatPreparationStage {
         // by request_building (which .take()s preparation).
         if let Some(ref mut tc) = ctx.state.tito_context {
             tc.prompt_token_ids.clone_from(&token_ids);
+            tc.reusable_prompt_token_ids = reusable_prompt_token_ids;
         }
 
         // Store results in context
@@ -337,6 +354,8 @@ impl ChatPreparationStage {
         request: &ChatCompletionRequest,
         tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
         image_placeholder: Option<&str>,
+        video_placeholder: Option<&str>,
+        audio_placeholder: Option<&str>,
     ) -> Result<Option<Vec<u32>>, Response> {
         let store = match self.tito_store.as_ref() {
             Some(s) => s,
@@ -372,7 +391,13 @@ impl ChatPreparationStage {
 
         let request_arc = Arc::new(request.clone());
         let messages = request.messages.as_slice();
-        let render_context = utils::get_render_context_from_request(request, image_placeholder).map_err(|e| {
+        let render_context = utils::get_render_context_from_request(request, image_placeholder).map(|context| {
+            context.with_media_placeholders(
+                image_placeholder.map(String::from),
+                video_placeholder.map(String::from),
+                audio_placeholder.map(String::from),
+            )
+        }).map_err(|e| {
             error!(function = "ChatPreparationStage::try_tito", error = %e, "Failed to build TITO render context");
             error::bad_request("tito_render_context_failed", e)
         })?;
@@ -410,6 +435,7 @@ impl ChatPreparationStage {
             matched_message_num: 0,
             trajectory_id,
             prompt_token_ids: Vec::new(),
+            reusable_prompt_token_ids: None,
             running_hasher,
             parent_hash,
         });
