@@ -7,19 +7,19 @@
 use anyhow::{anyhow, Result};
 use rand::RngExt;
 use smg_grpc_client::{
+    common_proto,
     tokenspeed_encoder::{tokenspeed_encoder_proto as tokenspeed_encoder, TokenSpeedEncoderClient},
-    tokenspeed_proto,
 };
 use uuid::Uuid;
 
 use super::{
     client::GrpcClient,
     context::{ClientSelection, WorkerSelection},
-    multimodal::{assemble_tokenspeed, MultimodalIntermediate, PrecomputedMultimodalIntermediate},
+    multimodal::{assemble_tokenspeed_for_encode, mm_rdma_exporter, MultimodalIntermediate},
     proto_wrapper::{
-        cleanup_tokenspeed_items_encoder_shm, cleanup_tokenspeed_shm_handles,
-        collect_tokenspeed_multimodal_inputs_shm_handles, EncodeItemBootstrapInfo,
-        TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
+        cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
+        collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
+        EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
     },
 };
 use crate::worker::DEFAULT_BOOTSTRAP_PORT;
@@ -77,15 +77,17 @@ pub(crate) enum PreparedEncodeItem {
     TokenSpeed {
         item: Option<TokenSpeedMultimodalItem>,
         shm_enabled: bool,
+        shm_min_bytes: usize,
         cleanup_on_drop: bool,
     },
 }
 
 impl PreparedEncodeItem {
-    fn tokenspeed(item: TokenSpeedMultimodalItem, shm_enabled: bool) -> Self {
+    fn tokenspeed(item: TokenSpeedMultimodalItem, shm_enabled: bool, shm_min_bytes: usize) -> Self {
         Self::TokenSpeed {
             item: Some(item),
             shm_enabled,
+            shm_min_bytes,
             cleanup_on_drop: true,
         }
     }
@@ -99,20 +101,28 @@ impl PreparedEncodeItem {
             Self::TokenSpeed {
                 item,
                 shm_enabled,
+                shm_min_bytes,
                 cleanup_on_drop,
             } => {
-                let item = item
+                let mut item = item
                     .take()
                     .ok_or_else(|| "encode item was already dispatched".to_string())?;
                 *cleanup_on_drop = false;
+                // Stage with bootstrap_room as the slot key (load-bearing), so
+                // into_proto(false) below does not re-stage with a random key.
+                if let Some(exporter) = mm_rdma_exporter() {
+                    item.encoder_input =
+                        stage_tokenspeed_tensor_rdma(exporter, bootstrap_room, item.encoder_input);
+                }
                 let request = tokenspeed_encoder::EncodeRequest {
                     request_id: format!("encode-{}", Uuid::now_v7()),
                     mm_inputs: Some(
                         TokenSpeedMultimodalData {
                             items: vec![item],
                             shm_enabled: *shm_enabled,
+                            shm_min_bytes: *shm_min_bytes,
                         }
-                        .into_proto(),
+                        .into_proto(false),
                     ),
                     items: vec![tokenspeed_encoder::EncodeItemAssignment { bootstrap_room }],
                 };
@@ -128,11 +138,11 @@ impl PreparedEncodeItem {
     }
 }
 
-struct TokenSpeedShmCleanupGuard(Vec<tokenspeed_proto::ShmHandle>);
+struct TokenSpeedShmCleanupGuard(Vec<common_proto::ShmHandle>);
 
 impl Drop for TokenSpeedShmCleanupGuard {
     fn drop(&mut self) {
-        cleanup_tokenspeed_shm_handles(&self.0);
+        cleanup_mm_shm_handles(&self.0);
     }
 }
 
@@ -154,20 +164,16 @@ pub(crate) fn build_plan_from_intermediate(
     clients: Option<&ClientSelection>,
     workers: Option<&WorkerSelection>,
 ) -> Result<EncodePlan> {
-    match intermediate {
-        MultimodalIntermediate::Precomputed(precomputed) => {
-            build_plan(precomputed, clients, workers)
-        }
-    }
+    build_plan(intermediate, clients, workers)
 }
 
 fn build_plan(
-    precomputed: &PrecomputedMultimodalIntermediate,
+    intermediate: &MultimodalIntermediate,
     clients: Option<&ClientSelection>,
     workers: Option<&WorkerSelection>,
 ) -> Result<EncodePlan> {
     let workers = workers.ok_or_else(|| anyhow!("Worker selection stage not completed"))?;
-    let items = prepare_items(precomputed, clients, Some(workers))?;
+    let items = prepare_items(intermediate, clients, Some(workers))?;
     if items.is_empty() {
         return Ok(EncodePlan {
             bootstrap_info: Vec::new(),
@@ -228,7 +234,7 @@ fn build_plan(
 }
 
 pub(crate) fn prepare_items(
-    precomputed: &PrecomputedMultimodalIntermediate,
+    intermediate: &MultimodalIntermediate,
     clients: Option<&ClientSelection>,
     workers: Option<&WorkerSelection>,
 ) -> Result<Vec<PreparedEncodeItem>> {
@@ -237,7 +243,7 @@ pub(crate) fn prepare_items(
         ClientSelection::Disaggregated {
             prefill: GrpcClient::TokenSpeed(_),
             ..
-        } => prepare_tokenspeed_items(precomputed, workers),
+        } => prepare_tokenspeed_items(intermediate, workers),
         ClientSelection::Disaggregated { prefill, .. } => Err(anyhow!(
             "EPD encode is not implemented for {} backend",
             backend_name(prefill)
@@ -249,15 +255,16 @@ pub(crate) fn prepare_items(
 }
 
 fn prepare_tokenspeed_items(
-    precomputed: &PrecomputedMultimodalIntermediate,
+    intermediate: &MultimodalIntermediate,
     workers: Option<&WorkerSelection>,
 ) -> Result<Vec<PreparedEncodeItem>> {
-    let tokenspeed_mm = assemble_tokenspeed(precomputed, workers, false)?;
+    let tokenspeed_mm = assemble_tokenspeed_for_encode(intermediate, workers)?;
     let shm_enabled = tokenspeed_mm.shm_enabled;
+    let shm_min_bytes = tokenspeed_mm.shm_min_bytes;
     Ok(tokenspeed_mm
         .items
         .into_iter()
-        .map(|item| PreparedEncodeItem::tokenspeed(item, shm_enabled))
+        .map(|item| PreparedEncodeItem::tokenspeed(item, shm_enabled, shm_min_bytes))
         .collect())
 }
 

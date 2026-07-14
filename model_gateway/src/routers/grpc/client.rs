@@ -14,9 +14,9 @@ use smg_grpc_client::{
 
 use crate::routers::grpc::{
     proto_wrapper::{
-        cleanup_tokenspeed_shm_handles, collect_tokenspeed_generate_request_shm_handles,
-        finish_tokenspeed_request, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
-        ProtoStream,
+        cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
+        collect_vllm_generate_request_shm_handles, finish_tokenspeed_request, finish_vllm_request,
+        ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest, ProtoStream,
     },
     MultimodalData,
 };
@@ -152,6 +152,19 @@ impl GrpcClient {
 
     pub fn is_tokenspeed(&self) -> bool {
         matches!(self, Self::TokenSpeed(_))
+    }
+
+    /// Runtime type backing this client. Lets shared logic (e.g. the multimodal
+    /// capability matrix) key on the backend without matching every variant.
+    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
+        use crate::worker::RuntimeType;
+        match self {
+            Self::Sglang(_) => RuntimeType::Sglang,
+            Self::Vllm(_) => RuntimeType::Vllm,
+            Self::Trtllm(_) => RuntimeType::Trtllm,
+            Self::Mlx(_) => RuntimeType::Mlx,
+            Self::TokenSpeed(_) => RuntimeType::TokenSpeed,
+        }
     }
 
     pub async fn connect(
@@ -367,8 +380,14 @@ impl GrpcClient {
                 Ok(ProtoStream::Sglang(stream))
             }
             (Self::Vllm(client), ProtoGenerateRequest::Vllm(boxed_req)) => {
-                let stream = client.generate(*boxed_req).await?;
-                Ok(ProtoStream::Vllm(stream))
+                let shm_handles = collect_vllm_generate_request_shm_handles(&boxed_req);
+                match client.generate(*boxed_req).await {
+                    Ok(stream) => Ok(ProtoStream::Vllm(stream)),
+                    Err(error) => {
+                        cleanup_mm_shm_handles(&shm_handles);
+                        Err(error)
+                    }
+                }
             }
             (Self::Trtllm(client), ProtoGenerateRequest::Trtllm(boxed_req)) => {
                 let stream = client.generate(*boxed_req).await?;
@@ -383,7 +402,7 @@ impl GrpcClient {
                 match client.generate(*boxed_req).await {
                     Ok(stream) => Ok(ProtoStream::TokenSpeed(stream)),
                     Err(error) => {
-                        cleanup_tokenspeed_shm_handles(&shm_handles);
+                        cleanup_mm_shm_handles(&shm_handles);
                         Err(error)
                     }
                 }
@@ -456,15 +475,16 @@ impl GrpcClient {
                     MultimodalData::Vllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
-                let req = client.build_generate_request_from_chat(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    vllm_mm,
-                    options.tool_constraints,
-                )?;
-                Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
+                finish_vllm_request(vllm_mm, |mm| {
+                    client.build_generate_request_from_chat(
+                        request_id,
+                        body,
+                        processed_text,
+                        token_ids,
+                        mm,
+                        options.tool_constraints,
+                    )
+                })
             }
             Self::Trtllm(client) => {
                 let trtllm_mm = options.multimodal_inputs.map(|mm| match mm {
@@ -494,7 +514,7 @@ impl GrpcClient {
             }
             Self::TokenSpeed(client) => {
                 let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::TokenSpeed(data) => data.into_proto(),
+                    MultimodalData::TokenSpeed(data) => data.into_proto(true),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_tokenspeed_request(tokenspeed_mm, |mm| {
@@ -547,15 +567,16 @@ impl GrpcClient {
                     MultimodalData::Vllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
-                let req = client.build_generate_request_from_messages(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    vllm_mm,
-                    options.tool_constraints,
-                )?;
-                Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
+                finish_vllm_request(vllm_mm, |mm| {
+                    client.build_generate_request_from_messages(
+                        request_id,
+                        body,
+                        processed_text,
+                        token_ids,
+                        mm,
+                        options.tool_constraints,
+                    )
+                })
             }
             Self::Trtllm(client) => {
                 let trtllm_mm = options.multimodal_inputs.map(|mm| match mm {
@@ -585,7 +606,7 @@ impl GrpcClient {
             }
             Self::TokenSpeed(client) => {
                 let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::TokenSpeed(data) => data.into_proto(),
+                    MultimodalData::TokenSpeed(data) => data.into_proto(true),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_tokenspeed_request(tokenspeed_mm, |mm| {

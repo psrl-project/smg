@@ -11,31 +11,12 @@ use fast_image_resize::{
 };
 use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgb, RgbImage};
 use ndarray::{s, Array3, Array4};
-use thiserror::Error;
 
-use super::execution::{scope as parallel_scope, task_count};
-
-/// Errors that can occur during image transformations.
-#[derive(Error, Debug)]
-pub enum TransformError {
-    #[error("Invalid tensor shape: expected {expected}, got {actual:?}")]
-    InvalidShape {
-        expected: String,
-        actual: Vec<usize>,
-    },
-
-    #[error("Image operation failed: {0}")]
-    ImageError(#[from] image::ImageError),
-
-    #[error("Empty batch: cannot stack zero tensors")]
-    EmptyBatch,
-
-    #[error("Inconsistent tensor shapes in batch")]
-    InconsistentShapes,
-
-    #[error("Shape error: {0}")]
-    ShapeError(String),
-}
+use super::{
+    execution::{scope as parallel_scope, task_count},
+    scratch,
+};
+pub use crate::error::TransformError;
 
 pub type Result<T> = std::result::Result<T, TransformError>;
 
@@ -151,7 +132,8 @@ fn build_planar_tensor(
     bias: [f32; 3],
 ) -> Array3<f32> {
     let pixels = h * w;
-    let mut data = vec![0.0f32; 3 * pixels];
+    // Pooled: this large per-image buffer is the data plane's hottest allocation.
+    let mut data = scratch::take_f32(3 * pixels);
     let (r_plane, rest) = data.split_at_mut(pixels);
     let (g_plane, b_plane) = rest.split_at_mut(pixels);
 

@@ -11,6 +11,7 @@ import itertools
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 import grpc
@@ -45,6 +46,7 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import STREAM_FINISHED, CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
+from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
 logger = init_logger(__name__)
@@ -80,7 +82,48 @@ def _tensor_from_proto(td: vllm_engine_pb2.TensorData) -> torch.Tensor:
     torch_dtype = _PROTO_DTYPE_MAP.get(td.dtype)
     if torch_dtype is None:
         raise ValueError(f"Unsupported proto tensor dtype: {td.dtype!r}")
-    return torch.frombuffer(bytearray(td.data), dtype=torch_dtype).reshape(*td.shape)
+    payload = mm_shm.tensor_payload_bytes(td)
+    return torch.frombuffer(bytearray(payload), dtype=torch_dtype).reshape(*td.shape)
+
+
+try:
+    from vllm.version import __version__ as VLLM_VERSION
+except Exception:  # pragma: no cover - version lookup is best-effort
+    VLLM_VERSION = ""
+
+
+def _latest_scheduler_stats(engine, engine_idx: int = 0):
+    """Best-effort read of the most recent ``SchedulerStats`` snapshot.
+
+    vLLM has no synchronous "current stats" accessor on ``AsyncLLM``/``EngineClient``;
+    ``SchedulerStats`` arrive asynchronously and are cached on the stat loggers. This
+    reaches into ``engine.logger_manager.stat_loggers`` and returns the freshest
+    snapshot, handling the logger-shape variants:
+
+    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats``
+    - ``AggregatedLoggingStatLogger`` (DP)   -> ``.last_scheduler_stats_dict[idx]``
+    - ``PerEngineStatLoggerAdapter``         -> ``.per_engine_stat_loggers[idx]``
+    - ``PrometheusStatLogger``               -> skipped (no cached snapshot)
+
+    Returns ``None`` when stats logging is disabled (``--disable-log-stats``) or no
+    engine step has produced outputs yet.
+    """
+    logger_manager = getattr(engine, "logger_manager", None)
+    if logger_manager is None:
+        return None
+    for sl in getattr(logger_manager, "stat_loggers", None) or []:
+        per = getattr(sl, "last_scheduler_stats_dict", None)
+        if isinstance(per, dict) and engine_idx in per:
+            return per[engine_idx]
+        stats = getattr(sl, "last_scheduler_stats", None)
+        if stats is not None:
+            return stats
+        per_engine = getattr(sl, "per_engine_stat_loggers", None)
+        if isinstance(per_engine, dict) and engine_idx in per_engine:
+            nested = getattr(per_engine[engine_idx], "last_scheduler_stats", None)
+            if nested is not None:
+                return nested
+    return None
 
 
 class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
@@ -641,10 +684,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """
         kv_connector = ""
         kv_role = ""
+        kv_engine_id = ""
         kv_transfer_config = self.engine.vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             kv_connector = kv_transfer_config.kv_connector or ""
             kv_role = kv_transfer_config.kv_role or ""
+            # Base engine_id; with DP the engine cores serve `{id}_dp{rank}` and
+            # the router derives the suffix from the rank it pins per request
+            kv_engine_id = getattr(kv_transfer_config, "engine_id", "") or ""
 
         parallel_config = self.engine.vllm_config.parallel_config
         data_parallel_size = parallel_config.data_parallel_size
@@ -654,9 +701,66 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         return vllm_engine_pb2.GetServerInfoResponse(
             kv_connector=kv_connector,
             kv_role=kv_role,
+            kv_engine_id=kv_engine_id,
             data_parallel_size=data_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
+            shm_namespace_id=mm_shm.shm_namespace_id(),
+        )
+
+    async def GetLoads(
+        self,
+        request: vllm_engine_pb2.GetLoadsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> vllm_engine_pb2.GetLoadsResponse:
+        """
+        Handle load-metric requests.
+
+        Reads the latest SchedulerStats snapshot cached on the engine's stat
+        loggers and maps it onto a single-DP-rank SchedulerLoad: ``token_usage``
+        carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
+        ``num_waiting_reqs`` report queue depth.
+
+        Always returns exactly one SchedulerLoad entry (zero-filled when no
+        snapshot is available yet, e.g. with --disable-log-stats or before the
+        first engine step) so callers treat the worker as responsive rather than
+        dropping the poll.
+
+        Note: ``request.dp_rank`` and ``request.include`` are accepted but not yet
+        applied — vLLM reports a single DP rank (``dp_rank_count=1``) with only
+        core metrics, so there is nothing to filter. They are reserved for future
+        multi-DP / sectioned-metrics support.
+
+        Args:
+            request: The GetLoadsRequest protobuf
+            context: gRPC context
+
+        Returns:
+            GetLoadsResponse protobuf
+        """
+        stats = _latest_scheduler_stats(self.engine)
+        if stats is not None:
+            num_running = int(getattr(stats, "num_running_reqs", 0) or 0)
+            num_waiting = int(getattr(stats, "num_waiting_reqs", 0) or 0)
+            kv_usage = float(getattr(stats, "kv_cache_usage", 0.0) or 0.0)
+        else:
+            num_running = 0
+            num_waiting = 0
+            kv_usage = 0.0
+
+        load = vllm_engine_pb2.SchedulerLoad(
+            dp_rank=0,
+            num_running_reqs=num_running,
+            num_waiting_reqs=num_waiting,
+            num_total_reqs=num_running + num_waiting,
+            token_usage=max(0.0, kv_usage),
+        )
+
+        return vllm_engine_pb2.GetLoadsResponse(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            version=VLLM_VERSION,
+            dp_rank_count=1,
+            loads=[load],
         )
 
     async def GetTokenizer(
@@ -1056,14 +1160,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         ``batched_keys`` and ``flat_keys`` proto fields.
         """
         prompt_token_ids = list(tokenized.input_ids)
-        num_images = len(mm_proto.mm_placeholders)
+        num_items = len(mm_proto.mm_placeholders)
+
+        # Image vs video: vLLM routes each modality to a different encoder and
+        # expects the pixel tensor under a modality-specific key. The router sends
+        # the generic ``pixel_values`` field; rename it to ``pixel_values_videos``
+        # for the video path (grid/size tensors already carry video-specific keys).
+        is_video = mm_proto.modality == common_pb2.VIDEO
+        mm_modality = "video" if is_video else "image"
+
+        def mm_key(key: str) -> str:
+            if is_video and key == "pixel_values":
+                return "pixel_values_videos"
+            return key
 
         # Deserialize all tensors from proto
         hf_dict: dict[str, torch.Tensor] = {
-            "pixel_values": _tensor_from_proto(mm_proto.pixel_values),
+            mm_key("pixel_values"): _tensor_from_proto(mm_proto.pixel_values),
         }
         for key, td in mm_proto.model_specific_tensors.items():
-            hf_dict[key] = _tensor_from_proto(td)
+            hf_dict[mm_key(key)] = _tensor_from_proto(td)
 
         # Cast floating-point tensors to model dtype (e.g. bfloat16).
         # This mirrors _postprocess_output in multimodal/processing/context.py
@@ -1073,26 +1189,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             if hf_dict[key].is_floating_point():
                 hf_dict[key] = hf_dict[key].to(dtype=model_dtype)
 
-        cpu_keys = set(mm_proto.keep_on_cpu_keys)
+        cpu_keys = {mm_key(k) for k in mm_proto.keep_on_cpu_keys}
 
         # Field configs are fully determined by the Rust router.
-        batched = set(mm_proto.batched_keys)
-        flat = dict(mm_proto.flat_keys)
+        batched = {mm_key(k) for k in mm_proto.batched_keys}
+        flat = {mm_key(k): mm_key(v) for k, v in mm_proto.flat_keys.items()}
         fields_config: dict[str, MultiModalFieldConfig] = {}
         flat_sizes_cache: dict[str, torch.Tensor] = {}
         for key in hf_dict:
             on_cpu = key in cpu_keys
             if key in batched:
-                fields_config[key] = MultiModalFieldConfig.batched("image", keep_on_cpu=on_cpu)
+                fields_config[key] = MultiModalFieldConfig.batched(mm_modality, keep_on_cpu=on_cpu)
             elif key in flat:
                 sizes_key = flat[key]
                 if sizes_key not in flat_sizes_cache:
                     flat_sizes_cache[sizes_key] = hf_dict[sizes_key].flatten().to(torch.int64)
                 fields_config[key] = MultiModalFieldConfig.flat_from_sizes(
-                    "image", flat_sizes_cache[sizes_key], keep_on_cpu=on_cpu
+                    mm_modality, flat_sizes_cache[sizes_key], keep_on_cpu=on_cpu
                 )
             else:
-                fields_config[key] = MultiModalFieldConfig.shared("image", num_images)
+                fields_config[key] = MultiModalFieldConfig.shared(mm_modality, num_items)
 
         batch_feature = BatchFeature(hf_dict, tensor_type="pt")
         mm_kwargs = MultiModalKwargsItems.from_hf_inputs(batch_feature, fields_config)
@@ -1100,7 +1216,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # Build mm_hashes: dict[str, list[str]]
         mm_hashes: dict[str, list[str]] = {}
         if mm_proto.mm_hashes:
-            mm_hashes["image"] = list(mm_proto.mm_hashes)
+            mm_hashes[mm_modality] = list(mm_proto.mm_hashes)
 
         # Build mm_placeholders: dict[str, list[PlaceholderRange]]
         # When structural tokens (e.g. <|image_start|>, separators) are present
@@ -1128,7 +1244,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 placeholders.append(
                     PlaceholderRange(offset=p.offset, length=p.length, is_embed=is_embed)
                 )
-            mm_placeholders["image"] = placeholders
+            mm_placeholders[mm_modality] = placeholders
 
         return mm_input(
             prompt_token_ids=prompt_token_ids,

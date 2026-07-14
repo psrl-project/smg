@@ -113,11 +113,22 @@ message TokenizedInput {
   repeated uint32 input_ids = 2;  // Actual token IDs to process
 }
 
-// A typed tensor: raw little-endian bytes + shape + dtype.
+// A typed tensor descriptor. The raw bytes live in exactly one payload
+// transport; shape and dtype describe how the receiver interprets them.
 message TensorData {
-  bytes data = 1;              // Raw little-endian bytes (f32/i64/u32)
   repeated uint32 shape = 2;   // Dimension sizes
   string dtype = 3;            // "float32", "int64", "uint32"
+
+  oneof payload {
+    // Current path: raw little-endian bytes carried in the gRPC message
+    // (field 1, formerly `bytes data`, kept for wire compatibility).
+    bytes inline = 1;
+    // Same-host CPU shared memory path; preferred for large payloads when
+    // SMG and the vLLM worker share /dev/shm.
+    smg.grpc.common.ShmHandle shm = 4;
+    // Cross-node or non-shared-memory transport (e.g. NIXL). Not implemented.
+    smg.grpc.common.RemoteTensorHandle remote = 5;
+  }
 }
 
 message PlaceholderRange {
@@ -158,6 +169,11 @@ message MultimodalInputs {
   // Tensor keys that should remain on CPU (not transferred to GPU).
   // Maps to vLLM's MultiModalFieldConfig keep_on_cpu flag.
   repeated string keep_on_cpu_keys = 9;
+
+  // Input modality (image/video). The servicer routes video to vLLM's video
+  // modality (`pixel_values_videos` / `video_grid_thw`) and expands the video
+  // placeholder token instead of the image one. Unset (0) is treated as image.
+  smg.grpc.common.Modality modality = 10;
 }
 
 // =====================
@@ -377,11 +393,17 @@ message GetServerInfoResponse {
   // KV transfer config (for PD disaggregation)
   string kv_connector = 6;  // "MooncakeConnector", "NixlConnector", "" if not configured
   string kv_role = 7;       // "kv_producer", "kv_consumer", "kv_both", "" if not configured
+  string kv_engine_id = 8;  // kv_transfer_config.engine_id, "" if not configured
 
   // Parallelism configuration
-  uint32 tensor_parallel_size = 8;
-  uint32 data_parallel_size = 9;
-  uint32 pipeline_parallel_size = 10;
+  uint32 tensor_parallel_size = 9;
+  uint32 data_parallel_size = 10;
+  uint32 pipeline_parallel_size = 11;
+
+  // This worker's /dev/shm tmpfs identity (<boot_id>:<st_dev>), advertised so
+  // the router can verify a shared /dev/shm before using the SHM tensor
+  // transport under `auto`. Empty when it can't be determined.
+  string shm_namespace_id = 12;
 }
 
 // =====================
