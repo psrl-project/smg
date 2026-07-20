@@ -379,8 +379,9 @@ impl ChatPreparationStage {
             None => return Ok(None),
         };
 
-        // Read trajectory-id header (default 0 when absent or unparseable)
-        let trajectory_id: u64 = ctx
+        // Manual mode preserves the existing default-to-zero behavior. Auto mode
+        // ignores this value after prefix lookup and resolves from the live leaves.
+        let manual_trajectory_id: u64 = ctx
             .input
             .headers
             .as_ref()
@@ -427,6 +428,19 @@ impl ChatPreparationStage {
         let running_hasher = lookup.running_hasher.clone();
         let parent_hash = lookup.parent_hash;
 
+        let resolved_trajectory = store
+            .resolve_trajectory_id(&session_id, manual_trajectory_id, parent_hash)
+            .map_err(|e| {
+                error!(
+                    function = "ChatPreparationStage::try_tito",
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to resolve TITO trajectory ID"
+                );
+                error::internal_error("tito_trajectory_id_resolution_failed", e.to_string())
+            })?;
+        let trajectory_id = resolved_trajectory.trajectory_id;
+
         ctx.state.tito_context = Some(TitoRequestContext {
             session_id: session_id.clone(),
             request: request_arc,
@@ -434,6 +448,7 @@ impl ChatPreparationStage {
             is_tito_hit: false,
             matched_message_num: 0,
             trajectory_id,
+            trajectory_id_reservation: resolved_trajectory.reservation,
             prompt_token_ids: Vec::new(),
             reusable_prompt_token_ids: None,
             running_hasher,

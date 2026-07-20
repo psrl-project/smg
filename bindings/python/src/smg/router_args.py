@@ -140,6 +140,7 @@ class RouterArgs:
     enable_tito: bool = False
     tito_debug: bool = False
     tito_gc_threshold: int | None = None
+    trajectory_id_strategy: str = "manual"  # manual | auto
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -921,6 +922,16 @@ class RouterArgs:
             type=int,
             default=RouterArgs.tito_gc_threshold,
             help="Threshold for TITO session garbage collection (default: 1000)",
+        )
+        tito_group.add_argument(
+            f"--{prefix}trajectory-id-strategy",
+            type=str,
+            choices=["manual", "auto"],
+            default=RouterArgs.trajectory_id_strategy,
+            help=(
+                "Select TITO trajectory ID assignment: read the request header "
+                "(manual) or derive IDs from prefix-tree leaves (auto)"
+            ),
         )
 
         # Retry configuration

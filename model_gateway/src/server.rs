@@ -862,6 +862,8 @@ pub struct ServerConfig {
     ///
     /// `None` (the default) means "always GC".
     pub tito_gc_threshold: Option<usize>,
+    /// Controls whether TITO reads trajectory IDs from headers or assigns them.
+    pub trajectory_id_strategy: smg_tito::TrajectoryIdStrategy,
     /// Bind address for WebRTC UDP sockets.
     /// `None` means use the default (0.0.0.0, auto-detect candidate IP).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -1278,7 +1280,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     if config.enable_tito {
-        let tito_store = Arc::new(smg_tito::TitoStore::new());
+        let tito_store = Arc::new(smg_tito::TitoStore::with_trajectory_id_strategy(
+            config.trajectory_id_strategy,
+        ));
         tito_store.set_debug(config.tito_debug);
         if let Some(threshold) = config.tito_gc_threshold {
             tito_store.set_gc_threshold(threshold);
@@ -1286,8 +1290,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         if let Some(ctx_mut) = Arc::get_mut(&mut app_context) {
             ctx_mut.tito_store = Some(tito_store);
             info!(
-                "TITO session store initialized (debug={}, gc_threshold={:?})",
-                config.tito_debug, config.tito_gc_threshold
+                "TITO session store initialized (debug={}, gc_threshold={:?}, trajectory_id_strategy={})",
+                config.tito_debug,
+                config.tito_gc_threshold,
+                config.trajectory_id_strategy
             );
         } else {
             error!("Failed to set tito_store: Arc::get_mut failed");

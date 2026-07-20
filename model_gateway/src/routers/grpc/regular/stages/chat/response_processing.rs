@@ -385,6 +385,10 @@ fn do_tito_capture_non_streaming(
             warn!(session_id = %tito_ctx.session_id, error = %e, "TITO store failed (non-fatal)");
         }
     };
+
+    if let Some(reservation) = tito_ctx.trajectory_id_reservation.as_ref() {
+        reservation.release();
+    }
 }
 
 fn build_mismatch_report(

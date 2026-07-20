@@ -483,9 +483,11 @@ pub(crate) struct TitoRequestContext {
     /// Number of messages matched by TITO prefix (if is_tito_hit is true).
     /// Used for rollback detection: if new request matches fewer messages, we truncate turn_records.
     pub matched_message_num: usize,
-    /// Trajectory identifier from `x-smg-tito-trajectory-id` header (defaults to 0).
-    /// Within a session each unique trajectory ID tracks a separate leaf node.
+    /// Resolved trajectory identifier. In manual mode this comes from the request
+    /// header; in auto mode TITO derives it from the matched tree leaf.
     pub trajectory_id: u64,
+    /// Prevents concurrent auto-mode branches from claiming the same trajectory.
+    pub trajectory_id_reservation: Option<smg_tito::TrajectoryIdReservation>,
     /// Prompt token IDs computed during preparation (set in ChatPreparationStage, read in
     /// ChatResponseProcessingStage for TITO capture).
     /// Consumed by `ChatRequestBuildingStage::execute()` before response processing runs.

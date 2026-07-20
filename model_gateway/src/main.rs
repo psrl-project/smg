@@ -841,6 +841,16 @@ struct CliArgs {
     #[arg(long, help_heading = "TITO")]
     tito_gc_threshold: Option<usize>,
 
+    /// Select how TITO assigns trajectory IDs: read the request header
+    /// (`manual`) or derive IDs from prefix-tree leaves (`auto`).
+    #[arg(
+        long,
+        default_value = "manual",
+        value_parser = ["manual", "auto"],
+        help_heading = "TITO"
+    )]
+    trajectory_id_strategy: String,
+
     // ==================== WebRTC ====================
     /// Bind address for WebRTC UDP sockets (client-facing ICE candidate IP).
     /// Default: 0.0.0.0 (auto-detect via routing table).
@@ -1626,6 +1636,10 @@ impl CliArgs {
             enable_tito: self.enable_tito,
             tito_debug: self.tito_debug,
             tito_gc_threshold: self.tito_gc_threshold,
+            trajectory_id_strategy: self
+                .trajectory_id_strategy
+                .parse()
+                .map_err(|reason| ConfigError::ValidationFailed { reason })?,
         })
     }
 }

@@ -44,6 +44,7 @@ class TestRouterArgs:
         assert args.disable_retries is False
         assert args.disable_circuit_breaker is False
         assert args.mesh_advertise_host is None
+        assert args.trajectory_id_strategy == "manual"
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
@@ -507,6 +508,15 @@ class TestParseRouterArgs:
         assert router_args.port == 30001
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
+
+    def test_parse_trajectory_id_strategy(self):
+        router_args = parse_router_args(["--trajectory-id-strategy", "auto"])
+
+        assert router_args.trajectory_id_strategy == "auto"
+
+    def test_reject_invalid_trajectory_id_strategy(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--trajectory-id-strategy", "invalid"])
 
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""

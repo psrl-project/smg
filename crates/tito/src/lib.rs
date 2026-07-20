@@ -11,7 +11,8 @@ pub use normalizer::{
     hash_messages_with_context, PrefixHash, PrefixHasher, RenderContext,
 };
 pub use store::{
-    MismatchEntry, PrefixLookup, PrefixMatch, TitoStore, Trajectory, TurnRecord, TurnRoutedExperts,
+    MismatchEntry, PrefixLookup, PrefixMatch, ResolvedTrajectoryId, TitoStore, Trajectory,
+    TrajectoryIdReservation, TrajectoryIdStrategy, TurnRecord, TurnRoutedExperts,
     TurnRoutedExpertsDtype,
 };
 
@@ -20,5 +21,5 @@ pub const TITO_SESSION_HEADER: &str = "x-smg-tito-session-id";
 
 /// HTTP header name for the TITO trajectory identifier.
 ///
-/// Defaults to 0 when absent.
+/// Used by the manual strategy and defaults to 0 when absent.
 pub const TITO_TRAJECTORY_ID_HEADER: &str = "x-smg-tito-trajectory-id";

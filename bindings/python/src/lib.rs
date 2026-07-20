@@ -515,6 +515,7 @@ struct Router {
     encode_policy: Option<PolicyType>,
     multimodal_tensor_transport: Option<String>,
     multimodal_shm_min_bytes: Option<usize>,
+    trajectory_id_strategy: String,
 }
 
 impl Router {
@@ -1087,6 +1088,7 @@ impl Router {
         encode_policy = None,
         multimodal_tensor_transport = None,
         multimodal_shm_min_bytes = None,
+        trajectory_id_strategy = String::from("manual"),
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1237,6 +1239,7 @@ impl Router {
         encode_policy: Option<PolicyType>,
         multimodal_tensor_transport: Option<String>,
         multimodal_shm_min_bytes: Option<usize>,
+        trajectory_id_strategy: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1261,6 +1264,12 @@ impl Router {
             Some("grpc") => worker::ConnectionMode::Grpc,
             _ => Self::determine_connection_mode(&all_urls),
         };
+
+        if !matches!(trajectory_id_strategy.as_str(), "manual" | "auto") {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid trajectory_id_strategy '{trajectory_id_strategy}'; expected manual or auto"
+            )));
+        }
 
         Ok(Router {
             host,
@@ -1404,6 +1413,7 @@ impl Router {
             encode_policy,
             multimodal_tensor_transport,
             multimodal_shm_min_bytes,
+            trajectory_id_strategy,
         })
     }
 
@@ -1530,6 +1540,11 @@ impl Router {
                 enable_tito: self.enable_tito,
                 tito_debug: self.tito_debug,
                 tito_gc_threshold: self.tito_gc_threshold,
+                trajectory_id_strategy: self.trajectory_id_strategy.parse().map_err(|reason| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid trajectory_id_strategy: {reason}"
+                    ))
+                })?,
                 webrtc_bind_addr: None,
                 webrtc_stun_server: None,
                 health_check_port: None,
