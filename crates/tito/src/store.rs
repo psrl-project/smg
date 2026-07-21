@@ -253,7 +253,18 @@ pub struct Trajectory {
     /// Full token ID sequence (prompt_ids + all output_ids concatenated in conversation order).
     pub accumulated_token_ids: Vec<u32>,
     /// One `TurnRecord` per assistant turn, ordered from oldest to newest.
+    #[serde(rename = "records")]
     pub turn_records: Vec<TurnRecord>,
+}
+
+/// Consistent training-data snapshot returned for every TITO session.
+#[derive(Debug, Serialize)]
+pub struct TitoSessionData {
+    pub session_id: String,
+    pub max_trim_tokens: usize,
+    /// Always an array: empty, single-trajectory, and multi-trajectory sessions
+    /// share the same wire format.
+    pub trajectories: Vec<Trajectory>,
 }
 
 /// Top-level store: session_id → Arc<Mutex<SessionState>>.
@@ -750,27 +761,22 @@ impl TitoStore {
         };
         let state = arc.lock();
 
-        // Build trajectories from trajectory_leaves, sorted by trajectory_id.
-        let mut pairs: Vec<(u64, PrefixHash)> = state
-            .trajectory_leaves
-            .iter()
-            .map(|(&tid, &hash)| (tid, hash))
-            .collect();
-        pairs.sort_unstable_by_key(|(tid, _)| *tid);
+        collect_trajectories(&state)
+    }
 
-        pairs
-            .into_iter()
-            .filter_map(|(trajectory_id, leaf_hash)| {
-                let entry = state.entries.get(&leaf_hash)?;
-                let accumulated_token_ids = (*entry.token_ids).clone();
-                let turn_records = collect_records_for_leaf(&state, leaf_hash);
-                Some(Trajectory {
-                    trajectory_id,
-                    accumulated_token_ids,
-                    turn_records,
-                })
-            })
-            .collect()
+    /// Return an atomic session snapshot with a stable multi-trajectory shape.
+    ///
+    /// The session existence check, metadata read, and trajectory collection all
+    /// happen under one lock so callers cannot observe a mixed snapshot.
+    pub fn get_session_data(&self, session_id: &str) -> Option<TitoSessionData> {
+        let arc = self.get_session_arc(session_id)?;
+        let state = arc.lock();
+
+        Some(TitoSessionData {
+            session_id: session_id.to_string(),
+            max_trim_tokens: state.max_trim_tokens,
+            trajectories: collect_trajectories(&state),
+        })
     }
 
     /// Look up the next-turn dispatch's `routed_experts_prompt_start` for
@@ -900,6 +906,27 @@ fn collect_records_for_leaf(state: &SessionState, leaf_hash: PrefixHash) -> Vec<
                 .entries
                 .get(&hash)
                 .map(|entry| entry.turn_record.clone())
+        })
+        .collect()
+}
+
+fn collect_trajectories(state: &SessionState) -> Vec<Trajectory> {
+    let mut pairs: Vec<(u64, PrefixHash)> = state
+        .trajectory_leaves
+        .iter()
+        .map(|(&trajectory_id, &leaf_hash)| (trajectory_id, leaf_hash))
+        .collect();
+    pairs.sort_unstable_by_key(|(trajectory_id, _)| *trajectory_id);
+
+    pairs
+        .into_iter()
+        .filter_map(|(trajectory_id, leaf_hash)| {
+            let entry = state.entries.get(&leaf_hash)?;
+            Some(Trajectory {
+                trajectory_id,
+                accumulated_token_ids: (*entry.token_ids).clone(),
+                turn_records: collect_records_for_leaf(state, leaf_hash),
+            })
         })
         .collect()
 }
@@ -1270,6 +1297,73 @@ mod tests {
         assert_eq!(trajectories[0].turn_records.len(), 2);
         assert_eq!(trajectories[0].turn_records[0].finish_reason, "turn1");
         assert_eq!(trajectories[0].turn_records[1].finish_reason, "turn2");
+    }
+
+    #[test]
+    fn session_data_uses_one_shape_for_empty_single_and_multiple_trajectories() {
+        let context = render_context();
+
+        let empty_store = make_store();
+        empty_store.create_session("empty");
+        let empty = serde_json::to_value(empty_store.get_session_data("empty").unwrap()).unwrap();
+        assert_eq!(
+            empty,
+            serde_json::json!({
+                "session_id": "empty",
+                "max_trim_tokens": 0,
+                "trajectories": [],
+            })
+        );
+        assert!(empty_store.get_session_data("missing").is_none());
+
+        let single_store = make_store();
+        single_store.create_session("single");
+        single_store
+            .store(
+                "single",
+                &[user_msg("one"), assistant_msg("answer one")],
+                vec![1, 2],
+                record(1, "single"),
+                &context,
+                0,
+            )
+            .unwrap();
+        let single =
+            serde_json::to_value(single_store.get_session_data("single").unwrap()).unwrap();
+        assert_eq!(single["trajectories"].as_array().unwrap().len(), 1);
+        assert!(single.get("trajectory_id").is_none());
+        assert!(single.get("accumulated_token_ids").is_none());
+        assert!(single.get("records").is_none());
+        assert_eq!(single["trajectories"][0]["trajectory_id"], 0);
+        assert!(single["trajectories"][0].get("records").is_some());
+        assert!(single["trajectories"][0].get("turn_records").is_none());
+
+        let multi_store = make_store();
+        multi_store.create_session("multi");
+        multi_store
+            .store(
+                "multi",
+                &[user_msg("zero"), assistant_msg("answer zero")],
+                vec![1, 2],
+                record(1, "zero"),
+                &context,
+                0,
+            )
+            .unwrap();
+        multi_store
+            .store(
+                "multi",
+                &[user_msg("one"), assistant_msg("answer one")],
+                vec![3, 4],
+                record(1, "one"),
+                &context,
+                1,
+            )
+            .unwrap();
+        let multi = serde_json::to_value(multi_store.get_session_data("multi").unwrap()).unwrap();
+        assert_eq!(multi["trajectories"].as_array().unwrap().len(), 2);
+        assert_eq!(multi["trajectories"][0]["trajectory_id"], 0);
+        assert_eq!(multi["trajectories"][1]["trajectory_id"], 1);
     }
 
     #[test]

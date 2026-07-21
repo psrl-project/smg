@@ -787,48 +787,14 @@ async fn tito_get_session(
         }
     };
 
-    // Check session exists (it was created via POST /v1/tito/sessions)
-    if !store.session_exists(&session_id) {
-        return (
+    match store.get_session_data(&session_id) {
+        Some(session_data) => Json(session_data).into_response(),
+        None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "session not found"})),
         )
-            .into_response();
+            .into_response(),
     }
-
-    // Get all trajectories from session store
-    let trajectories = store.get_all_trajectories(&session_id);
-    let max_trim_tokens = store.get_session_max_trim_tokens(&session_id);
-
-    let mut resp = serde_json::json!({
-        "session_id": session_id,
-        "max_trim_tokens": max_trim_tokens,
-    });
-
-    if trajectories.len() == 1 {
-        // Single trajectory: backward-compatible flat format with trajectory_id added
-        if let Some(traj) = trajectories.into_iter().next() {
-            resp["trajectory_id"] = serde_json::json!(traj.trajectory_id);
-            resp["accumulated_token_ids"] = serde_json::json!(traj.accumulated_token_ids);
-            resp["records"] = serde_json::json!(traj.turn_records);
-        }
-    } else {
-        // Multi-trajectory: list of {trajectory_id, accumulated_token_ids, records},
-        // sorted ascending by trajectory_id (get_all_trajectories already guarantees this).
-        let traj_list: Vec<_> = trajectories
-            .into_iter()
-            .map(|traj| {
-                serde_json::json!({
-                    "trajectory_id": traj.trajectory_id,
-                    "accumulated_token_ids": traj.accumulated_token_ids,
-                    "records": traj.turn_records,
-                })
-            })
-            .collect();
-        resp["trajectories"] = serde_json::json!(traj_list);
-    }
-
-    Json(resp).into_response()
 }
 
 pub struct ServerConfig {

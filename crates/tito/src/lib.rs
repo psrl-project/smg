@@ -11,8 +11,8 @@ pub use normalizer::{
     hash_messages_with_context, PrefixHash, PrefixHasher, RenderContext,
 };
 pub use store::{
-    MismatchEntry, PrefixLookup, PrefixMatch, ResolvedTrajectoryId, TitoStore, Trajectory,
-    TrajectoryIdReservation, TrajectoryIdStrategy, TurnRecord, TurnRoutedExperts,
+    MismatchEntry, PrefixLookup, PrefixMatch, ResolvedTrajectoryId, TitoSessionData, TitoStore,
+    Trajectory, TrajectoryIdReservation, TrajectoryIdStrategy, TurnRecord, TurnRoutedExperts,
     TurnRoutedExpertsDtype,
 };
 
