@@ -48,6 +48,7 @@ fn default_generate_request() -> GenerateRequest {
         preprocessed_mm_inputs: None,
         sampling_params: None,
         return_logprob: None,
+        return_prompt_token_ids: false,
         logprob_start_len: None,
         top_logprobs_num: None,
         token_ids_logprob: None,

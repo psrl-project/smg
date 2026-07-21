@@ -516,6 +516,10 @@ pub(crate) struct ResponseState {
     /// response_processing runs.
     pub skip_special_tokens: Option<bool>,
 
+    /// Exact prompt IDs dispatched to the backend for an opted-in generate
+    /// request. Retained across partial-rollout loopback iterations.
+    pub prompt_token_ids: Option<Vec<u32>>,
+
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,
 

@@ -173,6 +173,9 @@ impl GeneratePreparationStage {
             params.and_then(|p| p.ignore_eos).unwrap_or(false),
         );
 
+        ctx.state.response.prompt_token_ids =
+            request.return_prompt_token_ids.then(|| token_ids.clone());
+
         ctx.state.preparation = Some(PreparationOutput::Generate {
             original_text,
             token_ids,

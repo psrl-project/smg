@@ -106,6 +106,11 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_logprob: Option<bool>,
 
+    /// Return the exact prompt token IDs dispatched to the backend after any
+    /// gateway-side multimodal anchor expansion. Non-streaming only.
+    #[serde(default)]
+    pub return_prompt_token_ids: bool,
+
     /// If return logprobs, the start location in the prompt for returning logprobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprob_start_len: Option<i32>,
@@ -261,6 +266,11 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
             "preprocessed_mm_inputs require preexpanded input_ids and image_data",
         ));
     }
+    if req.return_prompt_token_ids && req.stream {
+        return Err(validator::ValidationError::new(
+            "return_prompt_token_ids requires stream=false",
+        ));
+    }
 
     Ok(())
 }
@@ -344,6 +354,8 @@ pub struct GenerateMetaInfo {
     pub reasoning_tokens: Option<u32>,
     pub e2e_latency: f64,
     pub matched_stop: Option<Value>,
+    /// Exact prompt IDs sent to the backend, when explicitly requested.
+    pub prompt_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routed_experts: Option<String>,
 }
@@ -369,4 +381,36 @@ pub enum GenerateFinishReason {
 pub enum GenerateFinishType {
     Length,
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_token_ids_are_opt_in_and_backward_compatible() {
+        let default_request: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"input_ids": [1, 2]})).unwrap();
+        assert!(!default_request.return_prompt_token_ids);
+
+        let opted_in: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "input_ids": [1, 2],
+            "return_prompt_token_ids": true
+        }))
+        .unwrap();
+        assert!(opted_in.return_prompt_token_ids);
+        assert!(opted_in.validate().is_ok());
+    }
+
+    #[test]
+    fn prompt_token_ids_reject_streaming_requests() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "input_ids": [1, 2],
+            "return_prompt_token_ids": true,
+            "stream": true
+        }))
+        .unwrap();
+
+        assert!(request.validate().is_err());
+    }
 }
