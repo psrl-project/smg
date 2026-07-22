@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use llm_multimodal::Modality;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{
     common::InputIds,
@@ -72,6 +73,18 @@ impl GeneratePreparationStage {
                 "preprocessed_mm_inputs require at least one valid image_data reference",
             ));
         }
+        if let Some(preprocessing) = &request.image_preprocessing {
+            let image_count = media_plan.count(Modality::Image);
+            if preprocessing.resize_targets.len() != image_count {
+                return Err(error::bad_request(
+                    "invalid_image_preprocessing",
+                    format!(
+                        "image_preprocessing has {} resize targets for {image_count} images",
+                        preprocessing.resize_targets.len()
+                    ),
+                ));
+            }
+        }
         if !media_plan.is_empty() {
             if request.video_data.is_some() || request.audio_data.is_some() {
                 return Err(error::bad_request(
@@ -106,6 +119,18 @@ impl GeneratePreparationStage {
                     components,
                     &entry.id,
                     &entry.source,
+                )
+                .await
+            } else if let Some(preprocessing) = &request.image_preprocessing {
+                multimodal::process_multimodal_plan_with_image_preprocessing(
+                    media_plan,
+                    model_id,
+                    &*tokenizer,
+                    token_ids,
+                    components,
+                    &entry.id,
+                    &entry.source,
+                    preprocessing.resize_targets.clone(),
                 )
                 .await
             } else if matches!(

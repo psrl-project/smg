@@ -45,6 +45,20 @@ pub struct PreprocessedMultimodalInputs {
     pub keep_on_cpu_keys: Vec<String>,
 }
 
+/// Dimensions produced by the caller's first-stage image preprocessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImageResizeTarget {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Optional image operations applied after fetch/decode and before the model
+/// processor. Resize targets use Pillow BICUBIC semantics.
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GenerateImagePreprocessing {
+    pub resize_targets: Vec<ImageResizeTarget>,
+}
+
 // ============================================================================
 // SGLang Generate API (native format)
 // ============================================================================
@@ -97,6 +111,11 @@ pub struct GenerateRequest {
     /// Optional caller-preprocessed tensors. This is independent of token mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preprocessed_mm_inputs: Option<PreprocessedMultimodalInputs>,
+
+    /// Reproduce a caller's first-stage image resize while retaining compact
+    /// URL/data references on the wire. Rust model preprocessing runs after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_preprocessing: Option<GenerateImagePreprocessing>,
 
     /// Sampling parameters (sglang style)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,6 +285,24 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
             "preprocessed_mm_inputs require preexpanded input_ids and image_data",
         ));
     }
+    if let Some(preprocessing) = &req.image_preprocessing {
+        if req.image_data.is_none()
+            || req.preprocessed_mm_inputs.is_some()
+            || matches!(
+                req.multimodal_token_mode,
+                Some(MultimodalTokenMode::Preexpanded)
+            )
+            || preprocessing.resize_targets.is_empty()
+            || preprocessing
+                .resize_targets
+                .iter()
+                .any(|target| target.width == 0 || target.height == 0)
+        {
+            return Err(validator::ValidationError::new(
+                "image_preprocessing requires unexpanded image_data and non-zero resize targets",
+            ));
+        }
+    }
     if req.return_prompt_token_ids && req.stream {
         return Err(validator::ValidationError::new(
             "return_prompt_token_ids requires stream=false",
@@ -412,5 +449,27 @@ mod tests {
         .unwrap();
 
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn image_preprocessing_requires_unexpanded_image_data() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "input_ids": [1, 2],
+            "image_data": ["https://example.com/image.png"],
+            "multimodal_token_mode": "unexpanded",
+            "image_preprocessing": {
+                "resize_targets": [{"width": 224, "height": 320}]
+            }
+        }))
+        .unwrap();
+
+        assert!(request.validate().is_ok());
+        assert_eq!(
+            request.image_preprocessing.unwrap().resize_targets,
+            vec![ImageResizeTarget {
+                width: 224,
+                height: 320
+            }]
+        );
     }
 }

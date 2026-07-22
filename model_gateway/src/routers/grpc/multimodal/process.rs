@@ -14,6 +14,7 @@ use llm_multimodal::{
     PromptReplacement, TrackedMedia, TrackerOutput, VideoClip, VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
+use openai_protocol::generate::ImageResizeTarget;
 use tracing::{debug, info, warn};
 
 use super::{
@@ -55,6 +56,34 @@ pub(crate) async fn process_multimodal_plan(
         tokenizer_source,
         false,
         true,
+        None,
+    )
+    .await
+}
+
+/// Process original image references after reproducing the caller's first
+/// resize stage, then run the existing model-specific processor.
+pub(crate) async fn process_multimodal_plan_with_image_preprocessing(
+    plan: MediaPlan,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    token_ids: Vec<u32>,
+    components: &MultimodalComponents,
+    tokenizer_id: &str,
+    tokenizer_source: &str,
+    resize_targets: Vec<ImageResizeTarget>,
+) -> Result<MultimodalOutput> {
+    process_multimodal_plan_with_mode(
+        plan,
+        model_id,
+        tokenizer,
+        token_ids,
+        components,
+        tokenizer_id,
+        tokenizer_source,
+        false,
+        true,
+        Some(resize_targets),
     )
     .await
 }
@@ -79,6 +108,7 @@ pub(crate) async fn process_multimodal_plan_preexpanded(
         tokenizer_source,
         true,
         true,
+        None,
     )
     .await
 }
@@ -102,6 +132,7 @@ pub(crate) async fn process_multimodal_plan_python_preprocessed(
         tokenizer_source,
         true,
         false,
+        None,
     )
     .await
 }
@@ -116,6 +147,7 @@ async fn process_multimodal_plan_with_mode(
     tokenizer_source: &str,
     preexpanded: bool,
     validate_preexpanded_counts: bool,
+    image_resize_targets: Option<Vec<ImageResizeTarget>>,
 ) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -146,6 +178,21 @@ async fn process_multimodal_plan_with_mode(
                 .collect()
         })
         .unwrap_or_default();
+
+    if let Some(targets) = &image_resize_targets {
+        anyhow::ensure!(
+            targets.len() == images.len(),
+            "First-stage resize target count ({}) does not match fetched image count ({})",
+            targets.len(),
+            images.len()
+        );
+        anyhow::ensure!(
+            targets
+                .iter()
+                .all(|target| target.width > 0 && target.height > 0),
+            "First-stage resize targets must have non-zero width and height"
+        );
+    }
 
     let videos: Vec<Arc<VideoClip>> = tracker_output
         .data
@@ -269,6 +316,7 @@ async fn process_multimodal_plan_with_mode(
             spec,
             tokenizer_id,
             &model_config,
+            image_resize_targets.as_deref(),
         )
     }))
     .await?;
@@ -480,6 +528,7 @@ async fn preprocess_modality(
     spec: &dyn ModelProcessorSpec,
     tokenizer_id: &str,
     model_config: &MultimodalModelConfig,
+    image_resize_targets: Option<&[ImageResizeTarget]>,
 ) -> Result<PreprocessedEncoderInputs> {
     // Run CPU-intensive preprocessing on a blocking thread pool so it doesn't
     // block the tokio async runtime under concurrent load.
@@ -503,6 +552,9 @@ async fn preprocess_modality(
                 model_type.map(String::from),
                 pp_config,
                 config_fingerprint(tokenizer_id, &model_config.config),
+                image_resize_targets
+                    .and_then(|targets| targets.first())
+                    .copied(),
             )
             .await;
         }
@@ -512,6 +564,7 @@ async fn preprocess_modality(
     let model_id_owned = model_id.to_string();
     let model_type_owned = model_type.map(String::from);
     let media_for_preprocess = media.clone(); // cheap Arc refcount bumps
+    let image_resize_targets = image_resize_targets.map(|targets| targets.to_vec());
     let audio_processor = if modality == Modality::Audio {
         Some(
             spec.audio_processor(&model_config.config, &model_config.preprocessor_config)
@@ -535,8 +588,7 @@ async fn preprocess_modality(
                 })?;
             // Extract DynamicImages inside the blocking closure so the expensive
             // clone happens off the tokio async runtime.
-            let raw_images: Vec<image::DynamicImage> =
-                images.iter().map(|frame| frame.image.clone()).collect();
+            let raw_images = prepare_images_for_model(&images, image_resize_targets.as_deref());
             processor
                 .preprocess(&raw_images, &pp_config)
                 .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
@@ -623,10 +675,12 @@ async fn preprocess_image_cached(
     model_type: Option<String>,
     pp_config: PreProcessorConfig,
     fingerprint: u64,
+    pre_resize: Option<ImageResizeTarget>,
 ) -> Result<PreprocessedEncoderInputs> {
     let key = PixelCacheKey {
         image_hash: image.hash.clone(),
         config_fingerprint: fingerprint,
+        pre_resize: pre_resize.map(|target| (target.width, target.height)),
     };
     if let Some(cached) = cache.get(&key) {
         return Ok(cached.preprocessed.clone());
@@ -638,6 +692,7 @@ async fn preprocess_image_cached(
         model_type,
         pp_config,
         std::slice::from_ref(image),
+        pre_resize.as_slice(),
     )
     .await?;
     cache.insert(
@@ -655,18 +710,51 @@ async fn preprocess_image_batch(
     model_type: Option<String>,
     pp_config: PreProcessorConfig,
     images: &[Arc<ImageFrame>],
+    resize_targets: &[ImageResizeTarget],
 ) -> Result<PreprocessedEncoderInputs> {
-    let raw_images: Vec<image::DynamicImage> = images.iter().map(|f| f.image.clone()).collect();
+    let images = images.to_vec();
+    let resize_targets = resize_targets.to_vec();
     tokio::task::spawn_blocking(move || {
         let processor = registry
             .find(&model_id, model_type.as_deref())
             .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;
+        let raw_images = prepare_images_for_model(
+            &images,
+            (!resize_targets.is_empty()).then_some(resize_targets.as_slice()),
+        );
         processor
             .preprocess(&raw_images, &pp_config)
             .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
     })
     .await
     .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
+}
+
+fn prepare_images_for_model(
+    images: &[Arc<ImageFrame>],
+    resize_targets: Option<&[ImageResizeTarget]>,
+) -> Vec<image::DynamicImage> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            let Some(target) = resize_targets.and_then(|targets| targets.get(index)) else {
+                return frame.image.clone();
+            };
+            if frame.image.width() == target.width && frame.image.height() == target.height {
+                match &frame.image {
+                    image::DynamicImage::ImageRgb8(_) => frame.image.clone(),
+                    _ => image::DynamicImage::ImageRgb8(frame.image.to_rgb8()),
+                }
+            } else {
+                llm_multimodal::vision::transforms::resize_bicubic_pil(
+                    &frame.image,
+                    target.width,
+                    target.height,
+                )
+            }
+        })
+        .collect()
 }
 
 struct ModalityExpansion<'a> {

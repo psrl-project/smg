@@ -51,7 +51,7 @@ pub(crate) use plan::{
 };
 pub(crate) use process::{
     process_multimodal_plan, process_multimodal_plan_preexpanded,
-    process_multimodal_plan_python_preprocessed,
+    process_multimodal_plan_python_preprocessed, process_multimodal_plan_with_image_preprocessing,
 };
 pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 

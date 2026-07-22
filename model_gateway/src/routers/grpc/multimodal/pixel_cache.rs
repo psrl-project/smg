@@ -18,6 +18,8 @@ pub(crate) struct PixelCacheKey {
     pub image_hash: String,
     /// Stable hash of model identity/config for this deployment.
     pub config_fingerprint: u64,
+    /// Caller-resolved first-stage resize, when one precedes model processing.
+    pub pre_resize: Option<(u32, u32)>,
 }
 
 /// Cached per-image vision processor output before backend-specific serialization.
@@ -188,6 +190,7 @@ mod tests {
         PixelCacheKey {
             image_hash: hash.to_string(),
             config_fingerprint: 7,
+            pre_resize: None,
         }
     }
 
