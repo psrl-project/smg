@@ -483,13 +483,18 @@ pub(crate) struct TitoRequestContext {
     /// Number of messages matched by TITO prefix (if is_tito_hit is true).
     /// Used for rollback detection: if new request matches fewer messages, we truncate turn_records.
     pub matched_message_num: usize,
-    /// Trajectory identifier from `x-smg-tito-trajectory-id` header (defaults to 0).
-    /// Within a session each unique trajectory ID tracks a separate leaf node.
+    /// Resolved trajectory identifier. In manual mode this comes from the request
+    /// header; in auto mode TITO derives it from the matched tree leaf.
     pub trajectory_id: u64,
+    /// Prevents concurrent auto-mode branches from claiming the same trajectory.
+    pub trajectory_id_reservation: Option<smg_tito::TrajectoryIdReservation>,
     /// Prompt token IDs computed during preparation (set in ChatPreparationStage, read in
     /// ChatResponseProcessingStage for TITO capture).
     /// Consumed by `ChatRequestBuildingStage::execute()` before response processing runs.
     pub prompt_token_ids: Vec<u32>,
+    /// Prompt IDs before multimodal anchor expansion, retained for the next
+    /// incremental TITO turn. Pure-text requests reuse `prompt_token_ids`.
+    pub reusable_prompt_token_ids: Option<Vec<u32>>,
     /// Snapshot of the prefix hash.
     /// The response stage extends this in place with the newly-generated
     /// assistant message and finalizes it to derive the leaf hash,
@@ -510,6 +515,10 @@ pub(crate) struct ResponseState {
     /// Stored here because PreparationOutput is consumed by request_building before
     /// response_processing runs.
     pub skip_special_tokens: Option<bool>,
+
+    /// Exact prompt IDs dispatched to the backend for an opted-in generate
+    /// request. Retained across partial-rollout loopback iterations.
+    pub prompt_token_ids: Option<Vec<u32>>,
 
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,

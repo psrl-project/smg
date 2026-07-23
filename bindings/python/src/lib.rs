@@ -513,6 +513,9 @@ struct Router {
     epd_disaggregation: bool,
     encode_urls: Option<Vec<(String, Option<u16>)>>,
     encode_policy: Option<PolicyType>,
+    multimodal_tensor_transport: Option<String>,
+    multimodal_shm_min_bytes: Option<usize>,
+    trajectory_id_strategy: String,
 }
 
 impl Router {
@@ -555,6 +558,23 @@ impl Router {
         use config::{
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
+
+        // Validate the transport mode up front. The CLI (value_parser) and the
+        // argparse path (choices) already reject bad values; this covers direct
+        // programmatic `RouterArgs` use, matching the CLI/Rust parsing contract.
+        let multimodal_tensor_transport = self
+            .multimodal_tensor_transport
+            .as_deref()
+            .map(|value| {
+                config::TransportMode::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "multimodal_tensor_transport".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'inline', 'shm', 'auto', or 'rdma'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
@@ -890,6 +910,8 @@ impl Router {
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .dp_aware(self.dp_aware)
+            .multimodal_tensor_transport(multimodal_tensor_transport)
+            .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -1064,6 +1086,9 @@ impl Router {
         epd_disaggregation = false,
         encode_urls = None,
         encode_policy = None,
+        multimodal_tensor_transport = None,
+        multimodal_shm_min_bytes = None,
+        trajectory_id_strategy = String::from("manual"),
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1212,6 +1237,9 @@ impl Router {
         epd_disaggregation: bool,
         encode_urls: Option<Vec<(String, Option<u16>)>>,
         encode_policy: Option<PolicyType>,
+        multimodal_tensor_transport: Option<String>,
+        multimodal_shm_min_bytes: Option<usize>,
+        trajectory_id_strategy: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1236,6 +1264,12 @@ impl Router {
             Some("grpc") => worker::ConnectionMode::Grpc,
             _ => Self::determine_connection_mode(&all_urls),
         };
+
+        if !matches!(trajectory_id_strategy.as_str(), "manual" | "auto") {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid trajectory_id_strategy '{trajectory_id_strategy}'; expected manual or auto"
+            )));
+        }
 
         Ok(Router {
             host,
@@ -1377,6 +1411,9 @@ impl Router {
             epd_disaggregation,
             encode_urls,
             encode_policy,
+            multimodal_tensor_transport,
+            multimodal_shm_min_bytes,
+            trajectory_id_strategy,
         })
     }
 
@@ -1503,6 +1540,11 @@ impl Router {
                 enable_tito: self.enable_tito,
                 tito_debug: self.tito_debug,
                 tito_gc_threshold: self.tito_gc_threshold,
+                trajectory_id_strategy: self.trajectory_id_strategy.parse().map_err(|reason| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid trajectory_id_strategy: {reason}"
+                    ))
+                })?,
                 webrtc_bind_addr: None,
                 webrtc_stun_server: None,
                 health_check_port: None,

@@ -19,14 +19,23 @@ fi
 
 echo "Using uv version: $(uv --version)"
 
-# Floor 0.22.1: older vllm resolved an early transformers v5 that broke
-# e5-mistral last-token pooling (the old <0.19.1 pin); 0.22.1+ only admits
-# transformers >= 5.5.1. e2e-1gpu-embeddings is the quality gate.
+# Floor 0.25.0: older vllm releases do not guarantee torchcodec, while the
+# import canary below deliberately validates it. This line also admits only
+# transformers >= 5.5.3, preserving e5-mistral last-token pooling.
 # FastAPI 0.137 makes vLLM's prometheus-fastapi-instrumentator health route
 # crash on _IncludedRouter entries; keep the last known-good FastAPI line.
 # --torch-backend=auto matches the torch CUDA variant to the pod's driver.
 echo "Installing vLLM..."
-uv pip install "vllm>=0.22.1" "fastapi<0.137" --torch-backend=auto
+uv pip install "vllm>=0.25.0" "fastapi<0.137" --torch-backend=auto
+
+# vLLM >=0.25 eagerly imports torchcodec, which dlopens the FFmpeg shared
+# libraries (libavutil/libavcodec/libavformat/...) at import time. The runner
+# image ships none, so every worker dies importing vllm. Install distro FFmpeg
+# (the metapackage pulls the matching libav* sonames; torchcodec supports
+# FFmpeg 4-7). This step is unconditional, so refresh apt lists first.
+echo "Installing FFmpeg for torchcodec..."
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends ffmpeg
 
 # NIXL for vLLM PD disaggregation. The bare metapackage pulls both cu12 and
 # cu13 backends, so install the top-level shim alone, then the backend
@@ -45,6 +54,12 @@ rm -rf "${SITE_PACKAGES}/nixl_ep"
 # (torch first so its bundled CUDA libraries are loaded)
 python3 -c "import torch, nixl"
 echo "nixl import canary OK"
+
+# Import canary: fail here (not mid-e2e) if vLLM's eager torchcodec import
+# can't find the FFmpeg shared libs installed above (torch first so its
+# bundled CUDA libraries are loaded)
+python3 -c "import torch, torchcodec, vllm"
+echo "vllm/torchcodec import canary OK"
 
 # Mooncake transfer engine, only on the MooncakeConnector PD leg so a broken
 # wheel cannot fail the unrelated vLLM jobs

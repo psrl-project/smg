@@ -11,31 +11,12 @@ use fast_image_resize::{
 };
 use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgb, RgbImage};
 use ndarray::{s, Array3, Array4};
-use thiserror::Error;
 
-use super::execution::{scope as parallel_scope, task_count};
-
-/// Errors that can occur during image transformations.
-#[derive(Error, Debug)]
-pub enum TransformError {
-    #[error("Invalid tensor shape: expected {expected}, got {actual:?}")]
-    InvalidShape {
-        expected: String,
-        actual: Vec<usize>,
-    },
-
-    #[error("Image operation failed: {0}")]
-    ImageError(#[from] image::ImageError),
-
-    #[error("Empty batch: cannot stack zero tensors")]
-    EmptyBatch,
-
-    #[error("Inconsistent tensor shapes in batch")]
-    InconsistentShapes,
-
-    #[error("Shape error: {0}")]
-    ShapeError(String),
-}
+use super::{
+    execution::{scope as parallel_scope, task_count},
+    scratch,
+};
+pub use crate::error::TransformError;
 
 pub type Result<T> = std::result::Result<T, TransformError>;
 
@@ -151,7 +132,8 @@ fn build_planar_tensor(
     bias: [f32; 3],
 ) -> Array3<f32> {
     let pixels = h * w;
-    let mut data = vec![0.0f32; 3 * pixels];
+    // Pooled: this large per-image buffer is the data plane's hottest allocation.
+    let mut data = scratch::take_f32(3 * pixels);
     let (r_plane, rest) = data.split_at_mut(pixels);
     let (g_plane, b_plane) = rest.split_at_mut(pixels);
 
@@ -789,6 +771,304 @@ fn resize_bicubic_pil_bytes(
             pil_resample_vertical(&horiz, in_h, out_w, out_h, 3)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Transformers TorchvisionBackend-exact bicubic resize.
+//
+// Transformers 5.10.1's normal CPU path feeds uint8 directly into
+// torchvision. PyTorch's bicubic AA CPU kernel computes weights in f64, chooses
+// the largest safe int16 precision for the whole axis, and quantizes to uint8
+// after each separable pass. This differs from Pillow's fixed 22-bit kernels.
+// The float `/256 -> resize -> *256` path exists only as a torch.compile ROCm
+// workaround and is not the PSRL/vLLM training path.
+
+#[derive(Debug)]
+struct TorchvisionAxisCoefficients {
+    bounds: Vec<(usize, usize)>,
+    kernels: Vec<Vec<i32>>,
+    precision: u32,
+}
+
+#[inline]
+fn torchvision_cubic(x: f64) -> f64 {
+    // PyTorch's bicubic AA filter uses cubic_convolution1/2 with a = -0.5.
+    const A: f64 = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A
+    } else {
+        0.0
+    }
+}
+
+fn torchvision_precompute_coeffs(
+    input_size: usize,
+    output_size: usize,
+) -> TorchvisionAxisCoefficients {
+    let scale = input_size as f64 / output_size as f64;
+    let support = 2.0_f64 * scale.max(1.0);
+    let inverse_scale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
+    let max_interp_size = (support.ceil() as usize) * 2 + 1;
+    let mut bounds = Vec::with_capacity(output_size);
+    let mut float_kernels = Vec::with_capacity(output_size);
+    let mut maximum_weight = 0.0_f64;
+
+    for output_index in 0..output_size {
+        let center = scale * (output_index as f64 + 0.5);
+        // C++ static_cast<int64_t> truncates toward zero. The lower bound is
+        // then clamped to zero, making this equivalent at the left edge too.
+        let source_min = ((center - support + 0.5) as i64).max(0) as usize;
+        let source_end = ((center + support + 0.5) as i64)
+            .min(input_size as i64)
+            .max(source_min as i64) as usize;
+        let source_count = (source_end - source_min).min(max_interp_size);
+
+        let mut weights = Vec::with_capacity(source_count);
+        let mut total_weight = 0.0_f64;
+        for offset in 0..source_count {
+            let distance = ((offset + source_min) as f64 - center + 0.5) * inverse_scale;
+            let weight = torchvision_cubic(distance);
+            weights.push(weight);
+            total_weight += weight;
+        }
+        if total_weight != 0.0 {
+            for weight in &mut weights {
+                *weight /= total_weight;
+                maximum_weight = maximum_weight.max(*weight);
+            }
+        }
+        bounds.push((source_min, source_count));
+        float_kernels.push(weights);
+    }
+
+    let mut precision = 0_u32;
+    while precision < 22 {
+        let next = (0.5 + maximum_weight * f64::from(1_u32 << (precision + 1))) as i32;
+        if next >= (1_i32 << 15) {
+            break;
+        }
+        precision += 1;
+    }
+    let coefficient_scale = f64::from(1_u32 << precision);
+    let kernels = float_kernels
+        .into_iter()
+        .map(|weights| {
+            weights
+                .into_iter()
+                .map(|weight| {
+                    let scaled = weight * coefficient_scale;
+                    if scaled < 0.0 {
+                        (scaled - 0.5) as i32
+                    } else {
+                        (scaled + 0.5) as i32
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    TorchvisionAxisCoefficients {
+        bounds,
+        kernels,
+        precision,
+    }
+}
+
+fn torchvision_horizontal_band(
+    source: &[u8],
+    input_width: usize,
+    output_width: usize,
+    coefficients: &TorchvisionAxisCoefficients,
+    output_y: usize,
+    output: &mut [u8],
+) {
+    let output_row_size = output_width * 3;
+    for (row_offset, output_row) in output.chunks_mut(output_row_size).enumerate() {
+        let source_y = output_y + row_offset;
+        let source_row = &source[source_y * input_width * 3..(source_y + 1) * input_width * 3];
+        for output_x in 0..output_width {
+            let (source_x, source_columns) = coefficients.bounds[output_x];
+            let weights = &coefficients.kernels[output_x];
+            for channel in 0..3 {
+                let mut value = 1_i32 << (coefficients.precision - 1);
+                for offset in 0..source_columns {
+                    value += i32::from(source_row[((source_x + offset) * 3) + channel])
+                        * weights[offset];
+                }
+                output_row[output_x * 3 + channel] =
+                    (value >> coefficients.precision).clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+fn torchvision_vertical_band(
+    source: &[u8],
+    width: usize,
+    coefficients: &TorchvisionAxisCoefficients,
+    output_y: usize,
+    output: &mut [u8],
+) {
+    let output_row_size = width * 3;
+    for (row_offset, output_row) in output.chunks_mut(output_row_size).enumerate() {
+        let target_y = output_y + row_offset;
+        let (source_y, source_rows) = coefficients.bounds[target_y];
+        let weights = &coefficients.kernels[target_y];
+        for x in 0..width {
+            for channel in 0..3 {
+                let mut value = 1_i32 << (coefficients.precision - 1);
+                for offset in 0..source_rows {
+                    value += i32::from(source[(((source_y + offset) * width + x) * 3) + channel])
+                        * weights[offset];
+                }
+                output_row[x * 3 + channel] = (value >> coefficients.precision).clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+fn resize_bicubic_torchvision_bytes(
+    data: &[u8],
+    input_width: u32,
+    input_height: u32,
+    output_width: u32,
+    output_height: u32,
+) -> Vec<u8> {
+    let (input_width, input_height, output_width, output_height) = (
+        input_width as usize,
+        input_height as usize,
+        output_width as usize,
+        output_height as usize,
+    );
+    if input_width == output_width && input_height == output_height {
+        return data.to_vec();
+    }
+
+    let horizontal_coefficients = torchvision_precompute_coeffs(input_width, output_width);
+    let horizontal_row_size = output_width * 3;
+    let mut horizontal = vec![0_u8; input_height * horizontal_row_size];
+    let horizontal_threads = par_threads(size_of_val(horizontal.as_slice()), input_height);
+    if horizontal_threads <= 1 {
+        torchvision_horizontal_band(
+            data,
+            input_width,
+            output_width,
+            &horizontal_coefficients,
+            0,
+            &mut horizontal,
+        );
+    } else {
+        let chunk_rows = input_height.div_ceil(horizontal_threads);
+        parallel_scope(|scope| {
+            let mut rest = horizontal.as_mut_slice();
+            let mut output_y = 0;
+            while output_y < input_height {
+                let rows = chunk_rows.min(input_height - output_y);
+                let (band, tail) = rest.split_at_mut(rows * horizontal_row_size);
+                rest = tail;
+                let start = output_y;
+                let coefficients = &horizontal_coefficients;
+                scope.spawn(move |_| {
+                    torchvision_horizontal_band(
+                        data,
+                        input_width,
+                        output_width,
+                        coefficients,
+                        start,
+                        band,
+                    );
+                });
+                output_y += rows;
+            }
+        });
+    }
+
+    let vertical_coefficients = torchvision_precompute_coeffs(input_height, output_height);
+    let output_row_size = output_width * 3;
+    let mut output = vec![0_u8; output_height * output_row_size];
+    let vertical_threads = par_threads(output.len(), output_height);
+    if vertical_threads <= 1 {
+        torchvision_vertical_band(
+            &horizontal,
+            output_width,
+            &vertical_coefficients,
+            0,
+            &mut output,
+        );
+    } else {
+        let chunk_rows = output_height.div_ceil(vertical_threads);
+        parallel_scope(|scope| {
+            let mut rest = output.as_mut_slice();
+            let mut output_y = 0;
+            while output_y < output_height {
+                let rows = chunk_rows.min(output_height - output_y);
+                let (band, tail) = rest.split_at_mut(rows * output_row_size);
+                rest = tail;
+                let start = output_y;
+                let coefficients = &vertical_coefficients;
+                let horizontal = &horizontal;
+                scope.spawn(move |_| {
+                    torchvision_vertical_band(horizontal, output_width, coefficients, start, band);
+                });
+                output_y += rows;
+            }
+        });
+    }
+    output
+}
+
+/// Bicubic resize matching Transformers 5.10.1 `TorchvisionBackend`'s normal
+/// uint8 CPU path.
+pub fn resize_bicubic_torchvision(
+    image: &DynamicImage,
+    output_width: u32,
+    output_height: u32,
+) -> DynamicImage {
+    let rgb = image.to_rgb8();
+    let (input_width, input_height) = rgb.dimensions();
+    let output = resize_bicubic_torchvision_bytes(
+        rgb.as_raw(),
+        input_width,
+        input_height,
+        output_width,
+        output_height,
+    );
+    #[expect(
+        clippy::expect_used,
+        reason = "output is exactly output_width*output_height*3 bytes by construction"
+    )]
+    DynamicImage::ImageRgb8(
+        RgbImage::from_raw(output_width, output_height, output)
+            .expect("torchvision resize buffer size"),
+    )
+}
+
+/// Raw interleaved-RGB variant of [`resize_bicubic_torchvision`].
+pub fn resize_bicubic_torchvision_rgb(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    output_width: u32,
+    output_height: u32,
+) -> Result<RgbImage> {
+    let expected = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(3);
+    if data.len() != expected {
+        return Err(TransformError::ShapeError(format!(
+            "torchvision bicubic RGB source has {} bytes, expected {expected} for {width}x{height}",
+            data.len()
+        )));
+    }
+    let output = resize_bicubic_torchvision_bytes(data, width, height, output_width, output_height);
+    RgbImage::from_raw(output_width, output_height, output).ok_or_else(|| {
+        TransformError::ShapeError(format!(
+            "failed to build torchvision bicubic RGB image for {output_width}x{output_height}"
+        ))
+    })
 }
 
 /// Resize image preserving aspect ratio, fitting within max dimensions.

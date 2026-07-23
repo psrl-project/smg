@@ -79,24 +79,18 @@ impl PipelineStage for GenerateRequestBuildingStage {
             multimodal_intermediate,
         } = prep
         else {
-            debug_assert!(false, "pipeline guarantees Generate variant");
             return Err(error::internal_error(
                 "wrong_preparation_type",
                 "Expected Generate preparation output",
             ));
         };
-
-        let multimodal_data = if let Some(intermediate) = multimodal_intermediate {
-            Some(
+        let multimodal_data = match multimodal_intermediate {
+            Some(intermediate) => Some(
                 assemble_multimodal_data(intermediate, builder_client, ctx.state.workers.as_ref())
                     .await
-                    .map_err(|e| {
-                error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to assemble multimodal request");
-                error::bad_request("multimodal_not_supported", format!("{e}"))
-                    })?,
-            )
-        } else {
-            None
+                    .map_err(|e| error::bad_request("multimodal_not_supported", e.to_string()))?,
+            ),
+            None => None,
         };
 
         // Build proto request using centralized dispatch

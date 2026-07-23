@@ -338,14 +338,32 @@ fn do_tito_capture_non_streaming(
         mismatch_report,
     );
 
-    match store.store_with_hashes(
-        &tito_ctx.session_id,
-        leaf_hash,
-        parent_hash,
-        full_ids,
-        turn_record,
-        tito_ctx.trajectory_id,
-    ) {
+    let store_result =
+        if let Some(reusable_prompt_ids) = tito_ctx.reusable_prompt_token_ids.as_ref() {
+            let mut reusable_full_ids =
+                Vec::with_capacity(reusable_prompt_ids.len() + output_ids.len());
+            reusable_full_ids.extend_from_slice(reusable_prompt_ids);
+            reusable_full_ids.extend_from_slice(output_ids);
+            store.store_with_hashes_and_reusable(
+                &tito_ctx.session_id,
+                leaf_hash,
+                parent_hash,
+                smg_tito::store::StoredTokenSequences::with_reusable(full_ids, reusable_full_ids),
+                turn_record,
+                tito_ctx.trajectory_id,
+            )
+        } else {
+            store.store_with_hashes(
+                &tito_ctx.session_id,
+                leaf_hash,
+                parent_hash,
+                full_ids,
+                turn_record,
+                tito_ctx.trajectory_id,
+            )
+        };
+
+    match store_result {
         Ok(()) => {
             debug!(session_id = %tito_ctx.session_id, "TITO stored generation result");
             // Advance the trajectory's RE offset only on successful store.
@@ -367,6 +385,10 @@ fn do_tito_capture_non_streaming(
             warn!(session_id = %tito_ctx.session_id, error = %e, "TITO store failed (non-fatal)");
         }
     };
+
+    if let Some(reservation) = tito_ctx.trajectory_id_reservation.as_ref() {
+        reservation.release();
+    }
 }
 
 fn build_mismatch_report(

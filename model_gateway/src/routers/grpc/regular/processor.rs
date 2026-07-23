@@ -398,6 +398,7 @@ impl ResponseProcessor {
         dispatch: DispatchMetadata,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
+        mut prompt_token_ids: Option<Vec<u32>>,
         start_time: Instant,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
         // Collect all responses from the execution result
@@ -405,8 +406,9 @@ impl ResponseProcessor {
             response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         // Process each completion
-        let mut result_array = Vec::new();
-        for complete in all_responses {
+        let response_count = all_responses.len();
+        let mut result_array = Vec::with_capacity(response_count);
+        for (response_index, complete) in all_responses.into_iter().enumerate() {
             stop_decoder.reset();
 
             // Process tokens through stop decoder
@@ -483,6 +485,11 @@ impl ResponseProcessor {
                 reasoning_tokens: Some(complete.reasoning_tokens()),
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
+                prompt_token_ids: if response_index + 1 == response_count {
+                    prompt_token_ids.take()
+                } else {
+                    prompt_token_ids.clone()
+                },
                 routed_experts: complete
                     .routed_experts()
                     .as_ref()

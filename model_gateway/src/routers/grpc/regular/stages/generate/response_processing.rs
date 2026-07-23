@@ -117,6 +117,7 @@ impl GenerateResponseProcessingStage {
         // Non-streaming: Delegate to ResponseProcessor
         let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
         let generate_request = ctx.generate_request_arc();
+        let prompt_token_ids = ctx.state.response.prompt_token_ids.take();
 
         let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
@@ -137,6 +138,7 @@ impl GenerateResponseProcessingStage {
                 dispatch,
                 stop_decoder,
                 request_logprobs,
+                prompt_token_ids,
                 start_time,
             )
             .await?;

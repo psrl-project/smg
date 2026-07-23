@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
+    encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::processor::PreprocessedEncoderInputs,
 };
 
 pub(super) struct LlavaSpec;
@@ -198,5 +198,23 @@ mod tests {
         let registry = ModelRegistry::new();
         let spec = registry.lookup(&metadata).expect("llava alias");
         assert_eq!(spec.name(), "llava");
+    }
+
+    #[test]
+    fn llava_spec_has_no_audio_processor() {
+        use crate::vision::PreProcessorConfig;
+
+        let tokenizer = TestTokenizer::new(&[("<image>", 32000)]);
+        let config = json!({"model_type": "llava", "image_token_index": 32000});
+        let metadata = ModelMetadata {
+            model_id: "llava-v1.5",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).expect("llava spec");
+        assert!(spec
+            .audio_processor(&config, &PreProcessorConfig::default())
+            .is_none());
     }
 }

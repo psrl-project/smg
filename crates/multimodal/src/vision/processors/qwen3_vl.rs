@@ -20,7 +20,7 @@ use std::ops::Deref;
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase};
+use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::{
     types::RgbFrameRef,
     vision::{
@@ -43,6 +43,14 @@ pub const DEFAULT_MIN_PIXELS: usize = 65536;
 /// Default maximum pixels for Qwen3-VL
 /// This corresponds to longest_edge = 16777216 from HF config
 pub const DEFAULT_MAX_PIXELS: usize = 16777216;
+
+/// Default minimum pixels for a complete Qwen3-VL video volume.
+/// This corresponds to shortest_edge = 4096 from the HF video config.
+pub const DEFAULT_VIDEO_MIN_PIXELS: usize = 4096;
+
+/// Default maximum pixels for a complete Qwen3-VL video volume.
+/// This corresponds to longest_edge = 25165824 from the HF video config.
+pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 25165824;
 
 /// Default patch size for Qwen3-VL (16, vs 14 in Qwen2-VL)
 pub const DEFAULT_PATCH_SIZE: usize = 16;
@@ -82,13 +90,36 @@ impl Qwen3VLProcessor {
     /// - temporal_patch_size: 2
     /// - normalization: [0.5, 0.5, 0.5] mean/std
     pub fn new() -> Self {
+        Self::with_limits(
+            DEFAULT_MIN_PIXELS,
+            DEFAULT_MAX_PIXELS,
+            DEFAULT_VIDEO_MIN_PIXELS,
+            DEFAULT_VIDEO_MAX_PIXELS,
+            DEFAULT_PATCH_SIZE,
+            DEFAULT_MERGE_SIZE,
+            DEFAULT_TEMPORAL_PATCH_SIZE,
+        )
+    }
+
+    fn with_limits(
+        image_min_pixels: usize,
+        image_max_pixels: usize,
+        video_min_pixels: usize,
+        video_max_pixels: usize,
+        patch_size: usize,
+        merge_size: usize,
+        temporal_patch_size: usize,
+    ) -> Self {
         Self {
             inner: QwenVLProcessorBase::new(QwenVLConfig {
-                patch_size: DEFAULT_PATCH_SIZE,
-                merge_size: DEFAULT_MERGE_SIZE,
-                min_pixels: DEFAULT_MIN_PIXELS,
-                max_pixels: DEFAULT_MAX_PIXELS,
-                temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
+                patch_size,
+                merge_size,
+                min_pixels: image_min_pixels,
+                max_pixels: image_max_pixels,
+                video_min_pixels,
+                video_max_pixels,
+                video_resize_mode: QwenVideoResizeMode::TotalVolume,
+                temporal_patch_size,
                 mean: QWEN3_MEAN,
                 std: QWEN3_STD,
                 model_name: "qwen3-vl",
@@ -104,55 +135,84 @@ impl Qwen3VLProcessor {
         max_pixels: usize,
         temporal_patch_size: usize,
     ) -> Self {
-        Self {
-            inner: QwenVLProcessorBase::new(QwenVLConfig {
-                patch_size,
-                merge_size,
-                min_pixels,
-                max_pixels,
-                temporal_patch_size,
-                mean: QWEN3_MEAN,
-                std: QWEN3_STD,
-                model_name: "qwen3-vl",
-            }),
-        }
+        Self::with_limits(
+            min_pixels,
+            max_pixels,
+            min_pixels,
+            max_pixels,
+            patch_size,
+            merge_size,
+            temporal_patch_size,
+        )
     }
 
     /// Create a processor from preprocessor config.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
-        Self {
-            inner: QwenVLProcessorBase::new(QwenVLConfig {
-                patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE),
-                merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
-                min_pixels: config
-                    .min_pixels
-                    .or_else(|| config.get_shortest_edge())
-                    .unwrap_or(DEFAULT_MIN_PIXELS),
-                max_pixels: config
-                    .max_pixels
-                    .or_else(|| config.get_longest_edge())
-                    .unwrap_or(DEFAULT_MAX_PIXELS),
-                temporal_patch_size: config
-                    .temporal_patch_size
-                    .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
-                mean: QWEN3_MEAN,
-                std: QWEN3_STD,
-                model_name: "qwen3-vl",
-            }),
-        }
+        let configured_min = config.min_pixels.or_else(|| config.get_shortest_edge());
+        let configured_max = config.max_pixels.or_else(|| config.get_longest_edge());
+        let min_pixels = configured_min.unwrap_or(DEFAULT_MIN_PIXELS);
+        let max_pixels = configured_max.unwrap_or(DEFAULT_MAX_PIXELS);
+        Self::with_limits(
+            min_pixels,
+            max_pixels,
+            min_pixels,
+            max_pixels,
+            config.get_patch_size(DEFAULT_PATCH_SIZE),
+            config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
+            config
+                .temporal_patch_size
+                .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+        )
+    }
+
+    fn from_image_preprocessor_config(config: &PreProcessorConfig) -> Self {
+        let configured_min = config.min_pixels.or_else(|| config.get_shortest_edge());
+        let configured_max = config.max_pixels.or_else(|| config.get_longest_edge());
+        Self::with_limits(
+            configured_min.unwrap_or(DEFAULT_MIN_PIXELS),
+            configured_max.unwrap_or(DEFAULT_MAX_PIXELS),
+            DEFAULT_VIDEO_MIN_PIXELS,
+            DEFAULT_VIDEO_MAX_PIXELS,
+            config.get_patch_size(DEFAULT_PATCH_SIZE),
+            config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
+            config
+                .temporal_patch_size
+                .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+        )
+    }
+
+    fn from_video_preprocessor_config(config: &PreProcessorConfig) -> Self {
+        let configured_min = config.min_pixels.or_else(|| config.get_shortest_edge());
+        let configured_max = config.max_pixels.or_else(|| config.get_longest_edge());
+        Self::with_limits(
+            DEFAULT_MIN_PIXELS,
+            DEFAULT_MAX_PIXELS,
+            configured_min.unwrap_or(DEFAULT_VIDEO_MIN_PIXELS),
+            configured_max.unwrap_or(DEFAULT_VIDEO_MAX_PIXELS),
+            config.get_patch_size(DEFAULT_PATCH_SIZE),
+            config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
+            config
+                .temporal_patch_size
+                .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+        )
     }
 
     fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.patch_size.is_some()
-            || config.merge_size.is_some()
-            || config.min_pixels.is_some()
-            || config.max_pixels.is_some()
-            || config.temporal_patch_size.is_some()
-            || config.size.is_some()
-        {
-            Self::from_preprocessor_config(config)
+        if config.has_structural_overrides() {
+            Self::from_image_preprocessor_config(config)
         } else {
             self.clone()
+        }
+    }
+
+    fn with_video_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
+        if !config.has_structural_overrides() {
+            return self.clone();
+        }
+        if config.is_image_only_processor_type() {
+            Self::from_image_preprocessor_config(config)
+        } else {
+            Self::from_video_preprocessor_config(config)
         }
     }
 
@@ -244,7 +304,7 @@ impl VisionPreProcessor for Qwen3VLProcessor {
         frames: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_preprocessor_config(config);
+        let processor = self.with_video_preprocessor_config(config);
         processor.inner.preprocess_video(frames, config)
     }
 
@@ -253,7 +313,7 @@ impl VisionPreProcessor for Qwen3VLProcessor {
         frames: &[RgbFrameRef<'_>],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_preprocessor_config(config);
+        let processor = self.with_video_preprocessor_config(config);
         processor.inner.preprocess_video_rgb(frames, config)
     }
 
@@ -291,7 +351,19 @@ mod tests {
         assert_eq!(processor.merge_size(), 2);
         assert_eq!(processor.min_pixels(), DEFAULT_MIN_PIXELS);
         assert_eq!(processor.max_pixels(), DEFAULT_MAX_PIXELS);
+        assert_eq!(processor.inner.video_min_pixels(), DEFAULT_VIDEO_MIN_PIXELS);
+        assert_eq!(processor.inner.video_max_pixels(), DEFAULT_VIDEO_MAX_PIXELS);
         assert_eq!(processor.get_factor(), 32); // 16 * 2
+    }
+
+    #[test]
+    fn test_with_config_preserves_shared_image_and_video_limits() {
+        let processor = Qwen3VLProcessor::with_config(16, 2, 8192, 1_048_576, 2);
+
+        assert_eq!(processor.min_pixels(), 8192);
+        assert_eq!(processor.max_pixels(), 1_048_576);
+        assert_eq!(processor.inner.video_min_pixels(), 8192);
+        assert_eq!(processor.inner.video_max_pixels(), 1_048_576);
     }
 
     #[test]
@@ -452,6 +524,74 @@ mod tests {
         }
     }
 
+    // Per-image-independence guard for the smg gateway pixel cache (EPD P1): the
+    // cache stores one entry per image and reassembles requests from per-image
+    // payloads, which is only sound if preprocessing image i is independent of the
+    // other images in the batch. This asserts that a batched preprocess equals the
+    // concatenation of per-image preprocesses (encoder_input rows, grid_thw rows,
+    // and feature_token_counts). If a processor ever introduces cross-image work,
+    // this fails and the cache assumption must be revisited.
+    #[test]
+    fn per_image_preprocess_equals_batched_slices() {
+        use ndarray::{Axis, Slice};
+
+        let processor = Qwen3VLProcessor::new();
+        let config = PreProcessorConfig {
+            image_mean: Some(QWEN3_MEAN.to_vec()),
+            image_std: Some(QWEN3_STD.to_vec()),
+            ..Default::default()
+        };
+
+        let image_a = create_test_image(640, 480, Rgb([100, 110, 120]));
+        let image_b = create_test_image(420, 560, Rgb([10, 200, 90]));
+
+        let batched = processor
+            .preprocess(&[image_a.clone(), image_b.clone()], &config)
+            .unwrap();
+        let single_a = processor.preprocess(&[image_a], &config).unwrap();
+        let single_b = processor.preprocess(&[image_b], &config).unwrap();
+
+        // Feature token counts line up per image.
+        assert_eq!(
+            batched.feature_token_counts,
+            vec![
+                single_a.feature_token_counts[0],
+                single_b.feature_token_counts[0]
+            ]
+        );
+
+        // encoder_input rows: batch == [single_a rows ++ single_b rows].
+        let pa = single_a.encoder_input.shape()[0];
+        let pb = single_b.encoder_input.shape()[0];
+        assert_eq!(batched.encoder_input.shape()[0], pa + pb);
+        assert_eq!(
+            batched
+                .encoder_input
+                .slice_axis(Axis(0), Slice::from(0..pa))
+                .to_owned(),
+            single_a.encoder_input
+        );
+        assert_eq!(
+            batched
+                .encoder_input
+                .slice_axis(Axis(0), Slice::from(pa..pa + pb))
+                .to_owned(),
+            single_b.encoder_input
+        );
+
+        // image_grid_thw rows: batch == [single_a row ++ single_b row].
+        let grid = |inputs: &PreprocessedEncoderInputs| match inputs
+            .model_specific
+            .get("image_grid_thw")
+        {
+            Some(ModelSpecificValue::IntTensor { data, .. }) => data.clone(),
+            other => panic!("expected image_grid_thw IntTensor, got {other:?}"),
+        };
+        let mut expected_grid = grid(&single_a);
+        expected_grid.extend(grid(&single_b));
+        assert_eq!(grid(&batched), expected_grid);
+    }
+
     #[test]
     fn test_qwen3_vl_preprocess_video() {
         let processor = Qwen3VLProcessor::new();
@@ -480,6 +620,11 @@ mod tests {
         } else {
             panic!("Expected video_grid_thw to be IntTensor");
         }
+        assert!(matches!(
+            result.model_specific.get("video_second_per_grid"),
+            Some(ModelSpecificValue::Tensor { data, shape })
+                if data == &vec![1.0] && shape == &vec![1]
+        ));
     }
 
     #[test]
@@ -558,6 +703,8 @@ mod tests {
         assert_eq!(processor.min_pixels(), 100000);
         assert_eq!(processor.max_pixels(), 500000);
         assert_eq!(processor.temporal_patch_size(), 4);
+        assert_eq!(processor.inner.video_min_pixels(), 100000);
+        assert_eq!(processor.inner.video_max_pixels(), 500000);
     }
 
     #[test]
@@ -570,14 +717,33 @@ mod tests {
             ..Default::default()
         };
 
-        let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
+        let processor = Qwen3VLProcessor::new().with_video_preprocessor_config(&config);
 
-        assert_eq!(processor.min_pixels(), 4096);
-        assert_eq!(processor.max_pixels(), 25165824);
+        assert_eq!(processor.min_pixels(), DEFAULT_MIN_PIXELS);
+        assert_eq!(processor.max_pixels(), DEFAULT_MAX_PIXELS);
+        assert_eq!(processor.inner.video_min_pixels(), 4096);
+        assert_eq!(processor.inner.video_max_pixels(), 25165824);
         assert_eq!(
             processor.inner.smart_resize_video(239, 720, 1280).unwrap(),
             (224, 416)
         );
+    }
+
+    #[test]
+    fn test_qwen3_vl_image_config_keeps_video_defaults() {
+        let config = PreProcessorConfig {
+            image_processor_type: Some("Qwen3VLImageProcessor".to_string()),
+            min_pixels: Some(100000),
+            max_pixels: Some(500000),
+            ..Default::default()
+        };
+
+        let processor = Qwen3VLProcessor::new().with_video_preprocessor_config(&config);
+
+        assert_eq!(processor.min_pixels(), 100000);
+        assert_eq!(processor.max_pixels(), 500000);
+        assert_eq!(processor.inner.video_min_pixels(), DEFAULT_VIDEO_MIN_PIXELS);
+        assert_eq!(processor.inner.video_max_pixels(), DEFAULT_VIDEO_MAX_PIXELS);
     }
 
     #[test]

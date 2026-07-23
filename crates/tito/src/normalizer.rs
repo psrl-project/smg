@@ -15,6 +15,8 @@ pub struct RenderContext {
     pub tools: Option<Vec<Value>>,
     pub template_kwargs: Option<HashMap<String, Value>>,
     pub image_placeholder: Option<String>,
+    pub video_placeholder: Option<String>,
+    pub audio_placeholder: Option<String>,
 }
 
 impl RenderContext {
@@ -23,6 +25,8 @@ impl RenderContext {
             tools,
             template_kwargs,
             image_placeholder: None,
+            video_placeholder: None,
+            audio_placeholder: None,
         }
     }
 
@@ -36,6 +40,8 @@ impl RenderContext {
             tools,
             template_kwargs,
             image_placeholder,
+            video_placeholder: None,
+            audio_placeholder: None,
         }
     }
 
@@ -49,6 +55,27 @@ impl RenderContext {
 
     pub fn image_placeholder_ref(&self) -> Option<&str> {
         self.image_placeholder.as_deref()
+    }
+
+    pub fn with_media_placeholders(
+        mut self,
+        image: Option<String>,
+        video: Option<String>,
+        audio: Option<String>,
+    ) -> Self {
+        self.image_placeholder = image;
+        self.video_placeholder = video;
+        self.audio_placeholder = audio;
+        self
+    }
+
+    pub fn placeholder_for_part_type(&self, part_type: &str) -> Option<&str> {
+        match part_type {
+            "image_url" | "image" | "input_image" => self.image_placeholder.as_deref(),
+            "video_url" | "video" => self.video_placeholder.as_deref(),
+            "audio_url" | "audio" | "input_audio" => self.audio_placeholder.as_deref(),
+            _ => None,
+        }
     }
 }
 
@@ -90,6 +117,16 @@ fn hash_render_context_into(hasher: &mut blake3::Hasher, context: &RenderContext
         None => {
             hasher.update(b"none\x00");
         }
+    }
+    for (name, placeholder) in [
+        ("image", &context.image_placeholder),
+        ("video", &context.video_placeholder),
+        ("audio", &context.audio_placeholder),
+    ] {
+        hasher.update(name.as_bytes());
+        hasher.update(b"_placeholder\x00");
+        hasher.update(placeholder.as_deref().unwrap_or("none").as_bytes());
+        hasher.update(b"\x00");
     }
 
     hasher.update(b"template_kwargs\x00");

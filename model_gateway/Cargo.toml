@@ -19,6 +19,7 @@ default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
 opencv-video = ["llm-multimodal/opencv-video"]
+mm-rdma = ["smg-mm-rdma/nixl"]
 
 vendored-openssl = ["openssl/vendored"]
 
@@ -43,6 +44,7 @@ chrono.workspace = true
 dashmap.workspace = true
 futures.workspace = true
 http.workspace = true
+lru.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -74,6 +76,7 @@ smg-mcp.workspace = true
 kv-index.workspace = true
 smg-data-connector.workspace = true
 llm-multimodal = { workspace = true, default-features = false }
+smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-grpc-client.workspace = true

@@ -9,9 +9,9 @@ import "common.proto";
 // TokenSpeed scheduler gRPC service. Self-contained wire definition apart
 // from the cross-engine admin messages in smg.grpc.common (flush/profile).
 // Trimmed to text+multimodal generation (no embed, no LoRA, no hidden-state
-// forwarding). Multimodal carries preprocessed tensors only — image fetch +
+// forwarding). Multimodal carries preprocessed tensors only — media fetch +
 // per-model preprocess happen in the gateway (see crates/multimodal). EPD: a
-// prefill request may carry `EncodeBootstrapInfo` so its image embeddings
+// prefill request may carry `EncodeBootstrapInfo` so its multimodal embeddings
 // arrive from an encode worker over Mooncake (see tokenspeed_encoder.proto).
 service TokenSpeedScheduler {
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
@@ -108,9 +108,9 @@ message GenerateRequest {
   // Preprocessed multimodal payload. Absent for text-only requests.
   MultimodalInputs mm_inputs = 9;
 
-  // EPD: present when this request's image embeddings arrive from an encode
+  // EPD: present when this request's multimodal embeddings arrive from an encode
   // worker over Mooncake instead of being computed here. The worker waits for
-  // the embedding keyed by `bootstrap_room` rather than running the vision
+  // the embedding keyed by `bootstrap_room` rather than running the matching
   // tower. Absent for non-disaggregated (aggregated) requests.
   optional EncodeBootstrapInfo encode_bootstrap_info = 10;
 
@@ -142,11 +142,11 @@ message EncodeItemBootstrapInfo {
   // The encode worker's bootstrap server (data-source side), not the prefill's.
   string bootstrap_host = 2;
   int32 bootstrap_port = 3;
-  // 63-bit rendezvous id: minted random per image by the gateway with no
+  // 63-bit rendezvous id: minted random per item by the gateway with no
   // in-flight dedup, so the space must be wide enough that the birthday
   // collision rate is negligible even with many independent gateways and
   // thousands of concurrent rooms (int32's 2^31 collides every few days under
-  // load, silently cross-wiring one image's embedding onto another's room).
+  // load, silently cross-wiring one item's embedding onto another's room).
   int64 bootstrap_room = 4;
 }
 
@@ -178,26 +178,11 @@ message TensorData {
     bytes inline = 3;
     // Same-host CPU shared memory path. This is the preferred large-payload
     // transport when SMG and TokenSpeed share /dev/shm.
-    ShmHandle shm = 4;
+    smg.grpc.common.ShmHandle shm = 4;
     // Cross-node or non-shared-memory transport descriptor. NIXL is the
     // expected remote transport for distributed multimodal tensor payloads.
-    RemoteTensorHandle remote = 5;
+    smg.grpc.common.RemoteTensorHandle remote = 5;
   }
-}
-
-message ShmHandle {
-  string name = 1;
-  uint64 offset = 2;
-  uint64 nbytes = 3;
-  // Producer/lifetime owner. Used by implementations to coordinate cleanup.
-  string owner_id = 4;
-}
-
-message RemoteTensorHandle {
-  // Examples: "nixl", "ucx", "object_store".
-  string transport = 1;
-  bytes descriptor = 2;
-  uint64 nbytes = 3;
 }
 
 // Where a multimodal item's tokens sit inside input_ids.
@@ -206,15 +191,8 @@ message PlaceholderRange {
   uint32 length = 2;
 }
 
-enum Modality {
-  MODALITY_UNSPECIFIED = 0;
-  IMAGE = 1;
-  AUDIO = 2;
-  VIDEO = 3;
-}
-
 message MultimodalItem {
-  Modality modality = 1;
+  smg.grpc.common.Modality modality = 1;
   bytes content_hash = 2;
   // Primary input to the multimodal encoder for this item. For vision models
   // this is the preprocessed image/video tensor; for audio models this can be
@@ -340,7 +318,7 @@ message GetModelInfoResponse {
   // non-vision workers before tokenization).
   bool supports_vision = 14;
   bool supports_multimodal = 15;
-  repeated Modality supported_modalities = 16;
+  repeated smg.grpc.common.Modality supported_modalities = 16;
   string model_dtype = 17;
   string multimodal_encoder_dtype = 18;
 }

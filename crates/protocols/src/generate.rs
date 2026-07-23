@@ -10,6 +10,55 @@ use super::{
 };
 use crate::validated::Normalizable;
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MultimodalTokenMode {
+    #[default]
+    Unexpanded,
+    Preexpanded,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SerializedMultimodalTensor {
+    pub data: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+}
+
+/// Tensors produced by the caller's Hugging Face processor. Raw `image_data`
+/// remains required so SMG can derive stable content hashes independently of
+/// the request/trajectory identity.
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PreprocessedMultimodalInputs {
+    pub pixel_values: SerializedMultimodalTensor,
+    #[serde(default)]
+    pub model_specific_tensors: HashMap<String, SerializedMultimodalTensor>,
+    #[serde(default)]
+    pub mm_placeholders: Vec<(u32, u32)>,
+    #[serde(default)]
+    pub batched_keys: Vec<String>,
+    #[serde(default)]
+    pub flat_keys: HashMap<String, String>,
+    #[serde(default)]
+    pub keep_on_cpu_keys: Vec<String>,
+}
+
+/// Dimensions produced by the caller's first-stage image preprocessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImageResizeTarget {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Optional image operations applied after fetch/decode and before the model
+/// processor. Resize targets use Pillow BICUBIC semantics.
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GenerateImagePreprocessing {
+    pub resize_targets: Vec<ImageResizeTarget>,
+}
+
 // ============================================================================
 // SGLang Generate API (native format)
 // ============================================================================
@@ -55,6 +104,19 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_data: Option<Value>,
 
+    /// Whether multimodal anchors in `input_ids` still need expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_token_mode: Option<MultimodalTokenMode>,
+
+    /// Optional caller-preprocessed tensors. This is independent of token mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preprocessed_mm_inputs: Option<PreprocessedMultimodalInputs>,
+
+    /// Reproduce a caller's first-stage image resize while retaining compact
+    /// URL/data references on the wire. Rust model preprocessing runs after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_preprocessing: Option<GenerateImagePreprocessing>,
+
     /// Sampling parameters (sglang style)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_params: Option<SamplingParams>,
@@ -62,6 +124,11 @@ pub struct GenerateRequest {
     /// Whether to return logprobs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_logprob: Option<bool>,
+
+    /// Return the exact prompt token IDs dispatched to the backend after any
+    /// gateway-side multimodal anchor expansion. Non-streaming only.
+    #[serde(default)]
+    pub return_prompt_token_ids: bool,
 
     /// If return logprobs, the start location in the prompt for returning logprobs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,6 +266,49 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
         ));
     }
 
+    if matches!(
+        req.multimodal_token_mode,
+        Some(MultimodalTokenMode::Preexpanded)
+    ) && req.input_ids.is_none()
+    {
+        return Err(validator::ValidationError::new(
+            "preexpanded multimodal inputs require input_ids",
+        ));
+    }
+    if req.preprocessed_mm_inputs.is_some()
+        && (!matches!(
+            req.multimodal_token_mode,
+            Some(MultimodalTokenMode::Preexpanded)
+        ) || req.image_data.is_none())
+    {
+        return Err(validator::ValidationError::new(
+            "preprocessed_mm_inputs require preexpanded input_ids and image_data",
+        ));
+    }
+    if let Some(preprocessing) = &req.image_preprocessing {
+        if req.image_data.is_none()
+            || req.preprocessed_mm_inputs.is_some()
+            || matches!(
+                req.multimodal_token_mode,
+                Some(MultimodalTokenMode::Preexpanded)
+            )
+            || preprocessing.resize_targets.is_empty()
+            || preprocessing
+                .resize_targets
+                .iter()
+                .any(|target| target.width == 0 || target.height == 0)
+        {
+            return Err(validator::ValidationError::new(
+                "image_preprocessing requires unexpanded image_data and non-zero resize targets",
+            ));
+        }
+    }
+    if req.return_prompt_token_ids && req.stream {
+        return Err(validator::ValidationError::new(
+            "return_prompt_token_ids requires stream=false",
+        ));
+    }
+
     Ok(())
 }
 
@@ -281,6 +391,8 @@ pub struct GenerateMetaInfo {
     pub reasoning_tokens: Option<u32>,
     pub e2e_latency: f64,
     pub matched_stop: Option<Value>,
+    /// Exact prompt IDs sent to the backend, when explicitly requested.
+    pub prompt_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routed_experts: Option<String>,
 }
@@ -306,4 +418,58 @@ pub enum GenerateFinishReason {
 pub enum GenerateFinishType {
     Length,
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_token_ids_are_opt_in_and_backward_compatible() {
+        let default_request: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"input_ids": [1, 2]})).unwrap();
+        assert!(!default_request.return_prompt_token_ids);
+
+        let opted_in: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "input_ids": [1, 2],
+            "return_prompt_token_ids": true
+        }))
+        .unwrap();
+        assert!(opted_in.return_prompt_token_ids);
+        assert!(opted_in.validate().is_ok());
+    }
+
+    #[test]
+    fn prompt_token_ids_reject_streaming_requests() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "input_ids": [1, 2],
+            "return_prompt_token_ids": true,
+            "stream": true
+        }))
+        .unwrap();
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn image_preprocessing_requires_unexpanded_image_data() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "input_ids": [1, 2],
+            "image_data": ["https://example.com/image.png"],
+            "multimodal_token_mode": "unexpanded",
+            "image_preprocessing": {
+                "resize_targets": [{"width": 224, "height": 320}]
+            }
+        }))
+        .unwrap();
+
+        assert!(request.validate().is_ok());
+        assert_eq!(
+            request.image_preprocessing.unwrap().resize_targets,
+            vec![ImageResizeTarget {
+                width: 224,
+                height: 320
+            }]
+        );
+    }
 }

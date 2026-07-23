@@ -10,6 +10,26 @@ from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_
 logger = logging.getLogger(__name__)
 
 
+COMMON_POLICY_CHOICES = [
+    "random",
+    "round_robin",
+    "passthrough",
+    "cache_aware",
+    "cache_aware_v1",
+    "power_of_two",
+    "least_load",
+    "manual",
+    "request_num_balance",
+    "throughput_optimal",
+    "throughput_optimal_with_budget",
+    "consistent_hashing",
+    "prefix_hash",
+]
+
+PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
+ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -17,8 +37,12 @@ class RouterArgs:
     host: str = "0.0.0.0"
     port: int = 30000
 
-    # PD-specific configuration
+    # PD/EPD-specific configuration
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
+    encode_urls: list[tuple] = dataclasses.field(
+        default_factory=list
+    )  # List of (url, bootstrap_port)
     prefill_urls: list[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -26,6 +50,7 @@ class RouterArgs:
 
     # Routing policy
     policy: str = "cache_aware"
+    encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
     prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
     decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
     worker_startup_timeout_secs: int = 1800
@@ -52,6 +77,8 @@ class RouterArgs:
     request_budget: int = 1024  # KV-cache page size in tokens for throughput_optimal policy
     max_num_waiting_reqs_after_preemption: int = 1000  # Max waiting requests after preemption for throughput_optimal policy
     dp_aware: bool = False
+    multimodal_tensor_transport: str | None = None
+    multimodal_shm_min_bytes: int | None = None
     routing_key_override: bool = False
     dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
@@ -65,7 +92,8 @@ class RouterArgs:
     selector: dict[str, str] = dataclasses.field(default_factory=dict)
     service_discovery_port: int = 80
     service_discovery_namespace: str | None = None
-    # PD service discovery configuration
+    # PD/EPD service discovery configuration
+    encode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     prefill_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -112,6 +140,7 @@ class RouterArgs:
     enable_tito: bool = False
     tito_debug: bool = False
     tito_gc_threshold: int | None = None
+    trajectory_id_strategy: str = "manual"  # manual | auto
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -222,7 +251,7 @@ class RouterArgs:
             "Routing Policy", "Load balancing and routing configuration"
         )
         pd_group = parser.add_argument_group(
-            "PD Disaggregation", "Prefill-Decode disaggregated mode settings"
+            "PD/EPD Disaggregation", "Encode-Prefill-Decode and Prefill-Decode settings"
         )
         k8s_group = parser.add_argument_group(
             "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
@@ -333,21 +362,20 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}encode-policy",
+            type=str,
+            default=None,
+            choices=ENCODE_POLICY_CHOICES,
+            help=(
+                "Specific policy for encode nodes in EPD mode."
+                " If not specified, uses consistent_hashing"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "cache_aware_v1",
-                "power_of_two",
-                "manual",
-                "bucket",
-                "request_num_balance",
-                "throughput_optimal",
-                "throughput_optimal_with_budget",
-            ],
+            choices=PREFILL_POLICY_CHOICES,
             help=(
                 "Specific policy for prefill nodes in PD mode."
                 " If not specified, uses the main policy"
@@ -357,8 +385,7 @@ class RouterArgs:
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "cache_aware_v1", "power_of_two", "manual",
-                     "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"],
+            choices=COMMON_POLICY_CHOICES,
             help=(
                 "Specific policy for decode nodes in PD mode."
                 " If not specified, uses the main policy"
@@ -538,11 +565,24 @@ class RouterArgs:
                  "default: auto-detect from worker URLs, falls back to http)",
         )
 
-        # PD-specific arguments
+        # PD/EPD-specific arguments
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}epd-disaggregation",
+            action="store_true",
+            help="Enable EPD (Encode-Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}encode",
+            nargs="+",
+            action="append",
+            help="Encode server URL and optional bootstrap port. Can be specified multiple times. "
+            "Format: --encode URL [BOOTSTRAP_PORT]. "
+            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",
@@ -581,6 +621,21 @@ class RouterArgs:
             type=int,
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
+        )
+
+        # Multimodal tensor transport
+        parser.add_argument(
+            f"--{prefix}multimodal-tensor-transport",
+            type=str,
+            choices=["inline", "shm", "auto", "rdma"],
+            default=RouterArgs.multimodal_tensor_transport,
+            help="Multimodal tensor transport: inline (default), shm, auto, or rdma (NIXL lane; needs mm-rdma build)",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-shm-min-bytes",
+            type=int,
+            default=RouterArgs.multimodal_shm_min_bytes,
+            help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
         )
 
         # Logging configuration
@@ -631,6 +686,16 @@ class RouterArgs:
             help=(
                 "Kubernetes namespace to watch for pods. If not provided, watches all namespaces"
                 " (requires cluster-wide permissions)"
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}encode-selector",
+            type=str,
+            nargs="+",
+            default={},
+            help=(
+                "Label selector for encode server pods in EPD mode"
+                " (format: key1=value1 key2=value2)"
             ),
         )
         k8s_group.add_argument(
@@ -857,6 +922,16 @@ class RouterArgs:
             type=int,
             default=RouterArgs.tito_gc_threshold,
             help="Threshold for TITO session garbage collection (default: 1000)",
+        )
+        tito_group.add_argument(
+            f"--{prefix}trajectory-id-strategy",
+            type=str,
+            choices=["manual", "auto"],
+            default=RouterArgs.trajectory_id_strategy,
+            help=(
+                "Select TITO trajectory ID assignment: read the request header "
+                "(manual) or derive IDs from prefix-tree leaves (auto)"
+            ),
         )
 
         # Retry configuration
@@ -1372,7 +1447,10 @@ class RouterArgs:
         if f"{prefix}tls_key_path" in cli_args_dict:
             args_dict["server_key_path"] = cli_args_dict[f"{prefix}tls_key_path"]
 
-        # parse special arguments and remove "--prefill" and "--decode" from cli_args_dict
+        # parse special arguments and remove "--encode", "--prefill", and "--decode" from cli_args_dict
+        args_dict["encode_urls"] = cls._parse_encode_urls(
+            cli_args_dict.get(f"{prefix}encode", None)
+        )
         args_dict["prefill_urls"] = cls._parse_prefill_urls(
             cli_args_dict.get(f"{prefix}prefill", None)
         )
@@ -1380,6 +1458,9 @@ class RouterArgs:
             cli_args_dict.get(f"{prefix}decode", None)
         )
         args_dict["selector"] = cls._parse_selector(cli_args_dict.get(f"{prefix}selector", None))
+        args_dict["encode_selector"] = cls._parse_selector(
+            cli_args_dict.get(f"{prefix}encode_selector", None)
+        )
         args_dict["prefill_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}prefill_selector", None)
         )
@@ -1449,6 +1530,10 @@ class RouterArgs:
             )
 
         # Validate configuration based on mode
+        if self.epd_disaggregation:
+            if self.encode_policy:
+                logger.info(f"Using --encode-policy '{self.encode_policy}' for encode nodes.")
+
         if self.pd_disaggregation:
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:
@@ -1520,6 +1605,18 @@ class RouterArgs:
             prefill_urls.append((url, bootstrap_port))
 
         return prefill_urls
+
+    @staticmethod
+    def _parse_encode_urls(encode_list):
+        """Parse encode URLs from --encode arguments.
+
+        Format: --encode URL [BOOTSTRAP_PORT]
+        Example:
+            --encode http://encode1:8080 9000  # With bootstrap port
+            --encode http://encode2:8080 none  # Explicitly no bootstrap port
+            --encode http://encode3:8080       # Defaults to no bootstrap port
+        """
+        return RouterArgs._parse_prefill_urls(encode_list)
 
     @staticmethod
     def _parse_decode_urls(decode_list):
