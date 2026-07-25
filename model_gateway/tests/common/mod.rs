@@ -350,6 +350,7 @@ pub fn create_test_context(
             policy_registry.clone(),
             client.clone(),
             config.load_monitor_interval_secs,
+            config.engine_metrics,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -495,6 +496,7 @@ pub fn create_test_context_with_parsers(
             policy_registry.clone(),
             client.clone(),
             config.load_monitor_interval_secs,
+            config.engine_metrics,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -647,6 +649,7 @@ pub fn create_test_context_with_mcp_config(
             policy_registry.clone(),
             client.clone(),
             config.load_monitor_interval_secs,
+            config.engine_metrics,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator

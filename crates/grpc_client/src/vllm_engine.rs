@@ -211,6 +211,23 @@ impl VllmEngineClient {
         Ok(response.into_inner())
     }
 
+    /// Get load metrics from the vLLM engine.
+    pub async fn get_loads(
+        &self,
+        include: Vec<String>,
+    ) -> Result<proto::GetLoadsResponse, tonic::Status> {
+        debug!("Requesting vLLM load metrics");
+        let request = Request::new(proto::GetLoadsRequest {
+            dp_rank: None,
+            include,
+        });
+
+        let mut client = self.client.clone();
+        let response = client.get_loads(request).await?;
+        debug!("vLLM load metrics response received");
+        Ok(response.into_inner())
+    }
+
     /// Abort one or more requests in a single RPC.
     pub async fn abort_request(&self, request_ids: Vec<String>) -> Result<(), tonic::Status> {
         if request_ids.is_empty() {
@@ -341,9 +358,16 @@ impl VllmEngineClient {
         body: &GenerateRequest,
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_inputs: Option<proto::MultimodalInputs>,
     ) -> Result<proto::GenerateRequest, String> {
-        let sampling_params =
+        let mut sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
+
+        // Forward return_logprob to vLLM's SamplingParams.logprobs so the engine
+        // actually computes per-token log probabilities during generation.
+        if body.return_logprob.unwrap_or(false) {
+            sampling_params.logprobs = Some(body.top_logprobs_num.unwrap_or(0));
+        }
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -356,7 +380,7 @@ impl VllmEngineClient {
             sampling_params: Some(sampling_params),
             stream: body.stream,
             kv_transfer_params: None,
-            mm_inputs: None,
+            mm_inputs: multimodal_inputs,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
         };
@@ -877,6 +901,43 @@ impl VllmEngineClient {
         sampling.constraint = Self::build_single_constraint_from_plain(p)?;
 
         Ok(sampling)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proto → protocol type conversions (load metrics)
+// ---------------------------------------------------------------------------
+
+impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
+    fn from(load: proto::SchedulerLoad) -> Self {
+        Self {
+            dp_rank: load.dp_rank,
+            num_running_reqs: load.num_running_reqs,
+            num_waiting_reqs: load.num_waiting_reqs,
+            // vLLM does not report queued token-work; degrade to 0.
+            num_waiting_uncached_tokens: 0,
+            num_total_reqs: load.num_total_reqs,
+            num_used_tokens: load.num_used_tokens,
+            max_total_num_tokens: load.max_total_num_tokens,
+            token_usage: load.token_usage,
+            gen_throughput: load.gen_throughput,
+            cache_hit_rate: load.cache_hit_rate,
+            utilization: load.utilization,
+            max_running_requests: load.max_running_requests,
+            // vLLM disagg mapping is out of scope here; canonical PD fields
+            // stay None until the vLLM proto exposes them.
+            ..Default::default()
+        }
+    }
+}
+
+impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
+    fn from(resp: proto::GetLoadsResponse) -> Self {
+        Self {
+            timestamp: resp.timestamp,
+            dp_rank_count: resp.dp_rank_count,
+            loads: resp.loads.into_iter().map(Into::into).collect(),
+        }
     }
 }
 

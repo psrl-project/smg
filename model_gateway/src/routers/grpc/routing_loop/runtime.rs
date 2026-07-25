@@ -941,7 +941,7 @@ async fn dispatch_entry_with_partial_rollout(
     // ── Step 3: extract the raw gRPC stream ──────────────────────────────
     let stream = match ctx.state.response.execution_result.take() {
         Some(ExecutionResult::Single { stream }) => stream,
-        Some(ExecutionResult::Dual { decode, .. }) => *decode,
+        Some(ExecutionResult::PrefillDecode { decode, .. }) => *decode,
         other => {
             // Non-generate result (embedding, etc.) — put it back and run
             // post-execution stages normally (no loopback needed).
@@ -999,7 +999,7 @@ async fn dispatch_entry_with_partial_rollout(
             // serving worker here (execute_remaining_stages resets it below).
             if let Some(worker) = ctx.state.workers.as_ref().map(|sel| match sel {
                 WorkerSelection::Single { worker } => worker.clone(),
-                WorkerSelection::Dual { decode, .. } => decode.clone(),
+                WorkerSelection::Disaggregated { decode, .. } => decode.clone(),
             }) {
                 log_pop(
                     &runtime,
@@ -1060,7 +1060,7 @@ async fn dispatch_entry_with_partial_rollout(
                 .as_ref()
                 .map(|sel| match sel {
                     WorkerSelection::Single { worker } => worker.clone(),
-                    WorkerSelection::Dual { decode, .. } => decode.clone(),
+                    WorkerSelection::Disaggregated { decode, .. } => decode.clone(),
                 })
                 .map(|worker| runtime.instance_id_for_worker(&worker));
 
@@ -1111,7 +1111,7 @@ async fn dispatch_entry_with_partial_rollout(
             // weights after the sync that triggered the abort).
             let worker = match ctx.state.workers.as_ref() {
                 Some(WorkerSelection::Single { worker }) => worker.clone(),
-                Some(WorkerSelection::Dual { decode, .. }) => decode.clone(),
+                Some(WorkerSelection::Disaggregated { decode, .. }) => decode.clone(),
                 None => {
                     let response =
                         router_error::internal_error("loopback_no_instance", "no worker selected");
@@ -1136,7 +1136,7 @@ async fn dispatch_entry_with_partial_rollout(
             );
 
             // Reset ctx for the next iteration (clears workers, clients,
-            // proto_request, dispatch, load_guards, and execution_result).
+            // execution_plan, dispatch, load_guards, and execution_result).
             reset_ctx_for_loopback(&mut ctx);
 
             // Inject the loopback `routed_experts_prompt_start` override

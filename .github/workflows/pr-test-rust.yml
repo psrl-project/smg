@@ -36,7 +36,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -56,7 +56,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -83,7 +83,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -125,7 +125,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # No wheel-output cache here. It was keyed on a hash of every crate's
       # source, so it missed on essentially every code PR (all-or-nothing), and
@@ -218,7 +218,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -262,7 +262,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -326,7 +326,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
@@ -363,7 +363,7 @@ jobs:
         env:
           ROUTER_LOCAL_MODEL_PATH: /models
           E2E_LOG_DIR: benchmark-logs
-          GENAI_BENCH_TEST_TIMEOUT: "480"
+          GENAI_BENCH_TEST_TIMEOUT: "600"
         run: |
           mkdir -p benchmark-logs
           bash scripts/ci_killall_sglang.sh "nuke_gpus"
@@ -403,10 +403,11 @@ jobs:
       completions: ${{ steps.filter.outputs.completions }}
       agentic: ${{ steps.filter.outputs.agentic }}
       embeddings: ${{ steps.filter.outputs.embeddings }}
+      realtime: ${{ steps.filter.outputs.realtime }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -454,6 +455,8 @@ jobs:
               - 'e2e_test/completions/**'
             embeddings:
               - 'e2e_test/embeddings/**'
+            realtime:
+              - 'e2e_test/realtime/**'
             go-bindings:
               - 'e2e_test/bindings_go/**'
             rust-ci:
@@ -583,6 +586,26 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/embeddings
       extra_deps: "sentence-transformers"
+    secrets: inherit
+
+  e2e-1gpu-realtime:
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.realtime == 'true')))
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: 1-gpu-h100
+      timeout: 25
+      test_timeout: 20
+      test_dirs: e2e_test/realtime
     secrets: inherit
 
   e2e-1gpu-gateway:
@@ -759,7 +782,7 @@ jobs:
       SHOW_ROUTER_LOGS: "1"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -826,7 +849,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -874,7 +897,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
@@ -945,7 +968,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
@@ -1039,7 +1062,7 @@ jobs:
       contents: read
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     - name: Set up Python
       uses: actions/setup-python@v6

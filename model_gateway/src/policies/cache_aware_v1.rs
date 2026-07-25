@@ -53,7 +53,7 @@ use dashmap::DashMap;
 use kv_index::{compute_request_content_hashes, Tier, TieredIndexer, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -1640,6 +1640,7 @@ mod tests {
             priority_groups: None,
             response_token_count: None,
             score_trace: None,
+            leg: crate::policies::WorkerLeg::Single,
         };
 
         // No snapshot yet (timestamp 0) and load 0 < cap => admit (count cap only).

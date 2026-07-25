@@ -35,9 +35,11 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.pd.kv_events import KVEventBatch
 
 from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
+from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 
@@ -56,6 +58,16 @@ LOG_MM_TENSOR_DATA = os.getenv("TOKENSPEED_LOG_MM_TENSOR_DATA", "").lower() in (
     "1",
     "true",
     "yes",
+)
+LOG_MM_TIMING = os.getenv("TOKENSPEED_LOG_MM_TIMING", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+UNLINK_MM_SHM_AFTER_READ = os.getenv("TOKENSPEED_UNLINK_MM_SHM_AFTER_READ", "1").lower() not in (
+    "0",
+    "false",
+    "no",
 )
 
 
@@ -120,6 +132,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # Resolved ZMQ KV-events endpoint, or None when the worker was not
         # launched with --kv-events-config (SubscribeKvEvents → UNIMPLEMENTED).
         self._kv_events_config = resolve_kv_events_config(server_args)
+        self._rdma_pixel_puller = RdmaPixelPuller(
+            agent_name=(
+                f"smg-scheduler-{getattr(server_args, 'host', 'unknown')}-"
+                f"{getattr(server_args, 'port', 'unknown')}"
+            ),
+            log_prefix="TokenSpeed RDMA",
+        )
 
         # Drive AsyncLLM's output-dispatch loop. This is idempotent — the
         # first caller creates the handle loop; subsequent callers (including
@@ -141,7 +160,16 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         logger.info("Generate request %s (stream=%s)", rid, request.stream)
 
         try:
+            build_started = time.perf_counter()
             req_obj = self._build_generate_req(request)
+            if LOG_MM_TIMING:
+                has_mm = getattr(req_obj, "precomputed_multimodal_inputs", None) is not None
+                logger.info(
+                    "mm_timing generate_build_ms rid=%s elapsed=%.3f has_mm=%s",
+                    rid,
+                    (time.perf_counter() - build_started) * 1000,
+                    has_mm,
+                )
         except ValueError as e:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
             return
@@ -160,7 +188,16 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         aborted = False
         try:
+            engine_started = time.perf_counter()
+            first_output = True
             async for output in self.async_llm.generate_request(req_obj):
+                if LOG_MM_TIMING and first_output:
+                    first_output = False
+                    logger.info(
+                        "mm_timing generate_first_output_ms rid=%s elapsed=%.3f",
+                        rid,
+                        (time.perf_counter() - engine_started) * 1000,
+                    )
                 # Non-streaming n>1 emits a list of final dicts in one yield.
                 # Pre-scan for aborts so we don't yield partial successes
                 # before raising on a later aborted choice.
@@ -258,6 +295,18 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         if self.async_llm.gracefully_exit:
             return tokenspeed_scheduler_pb2.HealthCheckResponse(
                 healthy=False, message="Server is shutting down"
+            )
+
+        # Disaggregation workers (prefill/decode/encode) can't serve a standalone
+        # 1-token generate: a prefill/decode request needs a P->D bootstrap_room
+        # to pair with its peer, and the decode scheduler raises (no peer) on a
+        # bootstrap-less probe. So skip the deep probe and report shallow liveness
+        # for any disaggregated role; the deep generate probe is meaningful only
+        # for aggregated (null) workers.
+        if getattr(self.server_args, "disaggregation_mode", "null") != "null":
+            return tokenspeed_scheduler_pb2.HealthCheckResponse(
+                healthy=True,
+                message="Health check passed (disaggregation worker; shallow probe)",
             )
 
         GenerateReqInput = _lazy_generate_req_input()
@@ -382,14 +431,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         tokenizer_path = getattr(self.server_args, "tokenizer", None) or getattr(
             self.server_args, "tokenizer_path", ""
         )
-        supports_vision = bool(getattr(model_config, "is_multimodal", False))
-        image_modality = getattr(tokenspeed_scheduler_pb2, "IMAGE", 1)
-        video_modality = getattr(tokenspeed_scheduler_pb2, "VIDEO", 3)
-        supported_modalities = []
-        if supports_vision:
-            supported_modalities.append(image_modality)
-            if hf_config is not None and getattr(hf_config, "video_token_id", None) is not None:
-                supported_modalities.append(video_modality)
+        supported_modalities = self._static_supported_modalities(model_config, hf_config)
+        supports_vision = any(
+            modality in (common_pb2.IMAGE, common_pb2.VIDEO) for modality in supported_modalities
+        )
+        supports_multimodal = bool(supported_modalities)
 
         response_kwargs = dict(
             model_path=model_path,
@@ -409,7 +455,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
         fields = tokenspeed_scheduler_pb2.GetModelInfoResponse.DESCRIPTOR.fields_by_name
         if "supports_multimodal" in fields:
-            response_kwargs["supports_multimodal"] = supports_vision
+            response_kwargs["supports_multimodal"] = supports_multimodal
         if "supported_modalities" in fields:
             response_kwargs["supported_modalities"] = supported_modalities
         dtype = self._torch_dtype_to_proto(getattr(model_config, "dtype", None))
@@ -418,6 +464,45 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         if "multimodal_encoder_dtype" in fields:
             response_kwargs["multimodal_encoder_dtype"] = dtype
         return tokenspeed_scheduler_pb2.GetModelInfoResponse(**response_kwargs)
+
+    @staticmethod
+    def _static_supported_modalities(model_config, hf_config) -> list[int]:
+        """Return modalities backed by towers present in the static model config."""
+
+        if getattr(model_config, "is_multimodal_active", None) is False:
+            return []
+
+        def config_value(config, name: str, default=None):
+            if isinstance(config, dict):
+                return config.get(name, default)
+            return getattr(config, name, default)
+
+        image_modality = common_pb2.IMAGE
+        audio_modality = common_pb2.AUDIO
+        video_modality = common_pb2.VIDEO
+        model_type = config_value(hf_config, "model_type", "") if hf_config is not None else ""
+
+        thinker_config = config_value(hf_config, "thinker_config")
+        if model_type == "qwen3_asr":
+            audio_config = config_value(thinker_config, "audio_config")
+            return [audio_modality] if audio_config is not None else []
+
+        if model_type.startswith("qwen3_omni"):
+            supported = []
+            if config_value(thinker_config, "vision_config") is not None:
+                supported.append(image_modality)
+            if config_value(thinker_config, "audio_config") is not None:
+                supported.append(audio_modality)
+            if config_value(thinker_config, "video_token_id") is not None:
+                supported.append(video_modality)
+            return supported
+
+        supported = []
+        if bool(getattr(model_config, "is_multimodal", False)):
+            supported.append(image_modality)
+            if hf_config is not None and config_value(hf_config, "video_token_id") is not None:
+                supported.append(video_modality)
+        return supported
 
     # ------------------------------------------------------------------
     # GetServerInfo (unary)
@@ -439,6 +524,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         scheduler_info_struct = Struct()
         scheduler_info_struct.update(_make_json_serializable(dict(self.scheduler_info)))
+        # Advertise this worker's /dev/shm namespace identity so the router can
+        # verify a shared /dev/shm before using the SHM tensor transport, instead
+        # of inferring locality from the worker URL.
+        scheduler_info_struct["shm_namespace_id"] = _shm_namespace_id()
 
         uptime = time.time() - self.start_time
         start_timestamp = Timestamp()
@@ -775,12 +864,54 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
 
         # Decode the precomputed multimodal payload, if the request carries one.
+        # EPD requests carry mm metadata WITHOUT encoder inputs (the multimodal
+        # embeddings arrive from encode workers over Mooncake), so build the mm
+        # whenever mm_inputs is present, not only when pixel_values is.
         precomputed_mm = None
         if request.HasField("mm_inputs"):
             precomputed_mm = self._mm_inputs_from_proto(
                 request.mm_inputs,
                 model_dtype=getattr(self.async_llm.model_config, "dtype", None),
             )
+
+        # EPD: per-item encode->prefill bootstrap info. Each entry tells the prefill
+        # which Mooncake room to receive that item's embedding on, and the encode
+        # worker's bootstrap endpoint to discover it. The gateway splits the mm
+        # payload one RPC per item, so ``item_index`` indexes ``mm_items`` 1:1;
+        # we attach each entry ONTO its item (``item.encode_handshake``) so it
+        # rides with the item through the engine. Absent for non-EPD.
+        if request.HasField("encode_bootstrap_info"):
+            if precomputed_mm is None:
+                raise ValueError(
+                    "GenerateRequest.encode_bootstrap_info present but mm_inputs "
+                    "is missing; bootstrap info describes items that must be in mm_inputs"
+                )
+            n_items = len(precomputed_mm.mm_items)
+            for h in request.encode_bootstrap_info.items:
+                if not 0 <= h.item_index < n_items:
+                    raise ValueError(
+                        f"EPD encode bootstrap item_index {h.item_index} out of range "
+                        f"for {n_items} mm item(s)"
+                    )
+                precomputed_mm.mm_items[h.item_index].encode_handshake = {
+                    "bootstrap_host": h.bootstrap_host,
+                    "bootstrap_port": h.bootstrap_port,
+                    "bootstrap_room": h.bootstrap_room,
+                }
+
+        # PD: prefill->decode KV rendezvous. The gateway sends identical params to
+        # both workers; the engine keys the Mooncake transfer on ``bootstrap_room``
+        # and reaches the prefill's bootstrap server at host:port. Scalars are
+        # fine: ``normalize_batch_and_arguments`` broadcasts them per-choice for
+        # n>1. Absent for aggregated (single-worker) requests.
+        bootstrap_host = None
+        bootstrap_port = None
+        bootstrap_room = None
+        if request.HasField("kv_bootstrap_info"):
+            dp = request.kv_bootstrap_info
+            bootstrap_host = dp.bootstrap_host or None
+            bootstrap_port = dp.bootstrap_port
+            bootstrap_room = dp.bootstrap_room
 
         GenerateReqInput = _lazy_generate_req_input()
         obj = GenerateReqInput(
@@ -798,6 +929,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 list(request.token_ids_logprob) if request.token_ids_logprob else None
             ),
             precomputed_multimodal_inputs=precomputed_mm,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
         )
         # ``normalize_batch_and_arguments`` asserts ``rid`` is a list when
         # n>1; expand to deterministic per-choice rids so the assert holds.
@@ -923,32 +1057,60 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         items = []
         im_token_id = None
         video_token_id = None
+        total_started = time.perf_counter() if LOG_MM_TIMING else None
 
         for item_proto in mm_inputs.items:
+            item_started = time.perf_counter() if LOG_MM_TIMING else None
             modality = self._modality_from_proto(item_proto.modality)
-            if not item_proto.HasField("encoder_input"):
-                raise ValueError("MultimodalItem must include encoder_input")
-
-            feature = self._tensor_from_proto(item_proto.encoder_input, cast_to=model_dtype)
-            if LOG_MM_TENSOR_DATA:
+            # EPD prefill items omit encoder_input: the per-item embedding
+            # arrives over Mooncake and is written into item.encoded. Keep the
+            # metadata (model_specific/grid_thw, placeholders, token id) so the
+            # prefill can slot it; content_hash supplies the pad-value hash.
+            feature = None
+            feature_elapsed_ms = None
+            if item_proto.HasField("encoder_input"):
+                feature_started = time.perf_counter() if LOG_MM_TIMING else None
                 encoder_input = item_proto.encoder_input
-                payload = encoder_input.WhichOneof("payload")
-                inline_nbytes = len(encoder_input.inline) if payload == "inline" else None
-                logger.info(
-                    "Multimodal encoder_input received: modality=%s proto_dtype=%s "
-                    "shape=%s payload=%s inline_nbytes=%s torch_dtype=%s cast_to=%s",
-                    modality,
-                    encoder_input.dtype,
-                    list(encoder_input.shape),
-                    payload,
-                    inline_nbytes,
-                    feature.dtype,
-                    model_dtype,
+                if encoder_input.WhichOneof("payload") == "remote":
+                    feature = self._rdma_pixel_puller.feature_from_remote(
+                        encoder_input,
+                        explicit_room=None,
+                        cast_to=model_dtype,
+                    )
+                else:
+                    feature = self._feature_from_proto(encoder_input, cast_to=model_dtype)
+                feature_elapsed_ms = (
+                    (time.perf_counter() - feature_started) * 1000
+                    if feature_started is not None
+                    else None
                 )
+                if LOG_MM_TENSOR_DATA:
+                    payload = encoder_input.WhichOneof("payload")
+                    inline_nbytes = len(encoder_input.inline) if payload == "inline" else None
+                    logger.info(
+                        "Multimodal encoder_input received: modality=%s proto_dtype=%s "
+                        "shape=%s payload=%s inline_nbytes=%s feature_type=%s "
+                        "torch_dtype=%s cast_to=%s",
+                        modality,
+                        encoder_input.dtype,
+                        list(encoder_input.shape),
+                        payload,
+                        inline_nbytes,
+                        type(feature).__name__,
+                        feature.dtype,
+                        model_dtype,
+                    )
+            model_started = time.perf_counter() if LOG_MM_TIMING else None
             model_specific_data = {
-                name: self._tensor_from_proto(tensor_data, cast_to=model_dtype)
+                # Side tensors are metadata, not encoder activations. Preserve
+                # their wire dtype: reducing video timing values to BF16 can
+                # change the integer M-RoPE positions at fractional frame rates.
+                name: self._tensor_from_proto(tensor_data)
                 for name, tensor_data in item_proto.model_specific_tensors.items()
             }
+            model_elapsed_ms = (
+                (time.perf_counter() - model_started) * 1000 if model_started is not None else None
+            )
             self._validate_item_tensor_consistency(modality, model_specific_data)
 
             if not item_proto.placeholders:
@@ -968,6 +1130,34 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             mm_item.set_pad_value()
             items.append(mm_item)
 
+            if LOG_MM_TIMING and item_started is not None:
+                if item_proto.HasField("encoder_input"):
+                    encoder_input = item_proto.encoder_input
+                    payload = encoder_input.WhichOneof("payload")
+                    proto_dtype = encoder_input.dtype
+                    shape = list(encoder_input.shape)
+                else:
+                    payload = None
+                    proto_dtype = None
+                    shape = None
+                feature_ms = (
+                    f"{feature_elapsed_ms:.3f}" if feature_elapsed_ms is not None else "n/a"
+                )
+                logger.info(
+                    "mm_timing item_build_ms modality=%s elapsed=%.3f "
+                    "feature_ms=%s model_specific_ms=%.3f payload=%s "
+                    "proto_dtype=%s shape=%s feature_type=%s tensors=%s",
+                    modality.name,
+                    (time.perf_counter() - item_started) * 1000,
+                    feature_ms,
+                    model_elapsed_ms,
+                    payload,
+                    proto_dtype,
+                    shape,
+                    type(feature).__name__,
+                    sorted(model_specific_data.keys()),
+                )
+
             if item_proto.HasField("placeholder_token_id"):
                 placeholder_token_id = int(item_proto.placeholder_token_id)
                 if modality == Modality.IMAGE:
@@ -981,6 +1171,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         if not items:
             raise ValueError("MultimodalInputs.items is empty")
+        if LOG_MM_TIMING and total_started is not None:
+            logger.info(
+                "mm_timing mm_inputs_build_ms items=%d elapsed=%.3f",
+                len(items),
+                (time.perf_counter() - total_started) * 1000,
+            )
         return MultimodalInputs(
             mm_items=items,
             im_token_id=im_token_id,
@@ -989,12 +1185,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
     @staticmethod
     def _modality_from_proto(modality: int) -> Modality:
-        if modality == getattr(tokenspeed_scheduler_pb2, "IMAGE", 1):
+        if modality == common_pb2.IMAGE:
             return Modality.IMAGE
-        if modality == getattr(tokenspeed_scheduler_pb2, "VIDEO", 3):
+        if modality == common_pb2.VIDEO:
             return Modality.VIDEO
-        if modality == getattr(tokenspeed_scheduler_pb2, "AUDIO", 2):
-            raise ValueError("TokenSpeed audio multimodal inputs are not supported yet")
+        if modality == common_pb2.AUDIO:
+            return Modality.AUDIO
         raise ValueError(f"Unsupported multimodal item modality: {modality}")
 
     @staticmethod
@@ -1021,6 +1217,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             raise ValueError("VIDEO MultimodalItem must not carry image_grid_thw")
         if modality == Modality.VIDEO and not has_video_grid:
             raise ValueError("VIDEO MultimodalItem must carry video_grid_thw")
+        if modality == Modality.AUDIO and (has_image_grid or has_video_grid):
+            raise ValueError("AUDIO MultimodalItem must not carry image/video grid tensors")
 
     @staticmethod
     def _tensor_from_proto(
@@ -1043,7 +1241,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     f"TensorData byte length mismatch for bfloat16 shape={shape}: "
                     f"expected {expected}, got {len(raw)}"
                 )
-            t = torch.from_numpy(np.frombuffer(raw, dtype=np.uint16).reshape(shape)).view(
+            t = torch.from_numpy(np.frombuffer(raw, dtype=np.uint16).copy().reshape(shape)).view(
                 torch.bfloat16
             )
         else:
@@ -1054,11 +1252,49 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     f"TensorData byte length mismatch for dtype={tensor_data.dtype}, "
                     f"shape={shape}: expected {expected}, got {len(raw)}"
                 )
-            t = torch.from_numpy(np.frombuffer(raw, dtype=dtype).reshape(shape))
+            t = torch.from_numpy(np.frombuffer(raw, dtype=dtype).copy().reshape(shape))
 
         if cast_to is not None and t.dtype != cast_to and t.is_floating_point():
             return t.to(cast_to)
-        return t.clone()
+        return t
+
+    @staticmethod
+    def _feature_from_proto(
+        tensor_data: tokenspeed_scheduler_pb2.TensorData,
+        cast_to: torch.dtype | None = None,
+    ) -> torch.Tensor | ShmTensorHandle:
+        """Reconstruct a feature tensor, preserving SHM handles when possible.
+
+        ``MultimodalInputs.publish_shm_features`` is a no-op for existing
+        ``ShmTensorHandle`` values, so the scheduler worker can consume the
+        upstream SMG segment directly instead of the gRPC frontend first
+        materializing bytes and cloning a CPU tensor.
+        """
+        if tensor_data.WhichOneof("payload") != "shm":
+            return TokenSpeedSchedulerServicer._tensor_from_proto(tensor_data, cast_to=cast_to)
+
+        dtype = TokenSpeedSchedulerServicer._torch_dtype_from_proto(tensor_data.dtype)
+        if (
+            cast_to is not None
+            and dtype != cast_to
+            and torch.is_floating_point(torch.empty((), dtype=dtype))
+        ):
+            return TokenSpeedSchedulerServicer._tensor_from_proto(tensor_data, cast_to=cast_to)
+
+        shm = tensor_data.shm
+        if shm.offset != 0:
+            return TokenSpeedSchedulerServicer._tensor_from_proto(tensor_data, cast_to=cast_to)
+
+        shape = tuple(int(dim) for dim in tensor_data.shape)
+        expected = int(np.prod(shape, dtype=np.int64)) * torch.empty((), dtype=dtype).element_size()
+        if int(shm.nbytes) != expected:
+            raise ValueError(
+                f"TensorData.shm byte length mismatch for dtype={tensor_data.dtype}, "
+                f"shape={list(shape)}: expected {expected}, got {int(shm.nbytes)}"
+            )
+
+        name = TokenSpeedSchedulerServicer._validated_shm_name(shm.name)
+        return ShmTensorHandle(shm_name=name, shape=shape, dtype=dtype)
 
     @staticmethod
     def _tensor_payload_bytes(tensor_data: tokenspeed_scheduler_pb2.TensorData) -> bytes:
@@ -1066,10 +1302,54 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         if payload == "inline":
             return bytes(tensor_data.inline)
         if payload == "shm":
-            raise ValueError("TensorData.shm payload is not implemented yet")
+            return TokenSpeedSchedulerServicer._tensor_payload_bytes_from_shm(tensor_data.shm)
         if payload == "remote":
             raise ValueError("TensorData.remote payload is not implemented yet")
         raise ValueError("TensorData payload is required")
+
+    @staticmethod
+    def _tensor_payload_bytes_from_shm(
+        shm_handle: common_pb2.ShmHandle,
+    ) -> bytes:
+        name = TokenSpeedSchedulerServicer._validated_shm_name(shm_handle.name)
+
+        path = os.path.join("/dev/shm", name)
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            raw = os.pread(fd, int(shm_handle.nbytes), int(shm_handle.offset))
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if fd is not None and UNLINK_MM_SHM_AFTER_READ:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+        if len(raw) != int(shm_handle.nbytes):
+            raise ValueError(
+                f"TensorData.shm byte length mismatch for name={shm_handle.name!r}: "
+                f"expected {int(shm_handle.nbytes)}, got {len(raw)}"
+            )
+        return raw
+
+    @staticmethod
+    def _validated_shm_name(name: str) -> str:
+        name = name.lstrip("/")
+        if not name or "/" in name or name in (".", "..") or "\x00" in name:
+            raise ValueError(f"Invalid TensorData.shm name: {name!r}")
+        return name
+
+    @staticmethod
+    def _torch_dtype_from_proto(dtype: str) -> torch.dtype:
+        if dtype == "bfloat16":
+            return torch.bfloat16
+        if dtype == "float16":
+            return torch.float16
+        if dtype == "float32":
+            return torch.float32
+        raise ValueError(f"Unsupported TensorData dtype for SHM feature: {dtype!r}")
 
     @staticmethod
     def _torch_dtype_to_proto(dtype: torch.dtype | None) -> str:
@@ -1263,3 +1543,23 @@ def _make_json_serializable(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {str(k): _make_json_serializable(v) for k, v in obj.items()}
     return str(obj)
+
+
+def _shm_namespace_id() -> str:
+    """Identity of this process's ``/dev/shm`` tmpfs: ``<boot_id>:<st_dev>``.
+
+    ``boot_id`` (``/proc/sys/kernel/random/boot_id``) is not namespaced, so it
+    pins the host; ``st_dev`` is the tmpfs superblock device backing
+    ``/dev/shm``. Two processes share ``/dev/shm`` iff both match — including
+    separate containers sharing it via ``--ipc``/bind-mount, where mount
+    namespaces differ but the underlying superblock (``st_dev``) is the same. The
+    router compares this token to its own to decide the SHM tensor transport.
+    Empty string if it can't be determined.
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+            boot_id = f.read().strip()
+        shm_dev = os.stat("/dev/shm").st_dev
+        return f"{boot_id}:{shm_dev}"
+    except OSError:
+        return ""

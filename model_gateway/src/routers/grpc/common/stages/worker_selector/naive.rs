@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use super::WorkerSelectorStrategy;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::grpc::routing_loop::metadata::RoutingMeta,
     worker::{ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
@@ -93,6 +93,7 @@ impl WorkerSelectorStrategy for NaiveWorkerSelector {
                     priority_groups: None,
                     response_token_count: None,
                     score_trace: None,
+                    leg: WorkerLeg::Single,
                 },
             )?;
             available[idx].increment_load();

@@ -9,6 +9,7 @@ use std::{
 use anyhow::anyhow;
 use axum::response::Response;
 use bytes::Bytes;
+use llm_multimodal::Modality;
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
@@ -28,7 +29,7 @@ use uuid::Uuid;
 
 use crate::routers::{
     error,
-    grpc::{context::RequestContext, ProcessedMessages},
+    grpc::{context::RequestContext, multimodal::PlaceholderTokens, ProcessedMessages},
 };
 
 /// Type alias for the SSE channel sender used across streaming endpoints.
@@ -169,7 +170,7 @@ pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), 
 pub(crate) fn process_content_format(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
-    image_placeholder: Option<&str>,
+    placeholder_tokens: Option<&PlaceholderTokens>,
 ) -> Result<Vec<Value>, String> {
     messages
         .iter()
@@ -188,7 +189,7 @@ pub(crate) fn process_content_format(
                 }
 
                 if let Some(content_value) = obj.get_mut("content") {
-                    transform_content_field(content_value, content_format, image_placeholder);
+                    transform_content_field(content_value, content_format, placeholder_tokens)?;
                 }
             }
 
@@ -199,38 +200,73 @@ pub(crate) fn process_content_format(
 
 /// Transform a single content field based on content format.
 ///
-/// When `image_placeholder` is provided and the content format is `String`,
-/// each `image_url` part is replaced with the placeholder string instead of
-/// being stripped.  This mirrors vLLM's behavior of injecting model-specific
-/// placeholder tokens (e.g. `"<|image|>"`) so that the tokenizer produces
-/// token IDs the multimodal expansion step can find and replace.
+/// For `String` templates, every media URL is replaced with its
+/// modality-specific structural anchor when placeholders are configured. The
+/// public preprocessing bindings do not have model metadata, so their legacy
+/// `None` path continues to omit media parts.
+///
+/// Media parts are always emitted BEFORE text, matching vLLM's default
+/// (`interleave_mm_strings=false`), which prepends media placeholders to the
+/// front of the prompt for every model. This is required for VQA accuracy:
+/// the harness sends `[text, image]` and image-after-question measurably
+/// degrades grounding (e.g. MMBench answers flip vs. image-first).
+///
+/// TODO(interleave): vLLM also supports `interleave_mm_strings=true` (opt-in,
+/// only with `--chat-template-content-format=string`), where placeholders stay
+/// in their authored position so users can fully interleave media within text.
+/// We currently always hoist media to the front and do not expose that opt-out.
+/// If/when we need interleaved prompts, thread an `interleave` flag through
+/// `process_content_format` (and the router config) and skip the reordering
+/// below when it is set, leaving the parts in their original order.
 fn transform_content_field(
     content_value: &mut Value,
     content_format: ChatTemplateContentFormat,
-    image_placeholder: Option<&str>,
-) {
+    placeholder_tokens: Option<&PlaceholderTokens>,
+) -> Result<(), String> {
     let Some(content_array) = content_value.as_array() else {
-        return; // Not multimodal, keep as-is
+        return Ok(()); // Not multimodal, keep as-is
     };
 
     match content_format {
         ChatTemplateContentFormat::String => {
-            // Extract text parts; optionally replace image parts with placeholders
-            let text_parts: Vec<String> = content_array
-                .iter()
-                .filter_map(|part| {
-                    let obj = part.as_object()?;
-                    let type_str = obj.get("type")?.as_str()?;
-                    match type_str {
-                        "text" => obj.get("text")?.as_str().map(String::from),
-                        "image_url" => image_placeholder.map(String::from),
-                        _ => None,
+            // Extract text parts; replace media parts with placeholders. Media
+            // placeholders are emitted FIRST (before text), matching vLLM's
+            // `_get_full_multimodal_text_prompt` ("always add missing
+            // placeholders at the front"). Placing the image after the question
+            // text measurably degrades VQA accuracy (MMBench answers flip).
+            let mut media_parts: Vec<String> = Vec::new();
+            let mut text_parts: Vec<String> = Vec::new();
+            for part in content_array {
+                let Some(obj) = part.as_object() else {
+                    continue;
+                };
+                match obj.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                            text_parts.push(t.to_string());
+                        }
                     }
-                })
-                .collect();
+                    Some(type_name @ ("image_url" | "video_url" | "audio_url" | "input_audio")) => {
+                        let modality = modality_for_chat_part(type_name).ok_or_else(|| {
+                            format!("unsupported media content part type: {type_name}")
+                        })?;
+                        let Some(tokens) = placeholder_tokens else {
+                            continue;
+                        };
+                        let placeholder = tokens.get(modality).ok_or_else(|| {
+                            format!(
+                                "missing {modality} placeholder for string-format chat template"
+                            )
+                        })?;
+                        media_parts.push(placeholder.to_string());
+                    }
+                    _ => {}
+                }
+            }
 
-            if !text_parts.is_empty() {
-                *content_value = Value::String(text_parts.join("\n"));
+            if !media_parts.is_empty() || !text_parts.is_empty() {
+                let ordered: Vec<String> = media_parts.into_iter().chain(text_parts).collect();
+                *content_value = Value::String(ordered.join("\n"));
             }
         }
         ChatTemplateContentFormat::OpenAI => {
@@ -243,15 +279,41 @@ fn transform_content_field(
                         .and_then(|type_str| match type_str {
                             "image_url" => Some(json!({"type": "image"})),
                             "video_url" => Some(json!({"type": "video"})),
-                            "audio_url" => Some(json!({"type": "audio"})),
+                            "audio_url" | "input_audio" => Some(json!({"type": "audio"})),
                             _ => None,
                         })
                         .unwrap_or_else(|| part.clone())
                 })
                 .collect();
 
-            *content_value = Value::Array(processed_parts);
+            // Place media parts before the remaining (text) parts, matching
+            // vLLM's front placement. The chat template renders parts in order,
+            // so an OpenAI request like [text, image] would otherwise put the
+            // image AFTER the whole question — which measurably hurts visual
+            // grounding (MMBench answers flip vs. image-first). `partition` is
+            // stable, so relative order within media and within text is kept.
+            let (mut media, rest): (Vec<Value>, Vec<Value>) =
+                processed_parts.into_iter().partition(|p| {
+                    matches!(
+                        p.get("type").and_then(|t| t.as_str()),
+                        Some("image") | Some("video") | Some("audio")
+                    )
+                });
+            media.extend(rest);
+
+            *content_value = Value::Array(media);
         }
+    }
+
+    Ok(())
+}
+
+fn modality_for_chat_part(type_name: &str) -> Option<Modality> {
+    match type_name {
+        "image_url" | "image" => Some(Modality::Image),
+        "audio_url" | "input_audio" | "audio" => Some(Modality::Audio),
+        "video_url" | "video" => Some(Modality::Video),
+        _ => None,
     }
 }
 
@@ -361,22 +423,42 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
     image_placeholder: Option<&str>,
 ) -> Result<ProcessedMessages, String> {
+    let placeholder_tokens = image_placeholder.map(|token| {
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, token.to_string());
+        placeholders
+    });
+    process_chat_messages_with_placeholders(request, tokenizer, placeholder_tokens.as_ref())
+}
+
+pub(crate) fn process_chat_messages_with_placeholders(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+) -> Result<ProcessedMessages, String> {
     let formatted_text = {
         // Get content format and transform messages accordingly
         let content_format = tokenizer.chat_template_content_format();
         let mut transformed_messages =
-            process_content_format(&request.messages, content_format, image_placeholder)?;
+            process_content_format(&request.messages, content_format, placeholder_tokens)?;
 
         // Process tool call arguments in assistant messages
         process_tool_call_arguments(&mut transformed_messages)?;
 
         // Convert tools to JSON values for template processing
+        let image_placeholder = placeholder_tokens.and_then(|tokens| tokens.get(Modality::Image));
         let render_context = get_render_context_from_request(request, image_placeholder)?;
 
         let params = ChatTemplateParams {
             add_generation_prompt: true,
             tools: render_context.tools_ref(),
             template_kwargs: render_context.template_kwargs_ref(),
+            // Project OpenAI `reasoning_effort` (none/minimal) onto the model's
+            // thinking toggle; the tokenizer applies it under the correct key.
+            // An explicit chat_template_kwargs toggle still wins (in apply).
+            thinking: openai_protocol::chat::thinking_from_reasoning_effort(
+                request.reasoning_effort.as_deref(),
+            ),
             ..Default::default()
         };
 
@@ -643,11 +725,19 @@ mod tests {
     use llm_tokenizer::chat_template::ChatTemplateContentFormat;
     use openai_protocol::{
         chat::{ChatMessage, MessageContent},
-        common::{ContentPart, ImageUrl},
+        common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
     };
     use serde_json::json;
 
     use super::*;
+
+    fn placeholders(entries: &[(Modality, &str)]) -> PlaceholderTokens {
+        let mut tokens = PlaceholderTokens::default();
+        for (modality, token) in entries {
+            tokens.insert(*modality, (*token).to_string());
+        }
+        tokens
+    }
 
     #[test]
     fn test_transform_messages_string_format() {
@@ -669,18 +759,170 @@ mod tests {
             name: None,
         }];
 
+        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
         let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
 
         assert_eq!(result.len(), 1);
         let transformed_message = &result[0];
 
-        // Should flatten multimodal content to text only (image stripped, no placeholder)
+        // Media is hoisted and uses the modality-specific placeholder.
         assert_eq!(
             transformed_message["content"].as_str().unwrap(),
-            "Hello\nWorld"
+            "<|image|>\nHello\nWorld"
         );
         assert_eq!(transformed_message["role"].as_str().unwrap(), "user");
+    }
+
+    #[test]
+    fn test_transform_messages_string_format_without_placeholders_omits_media() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Describe this".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/image.png".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let result =
+            process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+
+        assert_eq!(result[0]["content"], "Describe this");
+    }
+
+    #[test]
+    fn test_transform_messages_string_format_with_video_placeholder() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Watch this".to_string(),
+                },
+                ContentPart::VideoUrl {
+                    video_url: VideoUrl {
+                        url: "https://example.com/video.mp4".to_string(),
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let tokens = placeholders(&[(Modality::Video, "<|video|>")]);
+        let result =
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
+
+        // Media placeholder is emitted before the text (vLLM front placement).
+        assert_eq!(
+            result[0]["content"].as_str().unwrap(),
+            "<|video|>\nWatch this"
+        );
+    }
+
+    #[test]
+    fn test_transform_messages_string_format_uses_per_modality_placeholders() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Describe and transcribe".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "image".to_string(),
+                        detail: None,
+                    },
+                },
+                ContentPart::AudioUrl {
+                    audio_url: AudioUrl {
+                        url: "audio".to_string(),
+                    },
+                },
+            ]),
+            name: None,
+        }];
+        let tokens = placeholders(&[(Modality::Image, "<image>"), (Modality::Audio, "<audio>")]);
+
+        let result =
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
+
+        assert_eq!(
+            result[0]["content"],
+            "<image>\n<audio>\nDescribe and transcribe"
+        );
+
+        let openai =
+            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, Some(&tokens))
+                .unwrap();
+        assert_eq!(
+            openai[0]["content"],
+            json!([
+                {"type": "image"},
+                {"type": "audio"},
+                {"type": "text", "text": "Describe and transcribe"}
+            ])
+        );
+    }
+
+    #[test]
+    fn test_transform_messages_input_audio_uses_audio_placeholder() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Transcribe this".to_string(),
+                },
+                ContentPart::InputAudio {
+                    input_audio: InputAudio {
+                        data: "UklGRg==".to_string(),
+                        format: "wav".to_string(),
+                    },
+                },
+            ]),
+            name: None,
+        }];
+        let tokens = placeholders(&[(Modality::Audio, "<audio>")]);
+
+        let string =
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
+        assert_eq!(string[0]["content"], "<audio>\nTranscribe this");
+
+        let openai =
+            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, Some(&tokens))
+                .unwrap();
+        assert_eq!(
+            openai[0]["content"],
+            json!([
+                {"type": "audio"},
+                {"type": "text", "text": "Transcribe this"}
+            ])
+        );
+    }
+
+    #[test]
+    fn test_transform_messages_string_format_rejects_missing_modality_placeholder() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "audio".to_string(),
+                },
+            }]),
+            name: None,
+        }];
+        let tokens = placeholders(&[(Modality::Image, "<image>")]);
+
+        let error =
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap_err();
+
+        assert!(error.contains("missing audio placeholder"));
     }
 
     #[test]
@@ -706,16 +948,18 @@ mod tests {
         assert_eq!(result.len(), 1);
         let transformed_message = &result[0];
 
-        // Should replace media URLs with simple type placeholders
+        // Media URLs replaced with simple type placeholders, and the image is
+        // hoisted before the text (vLLM front placement; image-after-question
+        // degrades VQA accuracy).
         let content_array = transformed_message["content"].as_array().unwrap();
         assert_eq!(content_array.len(), 2);
 
-        // Text part should remain unchanged
-        assert_eq!(content_array[0]["type"], "text");
-        assert_eq!(content_array[0]["text"], "Describe this image:");
+        // Image part comes first now.
+        assert_eq!(content_array[0], json!({"type": "image"}));
 
-        // Image part should be replaced with simple type placeholder
-        assert_eq!(content_array[1], json!({"type": "image"}));
+        // Text part follows, unchanged.
+        assert_eq!(content_array[1]["type"], "text");
+        assert_eq!(content_array[1]["text"], "Describe this image:");
     }
 
     #[test]
@@ -725,8 +969,10 @@ mod tests {
             name: None,
         }];
 
+        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
         let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
 
         assert_eq!(result.len(), 1);
         let transformed_message = &result[0];
@@ -761,8 +1007,10 @@ mod tests {
             },
         ];
 
+        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
         let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
 
         assert_eq!(result.len(), 2);
 
@@ -770,9 +1018,12 @@ mod tests {
         assert_eq!(result[0]["role"].as_str().unwrap(), "system");
         assert_eq!(result[0]["content"].as_str().unwrap(), "System prompt");
 
-        // User message should be flattened to text only
+        // User message retains the media anchor.
         assert_eq!(result[1]["role"].as_str().unwrap(), "user");
-        assert_eq!(result[1]["content"].as_str().unwrap(), "User message");
+        assert_eq!(
+            result[1]["content"].as_str().unwrap(),
+            "<|image|>\nUser message"
+        );
     }
 
     #[test]
@@ -787,14 +1038,15 @@ mod tests {
             name: None,
         }];
 
+        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
         let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
 
         assert_eq!(result.len(), 1);
         let transformed_message = &result[0];
 
-        // Should keep original multimodal content when no text parts exist
-        assert!(transformed_message["content"].is_array());
+        assert_eq!(transformed_message["content"], "<|image|>");
     }
 
     #[test]
@@ -820,12 +1072,17 @@ mod tests {
             },
         ];
 
+        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
         let result_string =
-            process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
 
         assert_eq!(result_string.len(), 2);
         assert_eq!(result_string[0]["content"].as_str().unwrap(), "Plain text");
-        assert_eq!(result_string[1]["content"].as_str().unwrap(), "With image");
+        assert_eq!(
+            result_string[1]["content"].as_str().unwrap(),
+            "<|image|>\nWith image"
+        );
 
         let result_openai =
             process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
@@ -835,7 +1092,161 @@ mod tests {
 
         let content_array = result_openai[1]["content"].as_array().unwrap();
         assert_eq!(content_array.len(), 2);
-        assert_eq!(content_array[0]["type"], "text");
-        assert_eq!(content_array[1], json!({"type": "image"}));
+        // Image hoisted before text.
+        assert_eq!(content_array[0], json!({"type": "image"}));
+        assert_eq!(content_array[1]["type"], "text");
+    }
+
+    #[test]
+    fn test_media_hoisted_before_text_openai() {
+        // Real MMBench shape: [question text, image] must render image-first.
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Question: ...\nAnswer with only the option letter.".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/jpeg;base64,XXX".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let result =
+            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
+        let arr = result[0]["content"].as_array().unwrap();
+        assert_eq!(arr[0], json!({"type": "image"}));
+        assert_eq!(arr[1]["type"], "text");
+    }
+
+    #[test]
+    fn test_media_hoisted_before_text_string() {
+        // String-format template: placeholder prepended, matching vLLM exactly.
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Question?".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/jpeg;base64,XXX".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let tokens = placeholders(&[(Modality::Image, "<|image_pad|>")]);
+        let result =
+            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+                .unwrap();
+        assert_eq!(
+            result[0]["content"].as_str().unwrap(),
+            "<|image_pad|>\nQuestion?"
+        );
+    }
+
+    #[test]
+    fn test_media_first_stable_and_multi() {
+        // Multiple media + text keep relative order within each group, media first.
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "a".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "i1".to_string(),
+                        detail: None,
+                    },
+                },
+                ContentPart::Text {
+                    text: "b".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "i2".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let result =
+            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
+        let arr = result[0]["content"].as_array().unwrap();
+        assert_eq!(arr[0], json!({"type": "image"}));
+        assert_eq!(arr[1], json!({"type": "image"}));
+        assert_eq!(arr[2]["text"], "a");
+        assert_eq!(arr[3]["text"], "b");
+    }
+
+    /// End-to-end: run a real MMBench-shaped `[text, image]` message through the
+    /// full SMG pipeline (`process_content_format` + the actual model chat
+    /// template) and assert the rendered prompt places the image BEFORE the
+    /// question. Proves the fix end-to-end without needing the GPU worker.
+    /// Ignored by default (needs the real template); run with:
+    ///   QWEN35_CHAT_TEMPLATE=/path/chat_template.jinja cargo test -p smg \
+    ///     render_image_before_question -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs real chat_template.jinja via QWEN35_CHAT_TEMPLATE"]
+    fn test_render_image_before_question_real_template() {
+        use llm_tokenizer::chat_template::{
+            detect_chat_template_content_format, ChatTemplateParams, ChatTemplateProcessor,
+        };
+
+        let Ok(path) = std::env::var("QWEN35_CHAT_TEMPLATE") else {
+            return; // skip when not provided
+        };
+        let template = std::fs::read_to_string(&path).expect("read template");
+        let format = detect_chat_template_content_format(&template);
+
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Question: Which description is correct?\n\
+                           Answer with only the option letter (A/B/C/D)."
+                        .to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/jpeg;base64,XXX".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let tokens = placeholders(&[(Modality::Image, "<|image_pad|>")]);
+        let transformed = process_content_format(&messages, format, Some(&tokens)).unwrap();
+
+        let mut kwargs = HashMap::new();
+        kwargs.insert("enable_thinking".to_string(), json!(false));
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            template_kwargs: Some(&kwargs),
+            ..Default::default()
+        };
+        let rendered = ChatTemplateProcessor::new(template)
+            .unwrap()
+            .apply_chat_template(&transformed, params)
+            .unwrap();
+
+        let vstart = rendered
+            .find("<|vision_start|>")
+            .expect("rendered prompt has <|vision_start|>");
+        let qpos = rendered
+            .find("Question:")
+            .expect("rendered prompt has the question");
+        assert!(
+            vstart < qpos,
+            "image must precede the question (vstart={vstart}, qpos={qpos}).\n--- rendered ---\n{rendered}"
+        );
     }
 }

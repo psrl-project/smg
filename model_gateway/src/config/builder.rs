@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
+use openai_protocol::worker::TransportMode;
 use smg_mcp::McpConfig;
 
 use super::{
     CandidateSortKey, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvTransferConfig, MetricsConfig,
-    OracleConfig, PolicyConfig, PostgresConfig, PsrlConfig, RedisConfig, RequestSortKey,
-    RetryConfig, RouterConfig, RoutingLoopConfig, RoutingMode, TokenizerCacheConfig,
-    TraceConfig, WorkerSelectionStrategy,
+    HealthCheckConfig, HistoryBackend, KvTransferConfig, MetricsConfig, OracleConfig, PolicyConfig,
+    PostgresConfig, PsrlConfig, RedisConfig, RequestSortKey, RetryConfig, RouterConfig,
+    RoutingKeyOverrideConfig, RoutingLoopConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    WorkerSelectionStrategy,
 };
 use crate::worker::ConnectionMode;
 
@@ -260,6 +261,23 @@ impl RouterConfigBuilder {
 
     pub fn engine_stats_staleness_threshold_ms(mut self, threshold_ms: u64) -> Self {
         self.config.engine_stats_staleness_threshold_ms = threshold_ms;
+        self
+    }
+
+    pub fn engine_metrics(mut self, enabled: bool) -> Self {
+        self.config.engine_metrics = enabled;
+        self
+    }
+
+    /// Global multimodal tensor transport mode (per-worker specs can override).
+    pub fn multimodal_tensor_transport(mut self, mode: Option<TransportMode>) -> Self {
+        self.config.multimodal_tensor_transport = mode;
+        self
+    }
+
+    /// Global minimum multimodal tensor size (bytes) before SHM transport is used.
+    pub fn multimodal_shm_min_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.config.multimodal_shm_min_bytes = bytes;
         self
     }
 
@@ -655,6 +673,11 @@ impl RouterConfigBuilder {
 
     pub fn dp_aware(mut self, enable: bool) -> Self {
         self.config.dp_aware = enable;
+        self
+    }
+
+    pub fn routing_key_override(mut self, config: RoutingKeyOverrideConfig) -> Self {
+        self.config.routing_key_override = config;
         self
     }
 

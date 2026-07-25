@@ -55,6 +55,7 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
+        common::realtime::ws::RealtimeQueryParams,
         conversations,
         grpc::routing_loop::{
             controller::{
@@ -63,7 +64,6 @@ use crate::{
             },
             runtime::{run_routing_loop, RoutingLoopRuntime},
         },
-        openai::realtime::ws::RealtimeQueryParams,
         parse, responses as response_handlers,
         router_manager::RouterManager,
         tokenize, RouterTrait,
@@ -579,13 +579,9 @@ async fn create_worker(
 
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListWorkersQuery>,
+    Query(_query): Query<ListWorkersQuery>,
 ) -> Response {
-    state
-        .context
-        .worker_service
-        .list_workers()
-        .into_response()
+    state.context.worker_service.list_workers().into_response()
 }
 
 async fn get_worker(
@@ -739,7 +735,6 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
-
 /// POST /tito/sessions — create a new TITO session and return its ID.
 async fn tito_create_session(State(state): State<Arc<AppState>>) -> Response {
     let store = match state.context.tito_store.as_ref() {
@@ -792,48 +787,14 @@ async fn tito_get_session(
         }
     };
 
-    // Check session exists (it was created via POST /v1/tito/sessions)
-    if !store.session_exists(&session_id) {
-        return (
+    match store.get_session_data(&session_id) {
+        Some(session_data) => Json(session_data).into_response(),
+        None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "session not found"})),
         )
-            .into_response();
+            .into_response(),
     }
-
-    // Get all trajectories from session store
-    let trajectories = store.get_all_trajectories(&session_id);
-    let max_trim_tokens = store.get_session_max_trim_tokens(&session_id);
-
-    let mut resp = serde_json::json!({
-        "session_id": session_id,
-        "max_trim_tokens": max_trim_tokens,
-    });
-
-    if trajectories.len() == 1 {
-        // Single trajectory: backward-compatible flat format with trajectory_id added
-        if let Some(traj) = trajectories.into_iter().next() {
-            resp["trajectory_id"] = serde_json::json!(traj.trajectory_id);
-            resp["accumulated_token_ids"] = serde_json::json!(traj.accumulated_token_ids);
-            resp["records"] = serde_json::json!(traj.turn_records);
-        }
-    } else {
-        // Multi-trajectory: list of {trajectory_id, accumulated_token_ids, records},
-        // sorted ascending by trajectory_id (get_all_trajectories already guarantees this).
-        let traj_list: Vec<_> = trajectories
-            .into_iter()
-            .map(|traj| {
-                serde_json::json!({
-                    "trajectory_id": traj.trajectory_id,
-                    "accumulated_token_ids": traj.accumulated_token_ids,
-                    "records": traj.turn_records,
-                })
-            })
-            .collect();
-        resp["trajectories"] = serde_json::json!(traj_list);
-    }
-
-    Json(resp).into_response()
 }
 
 pub struct ServerConfig {
@@ -867,6 +828,8 @@ pub struct ServerConfig {
     ///
     /// `None` (the default) means "always GC".
     pub tito_gc_threshold: Option<usize>,
+    /// Controls whether TITO reads trajectory IDs from headers or assigns them.
+    pub trajectory_id_strategy: smg_tito::TrajectoryIdStrategy,
     /// Bind address for WebRTC UDP sockets.
     /// `None` means use the default (0.0.0.0, auto-detect candidate IP).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -1185,6 +1148,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ))
     };
 
+    // Seed the process-wide multimodal tensor transport defaults from the
+    // resolved router config; per-worker specs still override at request time.
+    use crate::routers::grpc::multimodal::init_mm_transport_defaults;
+    init_mm_transport_defaults(
+        config.router_config.multimodal_tensor_transport,
+        config.router_config.multimodal_shm_min_bytes,
+    );
+
     // Start the metrics server. It binds the port eagerly so we fail fast on
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {
@@ -1275,7 +1246,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     if config.enable_tito {
-        let tito_store = Arc::new(smg_tito::TitoStore::new());
+        let tito_store = Arc::new(smg_tito::TitoStore::with_trajectory_id_strategy(
+            config.trajectory_id_strategy,
+        ));
         tito_store.set_debug(config.tito_debug);
         if let Some(threshold) = config.tito_gc_threshold {
             tito_store.set_gc_threshold(threshold);
@@ -1283,8 +1256,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         if let Some(ctx_mut) = Arc::get_mut(&mut app_context) {
             ctx_mut.tito_store = Some(tito_store);
             info!(
-                "TITO session store initialized (debug={}, gc_threshold={:?})",
-                config.tito_debug, config.tito_gc_threshold
+                "TITO session store initialized (debug={}, gc_threshold={:?}, trajectory_id_strategy={})",
+                config.tito_debug,
+                config.tito_gc_threshold,
+                config.trajectory_id_strategy
             );
         } else {
             error!("Failed to set tito_store: Arc::get_mut failed");

@@ -25,12 +25,12 @@ pub use event_tree::{
     PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap, WorkerId, WorkerIdExhausted,
 };
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
-pub use tiered_indexer::{Tier, TieredIndexer};
 // Re-export under names matching old tree.rs API for easier migration
 pub use string_tree::Tree;
 pub use string_tree::{
     PrefixMatchResult as StringMatchResult, PrefixMatchResult, Tree as StringTree,
 };
+pub use tiered_indexer::{Tier, TieredIndexer};
 pub use token_tree::{PrefixMatchResult as TokenMatchResult, TokenTree};
 
 /// Trait for radix tree implementations.

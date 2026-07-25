@@ -55,7 +55,7 @@ use kv_index::{
 };
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{debug, warn};

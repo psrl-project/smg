@@ -7,6 +7,7 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use memchr::memmem;
 use openai_protocol::{
@@ -352,7 +353,10 @@ impl PDRouter {
                             context.batch_size,
                         ) {
                             Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
+                            Err(e) => {
+                                Metrics::record_pd_bootstrap_failure();
+                                return Self::handle_serialization_error(e);
+                            }
                         };
 
                         let mut prefill_json_request = json_request.clone();
@@ -515,7 +519,7 @@ impl PDRouter {
                 "data: {}\n\n",
                 serde_json::to_string(&json!({ "error": error_payload })).unwrap_or_default()
             );
-            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
+            let error_stream = tokio_stream::once(Ok(Bytes::from(sse_data)));
 
             let decode_url = decode.url().to_string();
             self.create_streaming_response(
@@ -648,22 +652,38 @@ impl PDRouter {
         // hits a transport error, the other is cancelled immediately — otherwise
         // the surviving request hangs waiting for a PD bootstrap that will never
         // come (see #831).
-        let pd_result = tokio::try_join!(prefill_request.send(), decode_request.send());
+        // Each leg captures its own head-arrival elapsed when its `send()`
+        // resolves, so the two are independent even though `try_join!` returns
+        // only once both heads arrive: decode TTFT isn't conflated with the
+        // prefill-head wait, and prefill duration isn't conflated with a slower
+        // decode head. Recorded on the success path only.
+        let runtime = prefill.metadata().spec.runtime_type.as_str();
+        let dispatch_start = Instant::now();
+        let prefill_fut = async {
+            let resp = prefill_request.send().await?;
+            Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
+        };
+        let decode_fut = async {
+            let resp = decode_request.send().await?;
+            Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
+        };
+        let pd_result = tokio::try_join!(prefill_fut, decode_fut);
 
         events::RequestReceivedEvent {}.emit();
 
-        let (prefill_response, decode_response) = match pd_result {
-            Ok((prefill_resp, decode_resp)) => (prefill_resp, decode_resp),
-            Err(e) => {
-                error!("PD request transport error, both sides aborted: {e}");
-                // Don't record_outcome here — the caller (execute_dual_dispatch)
-                // records outcomes from the response status after we return.
-                return error::bad_gateway(
-                    "PD disaggregation request failed",
-                    format!("Transport error: {e}"),
-                );
-            }
-        };
+        let ((prefill_head_elapsed, prefill_response), (decode_head_elapsed, decode_response)) =
+            match pd_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!("PD request transport error, both sides aborted: {e}");
+                    // Don't record_outcome here — the caller (execute_dual_dispatch)
+                    // records outcomes from the response status after we return.
+                    return error::bad_gateway(
+                        "PD disaggregation request failed",
+                        format!("Transport error: {e}"),
+                    );
+                }
+            };
 
         // Process decode response
         let status = StatusCode::from_u16(decode_response.status().as_u16())
@@ -682,7 +702,19 @@ impl PDRouter {
                 .await;
         }
 
+        // Honest PD TTFT: dispatch to the decode response head — the first
+        // user-visible decode output, since the gateway forwards the decode body
+        // unbuffered. Complements the decode-only `smg_router_ttft_seconds`,
+        // which PD never narrows to a single leg.
+        Metrics::record_pd_ttft(
+            metrics_labels::BACKEND_PD,
+            context.model_id,
+            runtime,
+            decode_head_elapsed,
+        );
+
         // Process prefill response
+        let prefill_drain_start = Instant::now();
         let prefill_body = match self
             .process_prefill_response(prefill_response, prefill.url(), context.return_logprob)
             .await
@@ -690,6 +722,15 @@ impl PDRouter {
             Ok((_, body)) => body,
             Err(error_response) => return error_response,
         };
+
+        // Prefill RPC duration: prefill-head elapsed + body drain, independent
+        // of decode so a slower decode head never inflates it.
+        Metrics::record_pd_prefill_duration(
+            metrics_labels::BACKEND_PD,
+            context.model_id,
+            runtime,
+            prefill_head_elapsed + prefill_drain_start.elapsed(),
+        );
 
         if context.is_stream {
             // Streaming response
@@ -803,22 +844,24 @@ impl PDRouter {
         // Get cached hash ring for consistent hashing
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let prefill = Self::pick_worker_by_policy_arc(
+        let prefill = self.pick_worker_by_policy_arc(
             &prefill_workers,
-            &*prefill_policy,
+            &prefill_policy,
             request_text,
             headers,
             hash_ring.clone(),
             "prefill",
+            crate::policies::WorkerLeg::Prefill,
         )?;
 
-        let decode = Self::pick_worker_by_policy_arc(
+        let decode = self.pick_worker_by_policy_arc(
             &decode_workers,
-            &*decode_policy,
+            &decode_policy,
             request_text,
             headers,
             hash_ring,
             "decode",
+            crate::policies::WorkerLeg::Decode,
         )?;
 
         // Record worker selection metrics (Layer 3)
@@ -839,13 +882,19 @@ impl PDRouter {
         Ok((prefill, decode))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "HTTP PD worker pick threads policy + request context + leg"
+    )]
     fn pick_worker_by_policy_arc(
+        &self,
         workers: &[Arc<dyn Worker>],
-        policy: &dyn LoadBalancingPolicy,
+        policy: &Arc<dyn LoadBalancingPolicy>,
         request_text: Option<&str>,
         headers: Option<&HeaderMap>,
         hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
+        leg: crate::policies::WorkerLeg,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
             return Err(format!(
@@ -865,8 +914,10 @@ impl PDRouter {
             ));
         }
 
-        let selected_idx = policy
+        let selected_idx = self
+            .policy_registry
             .select_worker(
+                policy,
                 &available_workers,
                 &SelectWorkerInfo {
                     request_text,
@@ -876,6 +927,7 @@ impl PDRouter {
                     response_token_count: None,
                     priority_groups: None,
                     score_trace: None,
+                    leg,
                 },
             )
             .ok_or_else(|| {
@@ -896,7 +948,7 @@ impl PDRouter {
     )]
     fn create_streaming_response(
         &self,
-        stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+        stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
@@ -916,10 +968,17 @@ impl PDRouter {
             futures_util::pin_mut!(stream);
             // Reusable SSE encoder for the logprob-merge re-encode path.
             let mut encoder = SseEncoder::new();
+            // Whether the next chunk begins at an SSE line boundary (i.e. the
+            // previous chunk ended with an EOL); used to anchor the [DONE]
+            // sentinel detection when the match sits at the start of a chunk.
+            let mut at_line_start = true;
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                        let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
+                        if let Some(&last) = chunk.last() {
+                            at_line_start = last == b'\n' || last == b'\r';
+                        }
 
                         let result = if return_logprob && prefill_logprobs.is_some() {
                             Self::merge_streaming_logprobs(
@@ -964,13 +1023,26 @@ impl PDRouter {
         AttachedBody::wrap_response(response, load_guards)
     }
 
+    /// Build a non-streaming PD response with `Content-Type: application/json`.
+    ///
+    /// Axum's `(StatusCode, Bytes).into_response()` defaults to
+    /// `application/octet-stream`, which breaks OpenAI-style JSON clients.
+    fn non_stream_pd_json_response(status: StatusCode, body: Bytes) -> Response {
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = status;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
+    }
+
     // Helper to process non-streaming decode response with logprob merging
     async fn process_non_streaming_response(
         &self,
         res: reqwest::Response,
         status: StatusCode,
         return_logprob: bool,
-        prefill_body: Option<bytes::Bytes>,
+        prefill_body: Option<Bytes>,
     ) -> Response {
         let response = res.bytes().await;
         let decode_body = match response {
@@ -982,11 +1054,11 @@ impl PDRouter {
         };
 
         if !return_logprob {
-            return (status, decode_body).into_response();
+            return Self::non_stream_pd_json_response(status, decode_body);
         }
 
         let Some(prefill_body) = prefill_body else {
-            return (status, decode_body).into_response();
+            return Self::non_stream_pd_json_response(status, decode_body);
         };
 
         // Merge logprobs from prefill and decode
@@ -995,17 +1067,17 @@ impl PDRouter {
             serde_json::from_slice::<Value>(&decode_body),
         ) else {
             warn!("Failed to parse responses for logprob merging");
-            return (status, decode_body).into_response();
+            return Self::non_stream_pd_json_response(status, decode_body);
         };
 
         Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
 
         // Return merged response
         match serde_json::to_vec(&decode_json) {
-            Ok(body) => (status, body).into_response(),
+            Ok(body) => Self::non_stream_pd_json_response(status, Bytes::from(body)),
             Err(e) => {
                 error!("Failed to serialize merged response: {}", e);
-                (status, decode_body).into_response()
+                Self::non_stream_pd_json_response(status, decode_body)
             }
         }
     }
@@ -1016,7 +1088,7 @@ impl PDRouter {
         prefill_response: reqwest::Response,
         prefill_url: &str,
         return_logprob: bool,
-    ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
+    ) -> Result<(StatusCode, Option<Bytes>), Response> {
         let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -1143,21 +1215,70 @@ impl PDRouter {
         false
     }
 
+    /// Line-anchored detection of the SSE `data: [DONE]` terminal event in a
+    /// raw upstream chunk: a match must start at a line boundary and be
+    /// immediately followed by a complete empty-line event delimiter within
+    /// the same chunk. Payload text that merely contains those bytes never
+    /// qualifies — real EOL bytes cannot occur inside a `data:` payload
+    /// (JSON escapes them). Requiring the full delimiter also rejects
+    /// multi-line events like `data: [DONE]\ndata: x\n\n`, whose joined data
+    /// is not exactly `[DONE]`.
+    ///
+    /// `at_line_start` says whether `chunk` begins at a line boundary. A
+    /// sentinel or delimiter split across chunks is never treated as
+    /// terminal — every byte is still forwarded and the relay then ends via
+    /// upstream EOF, so deferring is always safe while a false positive
+    /// kills a live stream.
+    fn chunk_contains_done_event(chunk: &[u8], at_line_start: bool) -> bool {
+        const DONE_EVENT: &[u8] = b"data: [DONE]";
+        // Length of the EOL sequence at `bytes[pos..]`: 2 for \r\n, 1 for a
+        // bare \r or \n, 0 if none.
+        fn eol_len_at(bytes: &[u8], pos: usize) -> usize {
+            match bytes.get(pos) {
+                Some(b'\r') => 1 + usize::from(bytes.get(pos + 1) == Some(&b'\n')),
+                Some(b'\n') => 1,
+                _ => 0,
+            }
+        }
+        let mut from = 0;
+        while let Some(pos) = memmem::find(&chunk[from..], DONE_EVENT) {
+            let start = from + pos;
+            let anchored = match start.checked_sub(1) {
+                None => at_line_start,
+                Some(prev) => chunk[prev] == b'\n' || chunk[prev] == b'\r',
+            };
+            if anchored {
+                let line_end = start + DONE_EVENT.len();
+                let eol1 = eol_len_at(chunk, line_end);
+                if eol1 > 0 && eol_len_at(chunk, line_end + eol1) > 0 {
+                    return true;
+                }
+            }
+            from = start + 1;
+        }
+        false
+    }
+
     // Simple helper to merge logprobs in streaming responses
     // Optimized to reduce allocations in the merge path
     fn merge_streaming_logprobs(
         prefill_logprobs: Option<&Value>,
         decode_chunk: &[u8],
         encoder: &mut SseEncoder,
-    ) -> Result<bytes::Bytes, ()> {
+    ) -> Result<Bytes, ()> {
         // Skip non-data chunks
         let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
-        if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
+        if !chunk_str.starts_with("data: ") {
             return Err(());
         }
 
-        // Parse JSON from chunk
+        // Parse JSON from chunk. The `[DONE]` sentinel must be matched
+        // exactly, not by substring: payloads that merely contain that text
+        // still need their logprobs merged.
         let json_str = chunk_str.trim_start_matches("data: ").trim();
+        if json_str == "[DONE]" {
+            return Err(());
+        }
         let mut decode_json: Value = serde_json::from_str(json_str).map_err(|_| ())?;
 
         // Merge prefill logprobs if available
@@ -1458,6 +1579,80 @@ mod tests {
     }
 
     #[test]
+    fn test_done_event_detection() {
+        // Production-incident payload: a delta whose arguments contained the
+        // literal sentinel text; the old substring scan treated it as
+        // terminal and silently killed the stream.
+        let incident: &[u8] = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"// data: [DONE]\"}}]}}]}\n\n";
+        // (chunk, chunk begins at a line boundary, expected, case)
+        let cases: &[(&[u8], bool, bool, &str)] = &[
+            (b"data: [DONE]\n\n", true, true, "standalone sentinel"),
+            (
+                b"data: {\"x\":1}\n\ndata: [DONE]\n\n",
+                true,
+                true,
+                "sentinel after a data event",
+            ),
+            (b"data: [DONE]\r\n\r\n", true, true, "CRLF endings"),
+            (
+                b"\ndata: [DONE]\n\n",
+                false,
+                true,
+                "line boundary inside the chunk",
+            ),
+            (incident, true, false, "sentinel text inside a JSON payload"),
+            (
+                b"data: [DONE]{\"x\":1}\n\n",
+                true,
+                false,
+                "line continues with payload",
+            ),
+            (b"data: [DONE]\n\n", false, false, "chunk starts mid-line"),
+            (
+                b"data: [DONE]",
+                true,
+                false,
+                "possibly a split payload line: defer",
+            ),
+            (
+                b"data: [DONE]\n",
+                true,
+                false,
+                "event delimiter incomplete: defer",
+            ),
+            (
+                b"data: [DONE]\ndata: x\n\n",
+                true,
+                false,
+                "one event, joined data is not [DONE]",
+            ),
+        ];
+        for (chunk, at_line_start, expected, case) in cases {
+            assert_eq!(
+                PDRouter::chunk_contains_done_event(chunk, *at_line_start),
+                *expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_streaming_logprobs_sentinel_exact_match() {
+        let mut encoder = SseEncoder::new();
+        // The exact sentinel is skipped (caller forwards it verbatim)
+        assert!(
+            PDRouter::merge_streaming_logprobs(None, b"data: [DONE]\n\n", &mut encoder).is_err()
+        );
+        // A payload containing "[DONE]" as text is still processed
+        assert!(PDRouter::merge_streaming_logprobs(
+            None,
+            b"data: {\"text\":\"[DONE]\",\"meta_info\":{}}\n\n",
+            &mut encoder
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_build_post_uses_dp_base_url_for_logical_worker() {
         let router = create_test_pd_router();
         let worker = BasicWorkerBuilder::new("http://127.0.0.1:30000")
@@ -1662,7 +1857,7 @@ mod tests {
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
 
-            tx.send(bytes::Bytes::from("test data")).unwrap();
+            tx.send(Bytes::from("test data")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 

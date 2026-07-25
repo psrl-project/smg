@@ -5,7 +5,12 @@
 //! and SGLang scheduler backends.
 
 pub mod common_proto {
-    #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
+    #![allow(
+        clippy::all,
+        clippy::absolute_paths,
+        clippy::trivially_copy_pass_by_ref,
+        unused_qualifications
+    )]
     tonic::include_proto!("smg.grpc.common");
 }
 pub mod abort_on_drop;
@@ -13,6 +18,7 @@ pub mod channel;
 pub mod mlx_engine;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
+pub mod tokenspeed_encoder;
 pub mod tokenspeed_scheduler;
 pub mod trtllm_service;
 pub mod vllm_engine;
@@ -23,7 +29,10 @@ use std::sync::Arc;
 pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{connect_channel, normalize_grpc_endpoint};
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
-pub use sglang_scheduler::{proto as sglang_proto, SglangSchedulerClient};
+pub use sglang_scheduler::{
+    proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
+};
+pub use tokenspeed_encoder::{tokenspeed_encoder_proto, TokenSpeedEncoderClient};
 pub use tokenspeed_scheduler::{tokenspeed_proto, TokenSpeedSchedulerClient};
 use tonic::metadata::MetadataMap;
 pub use trtllm_service::{proto as trtllm_proto, TrtllmServiceClient};

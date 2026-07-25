@@ -39,6 +39,9 @@ pub enum WorkerType {
     Prefill,
     /// Decode worker for PD disaggregated mode.
     Decode,
+    /// Encode worker for EPD disaggregated mode: runs the vision tower and
+    /// ships image embeddings to a prefill worker over Mooncake.
+    Encode,
 }
 
 impl std::fmt::Display for WorkerType {
@@ -47,6 +50,7 @@ impl std::fmt::Display for WorkerType {
             WorkerType::Regular => write!(f, "regular"),
             WorkerType::Prefill => write!(f, "prefill"),
             WorkerType::Decode => write!(f, "decode"),
+            WorkerType::Encode => write!(f, "encode"),
         }
     }
 }
@@ -61,6 +65,8 @@ impl std::str::FromStr for WorkerType {
             Ok(WorkerType::Prefill)
         } else if s.eq_ignore_ascii_case("decode") {
             Ok(WorkerType::Decode)
+        } else if s.eq_ignore_ascii_case("encode") {
+            Ok(WorkerType::Encode)
         } else {
             Err(format!("Unknown worker type: {s}"))
         }
@@ -215,19 +221,25 @@ impl RuntimeType {
     pub fn is_specified(self) -> bool {
         !matches!(self, RuntimeType::Unspecified)
     }
+
+    /// Static string form, identical to `Display`. For hot-path metric labels
+    /// that must avoid per-call allocation/interning.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeType::Unspecified => "unspecified",
+            RuntimeType::Sglang => "sglang",
+            RuntimeType::Vllm => "vllm",
+            RuntimeType::Trtllm => "trtllm",
+            RuntimeType::Mlx => "mlx",
+            RuntimeType::TokenSpeed => "tokenspeed",
+            RuntimeType::External => "external",
+        }
+    }
 }
 
 impl std::fmt::Display for RuntimeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RuntimeType::Unspecified => write!(f, "unspecified"),
-            RuntimeType::Sglang => write!(f, "sglang"),
-            RuntimeType::Vllm => write!(f, "vllm"),
-            RuntimeType::Trtllm => write!(f, "trtllm"),
-            RuntimeType::Mlx => write!(f, "mlx"),
-            RuntimeType::TokenSpeed => write!(f, "tokenspeed"),
-            RuntimeType::External => write!(f, "external"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -537,12 +549,12 @@ impl<'de> Deserialize<'de> for WorkerModels {
 
 /// JsonSchema: wire format is `Vec<ModelCard>`.
 impl JsonSchema for WorkerModels {
-    fn schema_name() -> String {
-        "WorkerModels".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WorkerModels".into()
     }
 
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        Vec::<ModelCard>::json_schema(gen)
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        Vec::<ModelCard>::json_schema(generator)
     }
 }
 
@@ -662,6 +674,17 @@ pub struct WorkerSpec {
     /// Falls back to the global `load_monitor_interval_secs` from router config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_monitor_interval_secs: Option<u64>,
+
+    /// Per-worker multimodal tensor transport override (`inline` | `shm` | `auto`).
+    /// Overrides the router-level `multimodal_tensor_transport` for this worker
+    /// (e.g. force `shm` for a co-located worker, `inline` for a remote one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_tensor_transport: Option<TransportMode>,
+
+    /// Per-worker minimum multimodal tensor size (bytes) before the SHM transport
+    /// is used. Overrides the router-level `multimodal_shm_min_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_shm_min_bytes: Option<usize>,
 }
 
 impl WorkerSpec {
@@ -693,7 +716,68 @@ impl WorkerSpec {
             resilience: ResilienceUpdate::default(),
             max_connection_attempts: default_max_connection_attempts(),
             load_monitor_interval_secs: None,
+            multimodal_tensor_transport: None,
+            multimodal_shm_min_bytes: None,
         }
+    }
+}
+
+/// Multimodal tensor transport mode for large payloads.
+///
+/// - `Inline`: always carry tensor bytes in the gRPC message.
+/// - `Shm`: use same-host `/dev/shm` when SMG can write it.
+/// - `Auto`: use `/dev/shm` only when the receiving worker is verified to share
+///   SMG's `/dev/shm`; otherwise fall back to inline.
+/// - `Rdma`: use the NIXL RDMA pixel lane for large tensors (requires the
+///   `mm-rdma` build feature + NIXL); falls back to inline when RDMA is
+///   unavailable.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMode {
+    #[default]
+    Inline,
+    Shm,
+    Auto,
+    Rdma,
+}
+
+impl TransportMode {
+    /// Parse from a case-insensitive string (`inline` | `shm` | `auto` | `rdma`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "inline" => Some(Self::Inline),
+            "shm" => Some(Self::Shm),
+            "auto" => Some(Self::Auto),
+            "rdma" => Some(Self::Rdma),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Shm => "shm",
+            Self::Auto => "auto",
+            Self::Rdma => "rdma",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TransportMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+            .ok_or_else(|| format!("invalid transport mode '{s}'; expected inline|shm|auto|rdma"))
     }
 }
 
@@ -1104,6 +1188,21 @@ pub struct SchedulerLoadSnapshot {
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
+    /// PD disaggregation signals, populated only when the backend reports a
+    /// `disagg` section. `None` for HTTP or older engines. Canonical schema
+    /// other engines map into; SGLang derives the queue depths from its
+    /// per-stage DisaggregationMetrics counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_speed_gb_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_queue_reqs: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_queue_reqs: Option<i32>,
+    /// "prefill", "decode", or "null" as reported by the backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disagg_mode: Option<String>,
 }
 
 /// Full load response for a single worker across all DP ranks.
@@ -1127,6 +1226,20 @@ impl WorkerLoadResponse {
     /// Total used tokens summed across all DP ranks.
     pub fn total_used_tokens(&self) -> i64 {
         self.loads.iter().map(|l| l.num_used_tokens as i64).sum()
+    }
+
+    /// Whether this response carries real absolute per-rank token counts
+    /// (as opposed to a ratio-only snapshot synthesized from Prometheus
+    /// `/metrics`, which knows KV *usage* but not token capacity).
+    ///
+    /// A running engine always reports its KV token capacity, so a positive
+    /// `max_total_num_tokens` on any rank marks the absolute-token fields
+    /// (`num_used_tokens`, `dp_rank_loads`, `total_used_tokens`) as
+    /// meaningful. Callers that need absolute tokens — the `/get_loads`
+    /// scalar and the DP-rank load cache — should gate on this so a
+    /// ratio-only snapshot is not read as "0 tokens used".
+    pub fn has_absolute_token_data(&self) -> bool {
+        self.loads.iter().any(|l| l.max_total_num_tokens > 0)
     }
 
     /// Total queued (waiting, uncached) tokens summed across all DP ranks.

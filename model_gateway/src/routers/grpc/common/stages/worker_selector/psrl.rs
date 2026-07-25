@@ -32,7 +32,7 @@ use super::WorkerSelectorStrategy;
 use crate::{
     config::types::CandidateSortKey,
     observability::metrics::{metrics_labels, Metrics},
-    policies::{PolicyRegistry, ScoreTraceCtx, SelectWorkerInfo},
+    policies::{PolicyRegistry, ScoreTraceCtx, SelectWorkerInfo, WorkerLeg},
     routers::{
         error,
         grpc::{
@@ -504,6 +504,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                     priority_groups: None,
                     response_token_count: meta.response_token_count,
                     score_trace: None,
+                    leg: WorkerLeg::Single,
                 };
                 let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                 let mut cands = Vec::with_capacity(sorted_candidates.len());
@@ -599,6 +600,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                             prev_instance_id: prev.as_deref(),
                         }
                     }),
+                    leg: WorkerLeg::Single,
                 },
             )?;
             gated_candidates[idx].increment_load();
@@ -927,7 +929,8 @@ mod tests {
     async fn commit_pins_unversioned_request_to_synced_version() {
         let runtime = make_runtime();
         let selector = make_selector(&runtime);
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
         let instance = selector.worker_instance_id(&worker);
         runtime.instance_to_version_after_sync.insert(instance, 5);
 
@@ -944,7 +947,8 @@ mod tests {
     async fn commit_keeps_versioned_request_unchanged() {
         let runtime = make_runtime();
         let selector = make_selector(&runtime);
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
         let instance = selector.worker_instance_id(&worker);
         runtime.instance_to_version_after_sync.insert(instance, 5);
 

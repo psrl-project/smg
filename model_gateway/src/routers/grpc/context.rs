@@ -23,8 +23,12 @@ use tracing::debug;
 
 use super::{
     client::GrpcClient,
+    epd_encode::EncodeDispatchPlan,
     multimodal::MultimodalComponents,
-    proto_wrapper::{ProtoEmbedComplete, ProtoGenerateComplete, ProtoRequest, ProtoStream},
+    proto_wrapper::{
+        ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateComplete, ProtoGenerateRequest,
+        ProtoRequest, ProtoStream,
+    },
     routing_loop::partial_rollout::PartialRolloutState,
 };
 use crate::{
@@ -151,7 +155,7 @@ pub(crate) struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     // Stage 4: Request building outputs
-    pub proto_request: Option<ProtoRequest>,
+    pub execution_plan: Option<ExecutionPlan>,
 
     // Stage 5: Dispatch metadata
     pub dispatch: Option<DispatchMetadata>,
@@ -187,7 +191,7 @@ pub(crate) struct ProcessingState {
 /// Kept as a small `Default`-able struct so adding future per-iteration
 /// override knobs (e.g., for cooperative aborts on different signals) does
 /// not churn `ProcessingState` shape.
-/// 
+///
 /// All fields are `None` outside the PSRL loopback branch and on iter 1.
 #[derive(Default, Debug, Clone)]
 pub(crate) struct PartialRolloutOverrides {
@@ -196,6 +200,76 @@ pub(crate) struct PartialRolloutOverrides {
     /// so vLLM does not re-capture RE for tokens already covered by prior
     /// iterations.
     pub routed_experts_prompt_start: Option<u32>,
+}
+
+/// Execution shape produced by request building and consumed by request execution.
+pub(crate) enum ExecutionPlan {
+    Single(ProtoRequest),
+    PrefillDecode(ProtoGenerateRequest),
+    EncodePrefillDecode {
+        request: ProtoGenerateRequest,
+        encode_dispatch: Option<EncodeDispatchPlan>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionPlanKind {
+    Single,
+    PrefillDecode,
+    EncodePrefillDecode,
+}
+
+impl ExecutionPlan {
+    pub(crate) fn generate(
+        kind: ExecutionPlanKind,
+        request: ProtoGenerateRequest,
+        encode_dispatch: Option<EncodeDispatchPlan>,
+    ) -> Self {
+        match kind {
+            ExecutionPlanKind::Single => {
+                debug_assert!(encode_dispatch.is_none());
+                Self::Single(ProtoRequest::Generate(request))
+            }
+            ExecutionPlanKind::PrefillDecode => {
+                debug_assert!(encode_dispatch.is_none());
+                Self::PrefillDecode(request)
+            }
+            ExecutionPlanKind::EncodePrefillDecode => Self::EncodePrefillDecode {
+                request,
+                encode_dispatch,
+            },
+        }
+    }
+
+    pub(crate) fn embed(request: ProtoEmbedRequest) -> Self {
+        Self::Single(ProtoRequest::Embed(request))
+    }
+
+    pub(crate) fn request_id(&self) -> &str {
+        match self {
+            Self::Single(request) => request.request_id(),
+            Self::PrefillDecode(request) | Self::EncodePrefillDecode { request, .. } => {
+                request.request_id()
+            }
+        }
+    }
+
+    pub(crate) fn request_type(&self) -> &'static str {
+        match self {
+            Self::Single(ProtoRequest::Generate(_))
+            | Self::PrefillDecode(_)
+            | Self::EncodePrefillDecode { .. } => "generate",
+            Self::Single(ProtoRequest::Embed(_)) => "embed",
+        }
+    }
+
+    pub(crate) fn mode_label(&self) -> &'static str {
+        match self {
+            Self::Single(_) => "single",
+            Self::PrefillDecode(_) => "prefill_decode",
+            Self::EncodePrefillDecode { .. } => "encode_prefill_decode",
+        }
+    }
 }
 
 /// Output from preparation stage (Step 1)
@@ -221,6 +295,7 @@ pub(crate) enum PreparationOutput {
     Generate {
         original_text: Option<String>,
         token_ids: Vec<u32>,
+        multimodal_intermediate: Option<super::multimodal::MultimodalIntermediate>,
     },
     Embedding {
         original_text: String,
@@ -270,12 +345,21 @@ impl PreparationOutput {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct EncodeWorkerAssignment {
+    pub item_index: usize,
+    pub worker: Arc<dyn Worker>,
+}
+
 /// Worker selection (Step 2)
 pub(crate) enum WorkerSelection {
     Single {
         worker: Arc<dyn Worker>,
     },
-    Dual {
+    /// Disaggregated prefill/decode selection. EPD layers per-item encode
+    /// assignments on top; plain PD leaves `encode_assignments` unset.
+    Disaggregated {
+        encode_assignments: Option<Vec<EncodeWorkerAssignment>>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         runtime_type: RuntimeType,
@@ -287,7 +371,9 @@ pub(crate) enum ClientSelection {
     Single {
         client: GrpcClient,
     },
-    Dual {
+    /// Disaggregated prefill/decode scheduler clients. EPD encode workers are
+    /// contacted directly from `WorkerSelection::Disaggregated` assignments.
+    Disaggregated {
         prefill: GrpcClient,
         decode: GrpcClient,
     },
@@ -308,7 +394,9 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
     },
-    Dual {
+    /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
+    /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
+    Disaggregated {
         _prefill: WorkerLoadGuard,
         _decode: WorkerLoadGuard,
     },
@@ -339,9 +427,9 @@ impl LoadGuards {
                     None => WorkerLoadGuard::new(worker.clone(), headers),
                 },
             },
-            WorkerSelection::Dual {
+            WorkerSelection::Disaggregated {
                 prefill, decode, ..
-            } => LoadGuards::Dual {
+            } => LoadGuards::Disaggregated {
                 _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
                 _decode: match token_estimate {
                     Some(tokens) => {
@@ -371,9 +459,9 @@ impl LoadGuards {
                     token_estimate,
                 ),
             },
-            WorkerSelection::Dual {
+            WorkerSelection::Disaggregated {
                 prefill, decode, ..
-            } => LoadGuards::Dual {
+            } => LoadGuards::Disaggregated {
                 _prefill: WorkerLoadGuard::from_pre_incremented(prefill.clone(), headers, None),
                 _decode: WorkerLoadGuard::from_pre_incremented(
                     decode.clone(),
@@ -395,13 +483,18 @@ pub(crate) struct TitoRequestContext {
     /// Number of messages matched by TITO prefix (if is_tito_hit is true).
     /// Used for rollback detection: if new request matches fewer messages, we truncate turn_records.
     pub matched_message_num: usize,
-    /// Trajectory identifier from `x-smg-tito-trajectory-id` header (defaults to 0).
-    /// Within a session each unique trajectory ID tracks a separate leaf node.
+    /// Resolved trajectory identifier. In manual mode this comes from the request
+    /// header; in auto mode TITO derives it from the matched tree leaf.
     pub trajectory_id: u64,
+    /// Prevents concurrent auto-mode branches from claiming the same trajectory.
+    pub trajectory_id_reservation: Option<smg_tito::TrajectoryIdReservation>,
     /// Prompt token IDs computed during preparation (set in ChatPreparationStage, read in
     /// ChatResponseProcessingStage for TITO capture).
     /// Consumed by `ChatRequestBuildingStage::execute()` before response processing runs.
     pub prompt_token_ids: Vec<u32>,
+    /// Prompt IDs before multimodal anchor expansion, retained for the next
+    /// incremental TITO turn. Pure-text requests reuse `prompt_token_ids`.
+    pub reusable_prompt_token_ids: Option<Vec<u32>>,
     /// Snapshot of the prefix hash.
     /// The response stage extends this in place with the newly-generated
     /// assistant message and finalizes it to derive the leaf hash,
@@ -422,6 +515,10 @@ pub(crate) struct ResponseState {
     /// Stored here because PreparationOutput is consumed by request_building before
     /// response_processing runs.
     pub skip_special_tokens: Option<bool>,
+
+    /// Exact prompt IDs dispatched to the backend for an opted-in generate
+    /// request. Retained across partial-rollout loopback iterations.
+    pub prompt_token_ids: Option<Vec<u32>>,
 
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,
@@ -708,14 +805,14 @@ impl RequestContext {
 /// Some methods are kept for API completeness even if currently unused.
 #[expect(dead_code)]
 impl WorkerSelection {
-    pub fn is_dual(&self) -> bool {
-        matches!(self, Self::Dual { .. })
+    pub fn is_disaggregated(&self) -> bool {
+        matches!(self, Self::Disaggregated { .. })
     }
 
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
-            Self::Dual { .. } => None,
+            Self::Disaggregated { .. } => None,
         }
     }
 
@@ -723,18 +820,20 @@ impl WorkerSelection {
     pub fn record_outcome(&self, status_code: u16) {
         match self {
             Self::Single { worker } => worker.record_outcome(status_code),
-            Self::Dual {
+            Self::Disaggregated {
                 prefill, decode, ..
             } => {
+                // EPD encode dispatch is asynchronous and supervised by
+                // RequestExecution; this records only the prefill/decode leg.
                 prefill.record_outcome(status_code);
                 decode.record_outcome(status_code);
             }
         }
     }
 
-    /// Record circuit breaker outcomes for dual dispatch (individual tracking)
-    pub fn record_dual_outcomes(&self, prefill_status: u16, decode_status: u16) {
-        if let Self::Dual {
+    /// Record circuit breaker outcomes for disaggregated dispatch (individual tracking)
+    pub fn record_prefill_decode_outcomes(&self, prefill_status: u16, decode_status: u16) {
+        if let Self::Disaggregated {
             prefill, decode, ..
         } = self
         {
@@ -746,7 +845,9 @@ impl WorkerSelection {
     /// Record circuit breaker outcome for prefill worker only (sequential PD)
     pub fn record_outcome_prefill(&self, status_code: u16) {
         match self {
-            Self::Dual { prefill, .. } => prefill.record_outcome(status_code),
+            Self::Disaggregated { prefill, .. } => {
+                prefill.record_outcome(status_code);
+            }
             Self::Single { .. } => {
                 debug!("record_outcome_prefill called on Single worker selection, ignoring");
             }
@@ -756,7 +857,9 @@ impl WorkerSelection {
     /// Record circuit breaker outcome for decode worker only (sequential PD)
     pub fn record_outcome_decode(&self, status_code: u16) {
         match self {
-            Self::Dual { decode, .. } => decode.record_outcome(status_code),
+            Self::Disaggregated { decode, .. } => {
+                decode.record_outcome(status_code);
+            }
             Self::Single { .. } => {
                 debug!("record_outcome_decode called on Single worker selection, ignoring");
             }
@@ -764,9 +867,9 @@ impl WorkerSelection {
     }
 
     #[expect(clippy::type_complexity)]
-    pub fn dual(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
+    pub fn disaggregated_pair(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
         match self {
-            Self::Dual {
+            Self::Disaggregated {
                 prefill, decode, ..
             } => Some((prefill, decode)),
             Self::Single { .. } => None,
@@ -775,22 +878,31 @@ impl WorkerSelection {
 
     pub fn prefill_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Disaggregated { prefill, .. } => Some(prefill),
             Self::Single { .. } => None,
         }
     }
 
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Disaggregated { decode, .. } => Some(decode),
             Self::Single { .. } => None,
         }
     }
 
-    /// Get the runtime type for PD mode (from dual workers)
-    pub fn pd_runtime_type(&self) -> Option<&RuntimeType> {
+    /// Get the runtime type for disaggregated mode.
+    pub fn disaggregated_runtime_type(&self) -> Option<&RuntimeType> {
         match self {
-            Self::Dual { runtime_type, .. } => Some(runtime_type),
+            Self::Disaggregated { runtime_type, .. } => Some(runtime_type),
+            Self::Single { .. } => None,
+        }
+    }
+
+    pub fn encode_assignments(&self) -> Option<&[EncodeWorkerAssignment]> {
+        match self {
+            Self::Disaggregated {
+                encode_assignments, ..
+            } => encode_assignments.as_deref(),
             Self::Single { .. } => None,
         }
     }
@@ -802,48 +914,48 @@ impl ClientSelection {
     pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
-            Self::Dual { .. } => None,
+            Self::Disaggregated { .. } => None,
         }
     }
 
     pub fn single_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
-            Self::Dual { .. } => None,
+            Self::Disaggregated { .. } => None,
         }
     }
 
-    pub fn dual_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient)> {
+    pub fn disaggregated_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient)> {
         match self {
-            Self::Dual { prefill, decode } => Some((prefill, decode)),
+            Self::Disaggregated { prefill, decode } => Some((prefill, decode)),
             Self::Single { .. } => None,
         }
     }
 
     pub fn prefill_client(&self) -> Option<&GrpcClient> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Disaggregated { prefill, .. } => Some(prefill),
             Self::Single { .. } => None,
         }
     }
 
     pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Disaggregated { prefill, .. } => Some(prefill),
             Self::Single { .. } => None,
         }
     }
 
     pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Disaggregated { decode, .. } => Some(decode),
             Self::Single { .. } => None,
         }
     }
 
     pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Disaggregated { decode, .. } => Some(decode),
             Self::Single { .. } => None,
         }
     }
@@ -855,9 +967,11 @@ pub(crate) enum ExecutionResult {
     Single {
         stream: ProtoStream,
     },
-    Dual {
+    PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        /// PD timing context, for honest PD TTFT (prefill start to first decode token).
+        pd_timing: PdTiming,
     },
     /// Embedding requests return a single response, not a stream
     Embedding {
@@ -868,6 +982,16 @@ pub(crate) enum ExecutionResult {
     /// single-stream result — they just call `collect_responses` which returns the
     /// already-assembled `ProtoGenerateComplete` directly.
     Complete(ProtoGenerateComplete),
+}
+
+/// Timing context threaded from PD execution into the streaming layer so the
+/// first decode token can be measured against prefill start.
+#[derive(Clone)]
+pub(crate) struct PdTiming {
+    /// Monotonic instant the prefill RPC was dispatched.
+    pub prefill_start: std::time::Instant,
+    /// Backend runtime label (e.g. "sglang", "vllm") for the PD metric set.
+    pub runtime: &'static str,
 }
 
 /// Final processed response

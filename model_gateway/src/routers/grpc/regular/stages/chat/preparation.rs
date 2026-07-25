@@ -1,10 +1,10 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
 use std::sync::Arc;
-use llm_multimodal::Modality;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use llm_multimodal::Modality;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ToolChoice, ToolChoiceValue},
@@ -68,87 +68,96 @@ impl ChatPreparationStage {
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
-        // Resolve multimodal context once: placeholder token, model_id, tokenizer_source.
-        // The placeholder is passed to process_chat_messages so that string-format chat
-        // templates insert it per image instead of stripping image parts.  The remaining
-        // fields are reused by process_multimodal to avoid duplicate lookups.
-        let is_multimodal = multimodal::has_multimodal_content(&request.messages);
-        let (image_placeholder, mm_context) = if is_multimodal {
-            if let Some(mm_components) = ctx.components.multimodal.as_ref() {
-                let model_id = ctx.input.model_id.clone();
-                let entry = ctx
-                    .components
-                    .tokenizer_registry
-                    .get_by_name(&model_id)
-                    .or_else(|| ctx.components.tokenizer_registry.get_by_id(&model_id));
+        // Normalize media once. The same plan drives placeholder resolution,
+        // rendering, fetching, preprocessing, and final count validation.
+        let media_plan = multimodal::media_plan_chat(&request.messages);
+        let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
+            (None, None)
+        } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
+            let model_id = ctx.input.model_id.clone();
+            let entry = ctx
+                .components
+                .tokenizer_registry
+                .get_by_name(&model_id)
+                .or_else(|| ctx.components.tokenizer_registry.get_by_id(&model_id));
 
-                let (tokenizer_id, tokenizer_source) = match entry {
-                    Some(e) => (e.id.clone(), e.source.clone()),
-                    None => {
-                        error!(
-                            function = "ChatPreparationStage::execute",
-                            model = %model_id,
-                            "Tokenizer entry not found for multimodal processing"
-                        );
-                        return Err(error::bad_request(
-                            "multimodal_config_missing",
-                            format!("Tokenizer not found for model: {model_id}"),
-                        ));
-                    }
-                };
-
-                let placeholder = multimodal::resolve_placeholder_token(
-                    &model_id,
-                    &*tokenizer,
-                    mm_components,
-                    &tokenizer_id,
-                    &tokenizer_source,
-                    Modality::Image,
-                )
-                .await
-                .map_err(|e| {
+            let (tokenizer_id, tokenizer_source) = match entry {
+                Some(e) => (e.id.clone(), e.source.clone()),
+                None => {
                     error!(
                         function = "ChatPreparationStage::execute",
                         model = %model_id,
-                        error = %e,
-                        "Failed to resolve multimodal placeholder token"
+                        "Tokenizer entry not found for multimodal processing"
                     );
-                    error::internal_error(
-                        "multimodal_placeholder_resolution_failed",
-                        format!("Failed to resolve multimodal placeholder token: {e}"),
-                    )
-                })?;
+                    return Err(error::bad_request(
+                        "multimodal_config_missing",
+                        format!("Tokenizer not found for model: {model_id}"),
+                    ));
+                }
+            };
 
-                (
-                    placeholder,
-                    Some((
-                        Arc::clone(mm_components),
-                        model_id,
-                        tokenizer_id,
-                        tokenizer_source,
-                    )),
-                )
-            } else {
+            let placeholders = multimodal::prepare_placeholder_tokens(
+                &media_plan,
+                &model_id,
+                &*tokenizer,
+                mm_components,
+                &tokenizer_id,
+                &tokenizer_source,
+            )
+            .await
+            .map_err(|e| {
                 error!(
                     function = "ChatPreparationStage::execute",
-                    "Multimodal content detected but multimodal components not initialized"
+                    model = %model_id,
+                    error = %e,
+                    "Failed to prepare multimodal prompt plan"
                 );
-                return Err(error::bad_request(
-                    "multimodal_not_supported",
-                    "Multimodal content detected but multimodal processing is not available",
-                ));
-            }
+                error::bad_request(
+                    "invalid_multimodal_request",
+                    format!("Invalid multimodal request: {e}"),
+                )
+            })?;
+
+            (
+                Some(placeholders),
+                Some((
+                    Arc::clone(mm_components),
+                    model_id,
+                    tokenizer_id,
+                    tokenizer_source,
+                    media_plan,
+                )),
+            )
         } else {
-            (None, None)
+            error!(
+                function = "ChatPreparationStage::execute",
+                "Multimodal content detected but multimodal components not initialized"
+            );
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                "Multimodal content detected but multimodal processing is not available",
+            ));
         };
 
-        // Step 2: Attempt TITO incremental tokenization, do full tokenization if TITO fails
-        // TITO will ignore `original_text` field and only build `token_ids` field.
-        let tito_token_ids: Option<Vec<u32>> = self.try_tito(
+        // TITO always operates on unexpanded anchors. On a hit the reusable
+        // prefix is merged with only the appended messages; the complete media
+        // plan below then rebuilds bindings/tensors for every historical item.
+        let image_placeholder = placeholder_tokens
+            .as_ref()
+            .and_then(|tokens| tokens.get(Modality::Image));
+        let video_placeholder = placeholder_tokens
+            .as_ref()
+            .and_then(|tokens| tokens.get(Modality::Video));
+        let audio_placeholder = placeholder_tokens
+            .as_ref()
+            .and_then(|tokens| tokens.get(Modality::Audio));
+        let tito_token_ids = self.try_tito(
             ctx,
             body_ref.as_ref(),
             &tokenizer,
-            image_placeholder.as_deref(),
+            image_placeholder,
+            video_placeholder,
+            audio_placeholder,
         )?;
 
         let (mut token_ids, processed_messages) = if let Some(ids) = tito_token_ids {
@@ -162,10 +171,10 @@ impl ChatPreparationStage {
             )
         } else {
             // Process messages and apply chat template
-            let processed_messages = match utils::process_chat_messages(
+            let processed_messages = match utils::process_chat_messages_with_placeholders(
                 &body_ref,
                 &*tokenizer,
-                image_placeholder.as_deref(),
+                placeholder_tokens.as_ref(),
             ) {
                 Ok(msgs) => msgs,
                 Err(e) => {
@@ -175,7 +184,13 @@ impl ChatPreparationStage {
             };
 
             // Tokenize the processed text (no special tokens - chat template already handles them)
-            let encoding = match tokenizer.encode(&processed_messages.text, false) {
+            let encoding = match utils::encode_blocking(
+                tokenizer.clone(),
+                processed_messages.text.clone(),
+                false,
+            )
+            .await
+            {
                 Ok(encoding) => encoding,
                 Err(e) => {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
@@ -189,11 +204,36 @@ impl ChatPreparationStage {
             (encoding.token_ids().to_vec(), processed_messages)
         };
 
+        if let (Some(placeholders), Some((_, _, _, _, media_plan))) =
+            (placeholder_tokens.as_ref(), mm_context.as_ref())
+        {
+            multimodal::validate_rendered_media_anchors(
+                media_plan,
+                placeholders,
+                &*tokenizer,
+                &token_ids,
+            )
+            .map_err(|error| {
+                error!(
+                    function = "ChatPreparationStage::execute",
+                    %error,
+                    "Rendered multimodal anchors do not match request media"
+                );
+                error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
+            })?;
+        }
+
+        // Only multimodal processing can replace media anchors with expanded
+        // model tokens. Pure-text TITO reuses `token_ids` without a second copy.
+        let reusable_prompt_token_ids = mm_context.as_ref().map(|_| token_ids.clone());
+
         // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash)
         let mut multimodal_intermediate = None;
-        if let Some((mm_components, model_id, tokenizer_id, tokenizer_source)) = mm_context {
-            match multimodal::process_multimodal(
-                &request.messages,
+        if let Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)) =
+            mm_context
+        {
+            match multimodal::process_multimodal_plan(
+                media_plan,
                 &model_id,
                 &*tokenizer,
                 token_ids,
@@ -284,6 +324,7 @@ impl ChatPreparationStage {
         // by request_building (which .take()s preparation).
         if let Some(ref mut tc) = ctx.state.tito_context {
             tc.prompt_token_ids.clone_from(&token_ids);
+            tc.reusable_prompt_token_ids = reusable_prompt_token_ids;
         }
 
         // Store results in context
@@ -313,6 +354,8 @@ impl ChatPreparationStage {
         request: &ChatCompletionRequest,
         tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
         image_placeholder: Option<&str>,
+        video_placeholder: Option<&str>,
+        audio_placeholder: Option<&str>,
     ) -> Result<Option<Vec<u32>>, Response> {
         let store = match self.tito_store.as_ref() {
             Some(s) => s,
@@ -336,8 +379,9 @@ impl ChatPreparationStage {
             None => return Ok(None),
         };
 
-        // Read trajectory-id header (default 0 when absent or unparseable)
-        let trajectory_id: u64 = ctx
+        // Manual mode preserves the existing default-to-zero behavior. Auto mode
+        // ignores this value after prefix lookup and resolves from the live leaves.
+        let manual_trajectory_id: u64 = ctx
             .input
             .headers
             .as_ref()
@@ -348,7 +392,13 @@ impl ChatPreparationStage {
 
         let request_arc = Arc::new(request.clone());
         let messages = request.messages.as_slice();
-        let render_context = utils::get_render_context_from_request(request, image_placeholder).map_err(|e| {
+        let render_context = utils::get_render_context_from_request(request, image_placeholder).map(|context| {
+            context.with_media_placeholders(
+                image_placeholder.map(String::from),
+                video_placeholder.map(String::from),
+                audio_placeholder.map(String::from),
+            )
+        }).map_err(|e| {
             error!(function = "ChatPreparationStage::try_tito", error = %e, "Failed to build TITO render context");
             error::bad_request("tito_render_context_failed", e)
         })?;
@@ -360,26 +410,36 @@ impl ChatPreparationStage {
             "TITO find_prefix: assistants diagnostic"
         );
 
-        let lookup: PrefixLookup = match store.find_prefix_with_lookup(
-            &session_id,
-            messages,
-            &render_context,
-        ) {
-            Ok(lookup) => lookup,
-            Err(e) => {
-                warn!(session_id = %session_id, error = %e, "TITO find_prefix error");
-                return Err(error::bad_request(
-                    "tito_invalid_appended_messages",
-                    e.to_string(),
-                ));
-            }
-        };
+        let lookup: PrefixLookup =
+            match store.find_prefix_with_lookup(&session_id, messages, &render_context) {
+                Ok(lookup) => lookup,
+                Err(e) => {
+                    warn!(session_id = %session_id, error = %e, "TITO find_prefix error");
+                    return Err(error::bad_request(
+                        "tito_invalid_appended_messages",
+                        e.to_string(),
+                    ));
+                }
+            };
 
         // Stash the running hasher state and parent hash into the TITO context
         // so the response stage can derive the leaf hash by extending this
         // hasher with the new assistant message.
         let running_hasher = lookup.running_hasher.clone();
         let parent_hash = lookup.parent_hash;
+
+        let resolved_trajectory = store
+            .resolve_trajectory_id(&session_id, manual_trajectory_id, parent_hash)
+            .map_err(|e| {
+                error!(
+                    function = "ChatPreparationStage::try_tito",
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to resolve TITO trajectory ID"
+                );
+                error::internal_error("tito_trajectory_id_resolution_failed", e.to_string())
+            })?;
+        let trajectory_id = resolved_trajectory.trajectory_id;
 
         ctx.state.tito_context = Some(TitoRequestContext {
             session_id: session_id.clone(),
@@ -388,7 +448,9 @@ impl ChatPreparationStage {
             is_tito_hit: false,
             matched_message_num: 0,
             trajectory_id,
+            trajectory_id_reservation: resolved_trajectory.reservation,
             prompt_token_ids: Vec::new(),
+            reusable_prompt_token_ids: None,
             running_hasher,
             parent_hash,
         });
@@ -396,10 +458,10 @@ impl ChatPreparationStage {
         // The gateway picks `prompt_start` for every turn from the
         // trajectory's RE offset store, so each turn captures only
         // the *new* token positions appended since the previous turn.
-        let re_prompt_start =
-            store.next_routed_experts_prompt_start(&session_id, trajectory_id);
-        ctx.state.partial_rollout_overrides.routed_experts_prompt_start =
-            Some(re_prompt_start);
+        let re_prompt_start = store.next_routed_experts_prompt_start(&session_id, trajectory_id);
+        ctx.state
+            .partial_rollout_overrides
+            .routed_experts_prompt_start = Some(re_prompt_start);
 
         let prefix_match = match lookup.matched {
             Some(pm) => {

@@ -54,95 +54,29 @@ pub struct QwenXmlParser {
     xml_param_pattern: Regex,
 }
 
-/// Decode HTML entities in a string (equivalent to Python's html.unescape)
+/// Parse a raw parameter value, similar to Python's `_safe_val`.
 ///
-/// Handles common HTML entities like &amp; &lt; &gt; &quot; &#39; and numeric entities
-fn html_unescape(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '&' {
-            let mut entity = String::new();
-            let mut consumed_semicolon = false;
-            while let Some(&next) = chars.peek() {
-                if next == ';' {
-                    chars.next();
-                    consumed_semicolon = true;
-                    break;
-                }
-                if next.is_alphanumeric() || next == '#' {
-                    // Safe: peek() returned Some, so next() will too
-                    if let Some(ch) = chars.next() {
-                        entity.push(ch);
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            let decoded = match entity.as_str() {
-                "amp" => "&",
-                "lt" => "<",
-                "gt" => ">",
-                "quot" => "\"",
-                "apos" => "'",
-                "nbsp" => "\u{00A0}",
-                s if s.starts_with('#') => {
-                    let num_str = &s[1..];
-                    let code_point = if num_str.starts_with('x') || num_str.starts_with('X') {
-                        u32::from_str_radix(&num_str[1..], 16).ok()
-                    } else {
-                        num_str.parse::<u32>().ok()
-                    };
-                    if let Some(cp) = code_point {
-                        if let Some(ch) = char::from_u32(cp) {
-                            result.push(ch);
-                            continue;
-                        }
-                    }
-                    // Invalid numeric entity, reconstruct original
-                    result.push('&');
-                    result.push_str(&entity);
-                    if consumed_semicolon {
-                        result.push(';');
-                    }
-                    continue;
-                }
-                _ => {
-                    // Unknown entity, reconstruct original
-                    result.push('&');
-                    result.push_str(&entity);
-                    if consumed_semicolon {
-                        result.push(';');
-                    }
-                    continue;
-                }
-            };
-            result.push_str(decoded);
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-/// Parse a raw parameter value, similar to Python's _safe_val
+/// Argument values are treated **literally** — no HTML-entity decoding. This
+/// matches Qwen's own official API (DashScope), verified for both Qwen3-Coder
+/// and Qwen3.5: a tool argument whose value contains `&amp;`, `&lt;`, `&#39;`
+/// is returned with those entities intact. The Qwen XML tool format is not
+/// HTML-escaped on render either (the chat template emits values via
+/// `| tojson | safe` / `| string`), so parsing must not unescape it. vLLM's
+/// `Qwen3CoderToolParser`, SGLang's `qwen3_coder_detector`, and Qwen-Agent all
+/// agree, passing argument values through verbatim.
 ///
-/// 1. Decode HTML entities
-/// 2. Try to parse as JSON (numbers, booleans, null, objects, arrays)
-/// 3. Fall back to string if JSON parsing fails
+/// 1. Try to parse as JSON (numbers, booleans, null, objects, arrays)
+/// 2. Fall back to string if JSON parsing fails
 fn safe_val(raw: &str) -> Value {
-    let unescaped = html_unescape(raw.trim());
+    let trimmed = raw.trim();
 
     // Try JSON parsing first
-    if let Ok(v) = serde_json::from_str::<Value>(&unescaped) {
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         return v;
     }
 
     // Handle Python-style literals (True, False, None)
-    match unescaped.as_str() {
+    match trimmed {
         "True" => return Value::Bool(true),
         "False" => return Value::Bool(false),
         "None" => return Value::Null,
@@ -150,7 +84,17 @@ fn safe_val(raw: &str) -> Value {
     }
 
     // Fall back to string
-    Value::String(unescaped)
+    Value::String(trimmed.to_string())
+}
+
+/// Coerce an XML parameter value by its declared schema type, falling back to
+/// [`safe_val`] inference when the type is unknown.
+///
+/// Values are treated literally; see [`safe_val`] for why the format is not
+/// HTML-unescaped.
+fn coerce_value(raw: &str, declared_type: Option<&str>) -> Value {
+    let trimmed = raw.trim();
+    helpers::coerce_by_schema_type(trimmed, declared_type).unwrap_or_else(|| safe_val(raw))
 }
 
 impl QwenXmlParser {
@@ -188,7 +132,7 @@ impl QwenXmlParser {
     }
 
     /// Parse XML format tool call: <function=name><parameter=key>value</parameter></function>
-    fn parse_xml_format(&self, content: &str) -> ParserResult<Option<ToolCall>> {
+    fn parse_xml_format(&self, content: &str, tools: &[Tool]) -> ParserResult<Option<ToolCall>> {
         let function_captures = self
             .xml_function_pattern
             .captures(content)
@@ -205,13 +149,14 @@ impl QwenXmlParser {
             return Ok(None);
         }
 
+        let param_types = helpers::param_types_for_function(tools, &function_name);
         let mut parameters = serde_json::Map::new();
 
         for cap in self.xml_param_pattern.captures_iter(content) {
             if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                 let key = key_match.as_str().trim().to_string();
                 let value = value_match.as_str();
-                let json_value = safe_val(value);
+                let json_value = coerce_value(value, param_types.get(&key).map(String::as_str));
                 parameters.insert(key, json_value);
             }
         }
@@ -229,8 +174,9 @@ impl QwenXmlParser {
 
     /// Parse and stream complete parameters from buffer
     /// Returns tool call items to emit (similar to Python's _parse_and_stream_parameters)
-    fn parse_and_stream_parameters(&mut self) -> Vec<ToolCallItem> {
+    fn parse_and_stream_parameters(&mut self, tools: &[Tool]) -> Vec<ToolCallItem> {
         let mut calls: Vec<ToolCallItem> = vec![];
+        let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
 
         // Find all complete parameter patterns in buffer
         let mut new_params = serde_json::Map::new();
@@ -238,7 +184,7 @@ impl QwenXmlParser {
             if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                 let key = key_match.as_str().trim().to_string();
                 let value = value_match.as_str();
-                let json_value = safe_val(value);
+                let json_value = coerce_value(value, param_types.get(&key).map(String::as_str));
                 new_params.insert(key, json_value);
             }
         }
@@ -305,6 +251,49 @@ impl QwenXmlParser {
         calls
     }
 
+    /// Shared non-streaming parse, schema-aware when `tools` are provided.
+    fn parse_complete_inner(
+        &self,
+        text: &str,
+        tools: &[Tool],
+    ) -> ParserResult<(String, Vec<ToolCall>)> {
+        // Check if text contains Qwen XML format
+        if !self.has_tool_markers(text) {
+            return Ok((text.to_string(), vec![]));
+        }
+
+        // Find where the first tool call begins
+        // Safe: has_tool_markers() already confirmed the marker exists
+        let idx = text
+            .find(self.tool_call_start_token)
+            .ok_or_else(|| ParserError::ParsingFailed("tool call marker not found".to_string()))?;
+        let normal_text = text[..idx].to_string();
+
+        // Extract tool calls
+        let mut parsed = Vec::new();
+        for captures in self.extractor.captures_iter(text) {
+            if let Some(content_str) = captures.get(1) {
+                let content = content_str.as_str().trim();
+
+                match self.parse_xml_format(content, tools) {
+                    Ok(Some(tool)) => parsed.push(tool),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse XML tool call: {:?}", e);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // If no tools were successfully parsed despite having markers, return entire text
+        if parsed.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
+
+        Ok((normal_text, parsed))
+    }
+
     /// Reset streaming state for next tool call
     fn reset_streaming_state(&mut self) {
         self.in_tool_call = false;
@@ -323,41 +312,15 @@ impl Default for QwenXmlParser {
 #[async_trait]
 impl ToolParser for QwenXmlParser {
     async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
-        // Check if text contains Qwen XML format
-        if !self.has_tool_markers(text) {
-            return Ok((text.to_string(), vec![]));
-        }
+        self.parse_complete_inner(text, &[])
+    }
 
-        // Find where the first tool call begins
-        // Safe: has_tool_markers() already confirmed the marker exists
-        let idx = text
-            .find(self.tool_call_start_token)
-            .ok_or_else(|| ParserError::ParsingFailed("tool call marker not found".to_string()))?;
-        let normal_text = text[..idx].to_string();
-
-        // Extract tool calls
-        let mut tools = Vec::new();
-        for captures in self.extractor.captures_iter(text) {
-            if let Some(content_str) = captures.get(1) {
-                let content = content_str.as_str().trim();
-
-                match self.parse_xml_format(content) {
-                    Ok(Some(tool)) => tools.push(tool),
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::warn!("Failed to parse XML tool call: {:?}", e);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // If no tools were successfully parsed despite having markers, return entire text
-        if tools.is_empty() {
-            return Ok((text.to_string(), vec![]));
-        }
-
-        Ok((normal_text, tools))
+    async fn parse_complete_with_tools(
+        &self,
+        text: &str,
+        tools: &[Tool],
+    ) -> ParserResult<(String, Vec<ToolCall>)> {
+        self.parse_complete_inner(text, tools)
     }
 
     async fn parse_incremental(
@@ -459,7 +422,7 @@ impl ToolParser for QwenXmlParser {
 
             // Parse parameters (only complete ones)
             if self.current_tool_name_sent {
-                let param_calls = self.parse_and_stream_parameters();
+                let param_calls = self.parse_and_stream_parameters(tools);
                 calls.extend(param_calls);
 
                 // Check if tool call is complete
@@ -520,41 +483,9 @@ impl ToolParser for QwenXmlParser {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::common::Function;
+
     use super::*;
-
-    #[test]
-    fn test_html_unescape_basic() {
-        assert_eq!(html_unescape("&amp;"), "&");
-        assert_eq!(html_unescape("&lt;"), "<");
-        assert_eq!(html_unescape("&gt;"), ">");
-        assert_eq!(html_unescape("&quot;"), "\"");
-        assert_eq!(html_unescape("&apos;"), "'");
-    }
-
-    #[test]
-    fn test_html_unescape_numeric() {
-        assert_eq!(html_unescape("&#60;"), "<");
-        assert_eq!(html_unescape("&#x3C;"), "<");
-        assert_eq!(html_unescape("&#x3c;"), "<");
-    }
-
-    #[test]
-    fn test_html_unescape_mixed() {
-        assert_eq!(
-            html_unescape("Hello &amp; World &lt;tag&gt;"),
-            "Hello & World <tag>"
-        );
-    }
-
-    #[test]
-    fn test_html_unescape_unknown() {
-        // Unknown entities with semicolon should be preserved as-is
-        assert_eq!(html_unescape("&unknown;"), "&unknown;");
-        // Unterminated entities should NOT have semicolon added
-        assert_eq!(html_unescape("&foo bar"), "&foo bar");
-        assert_eq!(html_unescape("&"), "&");
-        assert_eq!(html_unescape("& "), "& ");
-    }
 
     #[test]
     fn test_safe_val_json() {
@@ -586,12 +517,123 @@ mod tests {
         assert_eq!(safe_val("  spaces  "), Value::String("spaces".to_string()));
     }
 
+    // Values are treated literally: entity-like substrings must NOT be decoded
+    // (parity with Qwen's official API, which returns them intact).
     #[test]
-    fn test_safe_val_html_entities() {
-        assert_eq!(safe_val("&lt;div&gt;"), Value::String("<div>".to_string()));
+    fn test_safe_val_preserves_html_entities() {
+        assert_eq!(
+            safe_val("&lt;div&gt;"),
+            Value::String("&lt;div&gt;".to_string())
+        );
         assert_eq!(
             safe_val("Tom &amp; Jerry"),
-            Value::String("Tom & Jerry".to_string())
+            Value::String("Tom &amp; Jerry".to_string())
         );
+        // Numeric/hex entities are likewise left untouched.
+        assert_eq!(safe_val("it&#39;s"), Value::String("it&#39;s".to_string()));
+        assert_eq!(safe_val("&#x3C;"), Value::String("&#x3C;".to_string()));
+    }
+
+    fn tool_with_props(props: Value) -> Vec<Tool> {
+        vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "f".to_string(),
+                description: None,
+                parameters: serde_json::json!({"type": "object", "properties": props}),
+                strict: None,
+            },
+        }]
+    }
+
+    // String-typed params stay strings even when they look numeric/bool/array/object.
+    #[tokio::test]
+    async fn test_schema_aware_coercion_keeps_strings() {
+        let tools = tool_with_props(serde_json::json!({
+            "limit": {"type": "string"},
+            "flag": {"type": "string"},
+            "coords": {"type": "string"},
+            "cfg": {"type": "string"},
+            "count": {"type": "integer"},
+        }));
+        let text = "<tool_call>\n<function=f>\n\
+            <parameter=limit>4</parameter>\n\
+            <parameter=flag>true</parameter>\n\
+            <parameter=coords>[60,30]</parameter>\n\
+            <parameter=cfg>{\"a\": 1}</parameter>\n\
+            <parameter=count>5</parameter>\n\
+            </function>\n</tool_call>";
+        let (_, calls) = QwenXmlParser::new()
+            .parse_complete_with_tools(text, &tools)
+            .await
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["limit"], Value::String("4".to_string()));
+        assert_eq!(args["flag"], Value::String("true".to_string()));
+        assert_eq!(args["coords"], Value::String("[60,30]".to_string()));
+        assert_eq!(args["cfg"], Value::String("{\"a\": 1}".to_string()));
+        assert_eq!(args["count"], Value::Number(5.into()));
+    }
+
+    // The streaming path threads `tools` separately, so cover it too.
+    #[tokio::test]
+    async fn test_streaming_schema_aware_coercion() {
+        let tools = tool_with_props(serde_json::json!({
+            "limit": {"type": "string"},
+            "count": {"type": "integer"},
+        }));
+        let text = "<tool_call>\n<function=f>\n\
+            <parameter=limit>4</parameter>\n\
+            <parameter=count>5</parameter>\n\
+            </function>\n</tool_call>";
+        let result = QwenXmlParser::new()
+            .parse_incremental(text, &tools)
+            .await
+            .unwrap();
+        let args: String = result.calls.iter().map(|c| c.parameters.as_str()).collect();
+        assert!(
+            args.contains(r#""limit": "4""#),
+            "string param must stay string: {args}"
+        );
+        assert!(
+            args.contains(r#""count": 5"#),
+            "int param must coerce: {args}"
+        );
+    }
+
+    // Golden conformance test (regression guard for #1888): a tool argument
+    // whose value contains HTML entities must round-trip UNCHANGED, matching
+    // Qwen's official API (verified on Qwen3-Coder and Qwen3.5). Covers both the
+    // schema-typed `string` path and the schema-less inference fallback.
+    #[tokio::test]
+    async fn test_arg_values_with_entities_roundtrip_unchanged() {
+        let literal = "<a>Tom &amp; Jerry</a> &lt;x&gt; it&#39;s";
+
+        // Function name matches `tool_with_props` (`f`) so the schema-typed
+        // branch below actually resolves the `content` param's type.
+        let text = format!(
+            "<tool_call>\n<function=f>\n\
+             <parameter=content>\n{literal}\n</parameter>\n\
+             </function>\n</tool_call>"
+        );
+
+        // Schema-less inference path (`safe_val`): not valid JSON -> stays a
+        // literal string with entities intact.
+        let (_, calls) = QwenXmlParser::new().parse_complete(&text).await.unwrap();
+        assert_eq!(calls.len(), 1);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["content"], Value::String(literal.to_string()));
+
+        // Schema-typed `string` path (`coerce_value` -> `coerce_by_schema_type`).
+        let tools = tool_with_props(serde_json::json!({
+            "content": {"type": "string"},
+        }));
+        let (_, calls) = QwenXmlParser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["content"], Value::String(literal.to_string()));
     }
 }

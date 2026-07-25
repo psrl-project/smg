@@ -2,8 +2,11 @@ use llm_tokenizer::{chat_template::ChatTemplateParams, traits::Tokenizer};
 use openai_protocol::chat::{ChatMessage, MessageContent};
 
 use crate::{
-    error::TitoError, model_adapter::ModelAdapter, normalizer::RenderContext, store::PrefixMatch,
-    validator::messages_to_template_values,
+    error::TitoError,
+    model_adapter::ModelAdapter,
+    normalizer::RenderContext,
+    store::PrefixMatch,
+    validator::{messages_to_template_values, messages_to_template_values_with_context},
 };
 
 pub struct TitoEngine;
@@ -152,12 +155,9 @@ fn tokenize_segment_incremental(
 
     let mut full_msgs = base;
     full_msgs.extend_from_slice(segment);
-    let full_values = messages_to_template_values(
-        &full_msgs,
-        content_format,
-        render_context.image_placeholder_ref(),
-    )
-    .map_err(|e| TitoError::EngineFailed(format!("serialize full: {e}")))?;
+    let full_values =
+        messages_to_template_values_with_context(&full_msgs, content_format, render_context)
+            .map_err(|e| TitoError::EngineFailed(format!("serialize full: {e}")))?;
     let full_params = ChatTemplateParams {
         add_generation_prompt,
         tools: render_context.tools_ref(),

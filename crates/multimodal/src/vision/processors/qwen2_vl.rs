@@ -21,7 +21,7 @@ use std::ops::Deref;
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase};
+use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{PreprocessedEncoderInputs, VisionPreProcessor},
@@ -84,6 +84,9 @@ impl Qwen2VLProcessor {
                 merge_size: DEFAULT_MERGE_SIZE,
                 min_pixels: DEFAULT_MIN_PIXELS,
                 max_pixels: DEFAULT_MAX_PIXELS,
+                video_min_pixels: DEFAULT_MIN_PIXELS,
+                video_max_pixels: DEFAULT_MAX_PIXELS,
+                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -106,6 +109,9 @@ impl Qwen2VLProcessor {
                 merge_size,
                 min_pixels,
                 max_pixels,
+                video_min_pixels: min_pixels,
+                video_max_pixels: max_pixels,
+                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -122,6 +128,9 @@ impl Qwen2VLProcessor {
                 merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
                 min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
                 max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
+                video_min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
+                video_max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
+                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size: config
                     .temporal_patch_size
                     .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
@@ -135,13 +144,7 @@ impl Qwen2VLProcessor {
     /// Build the effective processor for a request, applying any structural
     /// overrides from `config`; otherwise reuse the existing defaults.
     fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.patch_size.is_some()
-            || config.merge_size.is_some()
-            || config.min_pixels.is_some()
-            || config.max_pixels.is_some()
-            || config.temporal_patch_size.is_some()
-            || config.size.is_some()
-        {
+        if config.has_structural_overrides() {
             Self::from_preprocessor_config(config)
         } else {
             self.clone()

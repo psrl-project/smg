@@ -6,4 +6,6 @@ pub enum TitoError {
     AssistantInAppended,
     #[error("incremental tokenization failed: {0}")]
     EngineFailed(String),
+    #[error("automatic trajectory ID space is exhausted")]
+    TrajectoryIdExhausted,
 }

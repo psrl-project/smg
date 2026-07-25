@@ -73,10 +73,10 @@ impl TokenSeqValidator {
         render_context: &RenderContext,
     ) -> Vec<MismatchEntry> {
         // Build canonical token IDs via chat-template rendering + encoding.
-        let values = match messages_to_template_values(
+        let values = match messages_to_template_values_with_context(
             messages,
             self.tokenizer.chat_template_content_format(),
-            render_context.image_placeholder_ref(),
+            render_context,
         ) {
             Ok(v) => v,
             Err(_) => return vec![],
@@ -350,13 +350,26 @@ pub(crate) fn messages_to_template_values(
     content_format: ChatTemplateContentFormat,
     image_placeholder: Option<&str>,
 ) -> Result<Vec<Value>, serde_json::Error> {
+    let context = RenderContext::new(None, None).with_media_placeholders(
+        image_placeholder.map(String::from),
+        None,
+        None,
+    );
+    messages_to_template_values_with_context(messages, content_format, &context)
+}
+
+pub(crate) fn messages_to_template_values_with_context(
+    messages: &[ChatMessage],
+    content_format: ChatTemplateContentFormat,
+    render_context: &RenderContext,
+) -> Result<Vec<Value>, serde_json::Error> {
     let mut values = messages
         .iter()
         .map(|message| {
             let mut value = serde_json::to_value(message)?;
             if let Some(obj) = value.as_object_mut() {
                 if let Some(content_value) = obj.get_mut("content") {
-                    transform_content_field(content_value, content_format, image_placeholder);
+                    transform_content_field(content_value, content_format, render_context);
                 }
             }
             Ok(value)
@@ -369,7 +382,7 @@ pub(crate) fn messages_to_template_values(
 fn transform_content_field(
     content_value: &mut Value,
     content_format: ChatTemplateContentFormat,
-    image_placeholder: Option<&str>,
+    render_context: &RenderContext,
 ) {
     let Some(content_array) = content_value.as_array() else {
         return;
@@ -387,7 +400,10 @@ fn transform_content_field(
                         // Inject the model-specific placeholder (e.g. "<|image|>") when
                         // available; otherwise silently drop the image part (pre-existing
                         // behavior, only reached in non-multimodal or legacy contexts).
-                        "image_url" => image_placeholder.map(String::from),
+                        "image_url" | "image" | "input_image" | "video_url" | "video"
+                        | "audio_url" | "audio" | "input_audio" => render_context
+                            .placeholder_for_part_type(type_str)
+                            .map(String::from),
                         _ => None,
                     }
                 })
@@ -618,6 +634,47 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(content_with_ph, "describe this <|image|>");
+    }
+
+    #[test]
+    fn string_format_injects_all_modality_placeholders() {
+        use openai_protocol::{
+            chat::{ChatMessage, MessageContent},
+            common::{AudioUrl, ContentPart, ImageUrl, VideoUrl},
+        };
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "image".into(),
+                        detail: None,
+                    },
+                },
+                ContentPart::VideoUrl {
+                    video_url: VideoUrl {
+                        url: "video".into(),
+                    },
+                },
+                ContentPart::AudioUrl {
+                    audio_url: AudioUrl {
+                        url: "audio".into(),
+                    },
+                },
+            ]),
+            name: None,
+        }];
+        let context = RenderContext::new(None, None).with_media_placeholders(
+            Some("<image>".into()),
+            Some("<video>".into()),
+            Some("<audio>".into()),
+        );
+        let values = messages_to_template_values_with_context(
+            &messages,
+            ChatTemplateContentFormat::String,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(values[0]["content"], "<image> <video> <audio>");
     }
 
     #[test]

@@ -31,6 +31,14 @@ class TestRouterConfigValidation:
         assert args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert args.policy == "cache_aware"
 
+    @patch("smg.router._Router")
+    def test_trajectory_id_strategy_is_forwarded_to_rust(self, rust_router):
+        from smg.router import Router
+
+        Router.from_args(RouterArgs(trajectory_id_strategy="auto"))
+
+        assert rust_router.call_args.kwargs["trajectory_id_strategy"] == "auto"
+
     def test_valid_pd_config(self):
         """Test that a valid PD configuration passes validation."""
         args = RouterArgs(

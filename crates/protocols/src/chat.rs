@@ -182,6 +182,9 @@ pub struct ChatCompletionRequest {
     /// Output types that you would like the model to generate for this request
     pub modalities: Option<Vec<String>>,
 
+    /// Whether to return audio output.
+    pub return_audio: Option<bool>,
+
     /// How many chat completion choices to generate for each input message
     #[validate(range(min = 1, max = 10))]
     pub n: Option<u32>,
@@ -259,7 +262,7 @@ pub struct ChatCompletionRequest {
     pub min_p: Option<f32>,
 
     /// Minimum number of tokens to generate
-    #[validate(range(min = 1))]
+    #[validate(range(min = 0))]
     pub min_tokens: Option<u32>,
 
     /// Repetition penalty for reducing repetitive text
@@ -318,6 +321,25 @@ pub struct ChatCompletionRequest {
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+/// Map an OpenAI `reasoning_effort` to a thinking on/off preference.
+///
+/// This is the protocol-level interpretation of "does the caller want
+/// reasoning?" — independent of any model/template. `reasoning_effort` is a
+/// *level* (`"low"`/`"medium"`/`"high"`) plus the vendor-extension `"none"`.
+///
+/// Both `"none"` and `"minimal"` map to thinking OFF (`Some(false)`).
+/// `"minimal"` is treated as an off-signal deliberately: templates that expose
+/// only a boolean thinking toggle (GLM/Qwen3) cannot do "a little" reasoning,
+/// so the lowest OpenAI level is the closest available "do not reason".
+/// Level values return `None` — no opinion, defer to the template default or an
+/// explicit thinking kwarg.
+pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<bool> {
+    match reasoning_effort {
+        Some("none") | Some("minimal") => Some(false),
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -756,4 +778,56 @@ pub struct ChatStreamChoice {
     /// intermediate chunks always have `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routed_experts: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::{thinking_from_reasoning_effort, ChatCompletionRequest};
+
+    fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let object = value.as_object_mut().expect("request must be an object");
+        for (name, field_value) in fields {
+            object.insert((*name).to_string(), field_value.clone());
+        }
+        serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    #[test]
+    fn thinking_from_reasoning_effort_maps_disable_values() {
+        // "none"/"minimal" mean do-not-reason -> thinking OFF.
+        assert_eq!(thinking_from_reasoning_effort(Some("none")), Some(false));
+        assert_eq!(thinking_from_reasoning_effort(Some("minimal")), Some(false));
+        // Level values do not toggle thinking on their own.
+        assert_eq!(thinking_from_reasoning_effort(Some("low")), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("medium")), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("high")), None);
+        // Unspecified / unknown -> defer.
+        assert_eq!(thinking_from_reasoning_effort(None), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("bogus")), None);
+    }
+
+    #[test]
+    fn return_audio_preserves_explicit_values() {
+        for fields in [vec![], vec![("return_audio", Value::Null)]] {
+            let request = request_with_output_fields(&fields);
+            assert_eq!(request.return_audio, None);
+            assert!(!request.other.contains_key("return_audio"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert!(serialized.get("return_audio").is_none());
+        }
+
+        for value in [false, true] {
+            let request = request_with_output_fields(&[("return_audio", json!(value))]);
+            assert_eq!(request.return_audio, Some(value));
+            assert!(!request.other.contains_key("return_audio"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert_eq!(serialized.get("return_audio"), Some(&Value::Bool(value)));
+        }
+    }
 }

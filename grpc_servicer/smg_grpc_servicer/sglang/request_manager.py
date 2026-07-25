@@ -31,7 +31,6 @@ from sglang.srt.managers.io_struct import (
     ProfileReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    WatchLoadUpdateReq,
 )
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -662,19 +661,25 @@ class GrpcRequestManager:
                 state.time_stats.set_last_time()
 
             # Extract output for this request
+            prompt_tokens = batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
+            completion_tokens = batch_out.completion_tokens[i] if batch_out.completion_tokens else 0
+            cached_tokens = batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
+            reasoning_tokens_list = getattr(batch_out, "reasoning_tokens", None)
+            reasoning_tokens = reasoning_tokens_list[i] if reasoning_tokens_list else 0
+            token_ids = batch_out.output_ids[i] if batch_out.output_ids else []
+            finished = batch_out.finished_reasons[i] is not None
+            finish_reason = batch_out.finished_reasons[i] if batch_out.finished_reasons[i] else None
+
             output_data = {
                 "request_id": rid,
-                "token_ids": batch_out.output_ids[i] if batch_out.output_ids else [],
-                "finished": batch_out.finished_reasons[i] is not None,
+                "token_ids": token_ids,
+                "finished": finished,
                 "meta_info": {
-                    "prompt_tokens": (batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0),
-                    "completion_tokens": (
-                        batch_out.completion_tokens[i] if batch_out.completion_tokens else 0
-                    ),
-                    "cached_tokens": (batch_out.cached_tokens[i] if batch_out.cached_tokens else 0),
-                    "finish_reason": (
-                        batch_out.finished_reasons[i] if batch_out.finished_reasons[i] else None
-                    ),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cached_tokens": cached_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                    "finish_reason": finish_reason,
                 },
             }
 
@@ -757,17 +762,6 @@ class GrpcRequestManager:
                         del self.rid_to_state[request_id]
 
                 cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
-
-        # Forward load info to DataParallelController for token-aware balancing.
-        # Mirrors TokenizerManager._handle_batch_output logic: when dp_size > 1,
-        # each scheduler piggybacks its load (num_reqs, num_tokens) on batch output.
-        # Without this, DPBudget stays at zero and total_tokens/total_requests
-        # policies degenerate to always picking rank 0.
-        if self.server_args.dp_size > 1 and batch_out.load is not None:
-            try:
-                await self._send_to_scheduler(WatchLoadUpdateReq(loads=[batch_out.load]))
-            except Exception as e:
-                logger.warning("Failed to forward DP load update: %s", e)
 
         # Execute all queue.put() operations in parallel
         if put_tasks:

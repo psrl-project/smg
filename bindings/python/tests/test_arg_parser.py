@@ -44,6 +44,7 @@ class TestRouterArgs:
         assert args.disable_retries is False
         assert args.disable_circuit_breaker is False
         assert args.mesh_advertise_host is None
+        assert args.trajectory_id_strategy == "manual"
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
@@ -115,6 +116,17 @@ class TestRouterArgs:
         # Test invalid bootstrap port
         with pytest.raises(ValueError, match="Invalid bootstrap port"):
             RouterArgs._parse_prefill_urls([["http://prefill1:8000", "invalid"]])
+
+    def test_parse_encode_urls_valid(self):
+        """Test parsing valid encode URL arguments."""
+        result = RouterArgs._parse_encode_urls([["http://encode1:8000", "9000"]])
+        assert result == [("http://encode1:8000", 9000)]
+
+        result = RouterArgs._parse_encode_urls([["http://encode1:8000", "none"]])
+        assert result == [("http://encode1:8000", None)]
+
+        result = RouterArgs._parse_encode_urls([["http://encode1:8000"]])
+        assert result == [("http://encode1:8000", None)]
 
     def test_parse_decode_urls_valid(self):
         """Test parsing valid decode URL arguments."""
@@ -497,6 +509,15 @@ class TestParseRouterArgs:
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
 
+    def test_parse_trajectory_id_strategy(self):
+        router_args = parse_router_args(["--trajectory-id-strategy", "auto"])
+
+        assert router_args.trajectory_id_strategy == "auto"
+
+    def test_reject_invalid_trajectory_id_strategy(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--trajectory-id-strategy", "invalid"])
+
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [
@@ -526,6 +547,42 @@ class TestParseRouterArgs:
         ]
         assert router_args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert router_args.prefill_policy == "power_of_two"
+        assert router_args.decode_policy == "round_robin"
+
+    def test_parse_epd_args(self):
+        """Test parsing EPD disaggregated mode arguments."""
+        args = [
+            "--epd-disaggregation",
+            "--encode",
+            "http://encode1:8000",
+            "9000",
+            "--encode",
+            "http://encode2:8000",
+            "none",
+            "--prefill",
+            "http://prefill1:8000",
+            "9001",
+            "--decode",
+            "http://decode1:8001",
+            "--encode-policy",
+            "consistent_hashing",
+            "--prefill-policy",
+            "cache_aware",
+            "--decode-policy",
+            "round_robin",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.epd_disaggregation is True
+        assert router_args.encode_urls == [
+            ("http://encode1:8000", 9000),
+            ("http://encode2:8000", None),
+        ]
+        assert router_args.prefill_urls == [("http://prefill1:8000", 9001)]
+        assert router_args.decode_urls == ["http://decode1:8001"]
+        assert router_args.encode_policy == "consistent_hashing"
+        assert router_args.prefill_policy == "cache_aware"
         assert router_args.decode_policy == "round_robin"
 
     def test_parse_pd_args_with_new_policies(self):

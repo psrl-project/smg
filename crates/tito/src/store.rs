@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -8,7 +10,7 @@ use std::{
 
 use dashmap::DashMap;
 use openai_protocol::chat::ChatMessage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     error::TitoError,
@@ -18,14 +20,73 @@ use crate::{
     },
 };
 
+/// Controls how TITO assigns a trajectory identifier to each request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrajectoryIdStrategy {
+    /// Read `x-smg-tito-trajectory-id` from the request (defaulting to 0).
+    #[default]
+    Manual,
+    /// Continue a matching live leaf, or allocate the next session-local ID.
+    Auto,
+}
+
+impl fmt::Display for TrajectoryIdStrategy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        })
+    }
+}
+
+impl FromStr for TrajectoryIdStrategy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "auto" => Ok(Self::Auto),
+            _ => Err(format!(
+                "invalid trajectory ID strategy '{value}'; expected manual or auto"
+            )),
+        }
+    }
+}
+
 /// A content-addressed tree node stored per session.
 pub struct PrefixEntry {
     /// Concatenation of prompt_token_ids + output_ids from the backend response.
     pub token_ids: Arc<Vec<u32>>,
+    /// Same conversation prefix before multimodal anchor expansion, when it
+    /// differs from `token_ids`. Pure-text entries reuse `token_ids` directly.
+    pub reusable_prefix_token_ids: Option<Arc<Vec<u32>>>,
     /// Hash of the parent prefix (None for Turn 1 root children).
     pub parent_hash: Option<PrefixHash>,
     /// Metadata for the assistant turn that produced this node.
     pub turn_record: TurnRecord,
+}
+
+/// Token representations stored for one TITO node.
+pub struct StoredTokenSequences {
+    expanded: Vec<u32>,
+    reusable: Option<Vec<u32>>,
+}
+
+impl StoredTokenSequences {
+    fn shared(token_ids: Vec<u32>) -> Self {
+        Self {
+            expanded: token_ids,
+            reusable: None,
+        }
+    }
+
+    /// Keep a distinct reusable sequence only when multimodal expansion
+    /// actually changed the token IDs.
+    pub fn with_reusable(expanded: Vec<u32>, reusable: Vec<u32>) -> Self {
+        let reusable = (expanded != reusable).then_some(reusable);
+        Self { expanded, reusable }
+    }
 }
 
 /// Internal session state managed behind a Mutex.
@@ -41,13 +102,15 @@ pub(crate) struct SessionState {
     pub leaf_hashes: HashSet<PrefixHash>,
     /// Maps `trajectory_id → current leaf hash` for each live trajectory in this session.
     ///
-    /// Trajectory IDs are caller-supplied u64 values (0 is the default).  Each write
-    /// (`store`) for a given trajectory ID advances the pointer to the newly-stored
-    /// node.  After updating, any `leaf_hashes` entry that is no longer reachable from
-    /// this map is eligible for GC.
+    /// In manual mode IDs are caller-supplied (0 by default); in auto mode they are
+    /// assigned from prefix matches. Each `store` advances the selected pointer to
+    /// the newly stored node. After updating, any `leaf_hashes` entry no longer
+    /// reachable from this map is eligible for GC.
     pub trajectory_leaves: HashMap<u64, PrefixHash>,
     /// Per-trajectory cross-turn `routed_experts_prompt_start` offset.
     pub trajectory_re_offsets: HashMap<u64, u32>,
+    /// IDs selected by requests that have not completed storage yet.
+    pub inflight_auto_trajectory_ids: HashSet<u64>,
     /// Maximum number of trailing boundary tokens that may be trimmed per non-last turn
     /// during training data construction.  `0` means no trimming is allowed (identity adapter
     /// such as `DefaultAdapter`).  Set once from the model adapter; `1` for Qwen3 and GLM4.7.
@@ -64,6 +127,7 @@ impl SessionState {
             leaf_hashes: HashSet::new(),
             trajectory_leaves: HashMap::new(),
             trajectory_re_offsets: HashMap::new(),
+            inflight_auto_trajectory_ids: HashSet::new(),
             max_trim_tokens: 0,
             gc_threshold: 0,
         }
@@ -184,12 +248,23 @@ pub struct MismatchEntry {
 /// A complete training trajectory collected from a session leaf.
 #[derive(Clone, Debug, Serialize)]
 pub struct Trajectory {
-    /// Caller-supplied trajectory identifier (from `x-smg-tito-trajectory-id` header, default 0).
+    /// Resolved trajectory identifier (header-selected or automatically assigned).
     pub trajectory_id: u64,
     /// Full token ID sequence (prompt_ids + all output_ids concatenated in conversation order).
     pub accumulated_token_ids: Vec<u32>,
     /// One `TurnRecord` per assistant turn, ordered from oldest to newest.
+    #[serde(rename = "records")]
     pub turn_records: Vec<TurnRecord>,
+}
+
+/// Consistent training-data snapshot returned for every TITO session.
+#[derive(Debug, Serialize)]
+pub struct TitoSessionData {
+    pub session_id: String,
+    pub max_trim_tokens: usize,
+    /// Always an array: empty, single-trajectory, and multi-trajectory sessions
+    /// share the same wire format.
+    pub trajectories: Vec<Trajectory>,
 }
 
 /// Top-level store: session_id → Arc<Mutex<SessionState>>.
@@ -197,6 +272,39 @@ pub struct TitoStore {
     sessions: DashMap<String, Arc<parking_lot::Mutex<SessionState>>>,
     debug: AtomicBool,
     gc_threshold: std::sync::atomic::AtomicUsize,
+    trajectory_id_strategy: TrajectoryIdStrategy,
+}
+
+/// Result of resolving a request's trajectory identity.
+pub struct ResolvedTrajectoryId {
+    pub trajectory_id: u64,
+    /// Keeps an automatic ID reserved until the request stores or is dropped.
+    pub reservation: Option<TrajectoryIdReservation>,
+}
+
+/// Request-scoped reservation preventing concurrent branches from sharing an ID.
+pub struct TrajectoryIdReservation {
+    state: Arc<parking_lot::Mutex<SessionState>>,
+    trajectory_id: u64,
+    active: AtomicBool,
+}
+
+impl TrajectoryIdReservation {
+    /// Release the ID as soon as response storage has completed.
+    pub fn release(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.state
+                .lock()
+                .inflight_auto_trajectory_ids
+                .remove(&self.trajectory_id);
+        }
+    }
+}
+
+impl Drop for TrajectoryIdReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Result of a successful prefix lookup.
@@ -205,7 +313,6 @@ pub struct PrefixMatch {
     /// How many messages from the start were matched (messages[..matched_len] is cached).
     pub matched_message_num: usize,
 }
-
 
 /// `running_hasher` is the [`PrefixHasher`] state after folding both the
 /// render context and every message in the lookup `messages` slice.
@@ -234,11 +341,83 @@ impl Default for TitoStore {
 
 impl TitoStore {
     pub fn new() -> Self {
+        Self::with_trajectory_id_strategy(TrajectoryIdStrategy::default())
+    }
+
+    pub fn with_trajectory_id_strategy(strategy: TrajectoryIdStrategy) -> Self {
         Self {
             sessions: DashMap::new(),
             debug: AtomicBool::new(false),
             gc_threshold: std::sync::atomic::AtomicUsize::new(0),
+            trajectory_id_strategy: strategy,
         }
+    }
+
+    pub const fn trajectory_id_strategy(&self) -> TrajectoryIdStrategy {
+        self.trajectory_id_strategy
+    }
+
+    /// Resolve the trajectory for a request after prefix lookup.
+    ///
+    /// Manual mode returns the caller-provided value. Auto mode continues an
+    /// unclaimed trajectory whose current leaf equals `matched_parent_hash`;
+    /// otherwise it allocates the next session-local ID.
+    pub fn resolve_trajectory_id(
+        &self,
+        session_id: &str,
+        manual_trajectory_id: u64,
+        matched_parent_hash: Option<PrefixHash>,
+    ) -> Result<ResolvedTrajectoryId, TitoError> {
+        if self.trajectory_id_strategy == TrajectoryIdStrategy::Manual {
+            return Ok(ResolvedTrajectoryId {
+                trajectory_id: manual_trajectory_id,
+                reservation: None,
+            });
+        }
+
+        let state = self.get_or_create_session_arc(session_id);
+        let trajectory_id = {
+            let mut session = state.lock();
+            let matching_id = matched_parent_hash.and_then(|parent_hash| {
+                session
+                    .trajectory_leaves
+                    .iter()
+                    .filter(|(trajectory_id, leaf_hash)| {
+                        **leaf_hash == parent_hash
+                            && !session.inflight_auto_trajectory_ids.contains(trajectory_id)
+                    })
+                    .map(|(trajectory_id, _)| *trajectory_id)
+                    .min()
+            });
+
+            let trajectory_id = match matching_id {
+                Some(trajectory_id) => trajectory_id,
+                None => {
+                    let mut candidate = 0;
+                    loop {
+                        if !session.trajectory_leaves.contains_key(&candidate)
+                            && !session.inflight_auto_trajectory_ids.contains(&candidate)
+                        {
+                            break candidate;
+                        }
+                        candidate = candidate
+                            .checked_add(1)
+                            .ok_or(TitoError::TrajectoryIdExhausted)?;
+                    }
+                }
+            };
+            session.inflight_auto_trajectory_ids.insert(trajectory_id);
+            trajectory_id
+        };
+
+        Ok(ResolvedTrajectoryId {
+            trajectory_id,
+            reservation: Some(TrajectoryIdReservation {
+                state,
+                trajectory_id,
+                active: AtomicBool::new(true),
+            }),
+        })
     }
 
     /// Enable or disable TITO mismatch validation (debug/development only).
@@ -355,7 +534,7 @@ impl TitoStore {
     /// Returns `Err(TitoError::AssistantInAppended)` if a HIT candidate would
     /// require an assistant turn inside the appended slice (client sequencing
     /// bug).
-    /// 
+    ///
     /// On a miss, the running hasher and parent hash are still populated,
     /// so the caller can store a root node for the session without paying
     /// for a second full message walk.
@@ -435,9 +614,13 @@ impl TitoStore {
                     prefix_tokens = entry.token_ids.len(),
                     "find_prefix_with_lookup: HIT"
                 );
+                let reusable_prefix_token_ids = entry
+                    .reusable_prefix_token_ids
+                    .as_deref()
+                    .unwrap_or(entry.token_ids.as_ref());
                 return Ok(PrefixLookup {
                     matched: Some(PrefixMatch {
-                        pretokenized_ids: (*entry.token_ids).clone(),
+                        pretokenized_ids: reusable_prefix_token_ids.clone(),
                         matched_message_num: *k,
                     }),
                     running_hasher: hasher,
@@ -494,6 +677,46 @@ impl TitoStore {
         turn_record: TurnRecord,
         trajectory_id: u64,
     ) -> Result<(), TitoError> {
+        self.store_token_sequences(
+            session_id,
+            leaf_hash,
+            parent_hash,
+            StoredTokenSequences::shared(token_ids),
+            turn_record,
+            trajectory_id,
+        )
+    }
+
+    /// Store the expanded training sequence and the unexpanded reusable TITO
+    /// prefix as separate representations of the same conversation node.
+    pub fn store_with_hashes_and_reusable(
+        &self,
+        session_id: &str,
+        leaf_hash: PrefixHash,
+        parent_hash: Option<PrefixHash>,
+        token_ids: StoredTokenSequences,
+        turn_record: TurnRecord,
+        trajectory_id: u64,
+    ) -> Result<(), TitoError> {
+        self.store_token_sequences(
+            session_id,
+            leaf_hash,
+            parent_hash,
+            token_ids,
+            turn_record,
+            trajectory_id,
+        )
+    }
+
+    fn store_token_sequences(
+        &self,
+        session_id: &str,
+        leaf_hash: PrefixHash,
+        parent_hash: Option<PrefixHash>,
+        token_ids: StoredTokenSequences,
+        turn_record: TurnRecord,
+        trajectory_id: u64,
+    ) -> Result<(), TitoError> {
         let arc = self.get_or_create_session_arc(session_id);
         let mut state = arc.lock();
 
@@ -506,7 +729,8 @@ impl TitoStore {
         state.entries.insert(
             leaf_hash,
             PrefixEntry {
-                token_ids: Arc::new(token_ids),
+                token_ids: Arc::new(token_ids.expanded),
+                reusable_prefix_token_ids: token_ids.reusable.map(Arc::new),
                 parent_hash,
                 turn_record,
             },
@@ -537,27 +761,22 @@ impl TitoStore {
         };
         let state = arc.lock();
 
-        // Build trajectories from trajectory_leaves, sorted by trajectory_id.
-        let mut pairs: Vec<(u64, PrefixHash)> = state
-            .trajectory_leaves
-            .iter()
-            .map(|(&tid, &hash)| (tid, hash))
-            .collect();
-        pairs.sort_unstable_by_key(|(tid, _)| *tid);
+        collect_trajectories(&state)
+    }
 
-        pairs
-            .into_iter()
-            .filter_map(|(trajectory_id, leaf_hash)| {
-                let entry = state.entries.get(&leaf_hash)?;
-                let accumulated_token_ids = (*entry.token_ids).clone();
-                let turn_records = collect_records_for_leaf(&state, leaf_hash);
-                Some(Trajectory {
-                    trajectory_id,
-                    accumulated_token_ids,
-                    turn_records,
-                })
-            })
-            .collect()
+    /// Return an atomic session snapshot with a stable multi-trajectory shape.
+    ///
+    /// The session existence check, metadata read, and trajectory collection all
+    /// happen under one lock so callers cannot observe a mixed snapshot.
+    pub fn get_session_data(&self, session_id: &str) -> Option<TitoSessionData> {
+        let arc = self.get_session_arc(session_id)?;
+        let state = arc.lock();
+
+        Some(TitoSessionData {
+            session_id: session_id.to_string(),
+            max_trim_tokens: state.max_trim_tokens,
+            trajectories: collect_trajectories(&state),
+        })
     }
 
     /// Look up the next-turn dispatch's `routed_experts_prompt_start` for
@@ -567,11 +786,7 @@ impl TitoStore {
     /// Called by chat preparation before dispatching turn k.  The store
     /// returns an *advisory* value; the caller may still override it with
     /// a partial-rollout-injected loopback offset.
-    pub fn next_routed_experts_prompt_start(
-        &self,
-        session_id: &str,
-        trajectory_id: u64,
-    ) -> u32 {
+    pub fn next_routed_experts_prompt_start(&self, session_id: &str, trajectory_id: u64) -> u32 {
         let Some(arc) = self.get_session_arc(session_id) else {
             return 0;
         };
@@ -695,6 +910,27 @@ fn collect_records_for_leaf(state: &SessionState, leaf_hash: PrefixHash) -> Vec<
         .collect()
 }
 
+fn collect_trajectories(state: &SessionState) -> Vec<Trajectory> {
+    let mut pairs: Vec<(u64, PrefixHash)> = state
+        .trajectory_leaves
+        .iter()
+        .map(|(&trajectory_id, &leaf_hash)| (trajectory_id, leaf_hash))
+        .collect();
+    pairs.sort_unstable_by_key(|(trajectory_id, _)| *trajectory_id);
+
+    pairs
+        .into_iter()
+        .filter_map(|(trajectory_id, leaf_hash)| {
+            let entry = state.entries.get(&leaf_hash)?;
+            Some(Trajectory {
+                trajectory_id,
+                accumulated_token_ids: (*entry.token_ids).clone(),
+                turn_records: collect_records_for_leaf(state, leaf_hash),
+            })
+        })
+        .collect()
+}
+
 fn is_assistant_role(msg: &ChatMessage) -> bool {
     matches!(msg, ChatMessage::Assistant { .. })
 }
@@ -732,6 +968,10 @@ mod tests {
         TitoStore::new()
     }
 
+    fn make_auto_store() -> TitoStore {
+        TitoStore::with_trajectory_id_strategy(TrajectoryIdStrategy::Auto)
+    }
+
     fn render_context() -> RenderContext {
         RenderContext::default()
     }
@@ -745,6 +985,156 @@ mod tests {
             routed_experts: None,
             weight_version: None,
         }
+    }
+
+    #[test]
+    fn manual_strategy_preserves_header_selected_id() {
+        let store = make_store();
+        assert_eq!(store.trajectory_id_strategy(), TrajectoryIdStrategy::Manual);
+
+        let resolved = store.resolve_trajectory_id("s1", 42, None).unwrap();
+        assert_eq!(resolved.trajectory_id, 42);
+        assert!(resolved.reservation.is_none());
+    }
+
+    #[test]
+    fn trajectory_id_strategy_rejects_unknown_value() {
+        assert_eq!(
+            "auto".parse::<TrajectoryIdStrategy>().unwrap(),
+            TrajectoryIdStrategy::Auto
+        );
+        assert!("random".parse::<TrajectoryIdStrategy>().is_err());
+    }
+
+    #[test]
+    fn auto_strategy_reuses_id_for_single_linear_trajectory() {
+        let store = make_auto_store();
+        let context = render_context();
+        let root = vec![user_msg("hi"), assistant_msg("hello")];
+        let root_hash = hash_messages_with_context(&root, &context);
+
+        let first = store.resolve_trajectory_id("s1", 99, None).unwrap();
+        assert_eq!(first.trajectory_id, 0, "auto mode ignores the header ID");
+        store
+            .store(
+                "s1",
+                &root,
+                vec![1, 2],
+                record(1, "root"),
+                &context,
+                first.trajectory_id,
+            )
+            .unwrap();
+        first.reservation.as_ref().unwrap().release();
+
+        let next = store
+            .resolve_trajectory_id("s1", 99, Some(root_hash))
+            .unwrap();
+        assert_eq!(next.trajectory_id, 0);
+    }
+
+    #[test]
+    fn auto_strategy_allocates_next_id_when_branching_from_internal_node() {
+        let store = make_auto_store();
+        let context = render_context();
+        let root = vec![user_msg("hi"), assistant_msg("hello")];
+        let root_hash = hash_messages_with_context(&root, &context);
+        let branch_a = vec![
+            user_msg("hi"),
+            assistant_msg("hello"),
+            user_msg("path A"),
+            assistant_msg("answer A"),
+        ];
+
+        let root_id = store.resolve_trajectory_id("s1", 0, None).unwrap();
+        store
+            .store(
+                "s1",
+                &root,
+                vec![1, 2],
+                record(1, "root"),
+                &context,
+                root_id.trajectory_id,
+            )
+            .unwrap();
+        root_id.reservation.as_ref().unwrap().release();
+
+        let first_branch = store
+            .resolve_trajectory_id("s1", 0, Some(root_hash))
+            .unwrap();
+        assert_eq!(first_branch.trajectory_id, 0);
+        store
+            .store(
+                "s1",
+                &branch_a,
+                vec![1, 2, 3, 4],
+                record(3, "branch A"),
+                &context,
+                first_branch.trajectory_id,
+            )
+            .unwrap();
+        first_branch.reservation.as_ref().unwrap().release();
+
+        let second_branch = store
+            .resolve_trajectory_id("s1", 0, Some(root_hash))
+            .unwrap();
+        assert_eq!(second_branch.trajectory_id, 1);
+    }
+
+    #[test]
+    fn auto_strategy_reserves_distinct_ids_for_concurrent_leaf_branches() {
+        let store = make_auto_store();
+        let context = render_context();
+        let root = vec![user_msg("hi"), assistant_msg("hello")];
+        let root_hash = hash_messages_with_context(&root, &context);
+
+        let root_id = store.resolve_trajectory_id("s1", 0, None).unwrap();
+        store
+            .store(
+                "s1",
+                &root,
+                vec![1, 2],
+                record(1, "root"),
+                &context,
+                root_id.trajectory_id,
+            )
+            .unwrap();
+        root_id.reservation.as_ref().unwrap().release();
+
+        let first = store
+            .resolve_trajectory_id("s1", 0, Some(root_hash))
+            .unwrap();
+        let second = store
+            .resolve_trajectory_id("s1", 0, Some(root_hash))
+            .unwrap();
+        assert_eq!(first.trajectory_id, 0);
+        assert_eq!(second.trajectory_id, 1);
+    }
+
+    #[test]
+    fn auto_strategy_allocates_consecutive_ids_for_new_inflight_trajectories() {
+        let store = make_auto_store();
+        let reservations: Vec<_> = (0..4)
+            .map(|_| store.resolve_trajectory_id("s1", 99, None).unwrap())
+            .collect();
+        let trajectory_ids: Vec<_> = reservations
+            .iter()
+            .map(|resolved| resolved.trajectory_id)
+            .collect();
+
+        assert_eq!(trajectory_ids, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn auto_strategy_reuses_unstored_id_after_reservation_is_dropped() {
+        let store = make_auto_store();
+
+        let abandoned = store.resolve_trajectory_id("s1", 0, None).unwrap();
+        assert_eq!(abandoned.trajectory_id, 0);
+        drop(abandoned);
+
+        let retry = store.resolve_trajectory_id("s1", 0, None).unwrap();
+        assert_eq!(retry.trajectory_id, 0);
     }
 
     fn store_turn(
@@ -907,6 +1297,73 @@ mod tests {
         assert_eq!(trajectories[0].turn_records.len(), 2);
         assert_eq!(trajectories[0].turn_records[0].finish_reason, "turn1");
         assert_eq!(trajectories[0].turn_records[1].finish_reason, "turn2");
+    }
+
+    #[test]
+    fn session_data_uses_one_shape_for_empty_single_and_multiple_trajectories() {
+        let context = render_context();
+
+        let empty_store = make_store();
+        empty_store.create_session("empty");
+        let empty = serde_json::to_value(empty_store.get_session_data("empty").unwrap()).unwrap();
+        assert_eq!(
+            empty,
+            serde_json::json!({
+                "session_id": "empty",
+                "max_trim_tokens": 0,
+                "trajectories": [],
+            })
+        );
+        assert!(empty_store.get_session_data("missing").is_none());
+
+        let single_store = make_store();
+        single_store.create_session("single");
+        single_store
+            .store(
+                "single",
+                &[user_msg("one"), assistant_msg("answer one")],
+                vec![1, 2],
+                record(1, "single"),
+                &context,
+                0,
+            )
+            .unwrap();
+        let single =
+            serde_json::to_value(single_store.get_session_data("single").unwrap()).unwrap();
+        assert_eq!(single["trajectories"].as_array().unwrap().len(), 1);
+        assert!(single.get("trajectory_id").is_none());
+        assert!(single.get("accumulated_token_ids").is_none());
+        assert!(single.get("records").is_none());
+        assert_eq!(single["trajectories"][0]["trajectory_id"], 0);
+        assert!(single["trajectories"][0].get("records").is_some());
+        assert!(single["trajectories"][0].get("turn_records").is_none());
+
+        let multi_store = make_store();
+        multi_store.create_session("multi");
+        multi_store
+            .store(
+                "multi",
+                &[user_msg("zero"), assistant_msg("answer zero")],
+                vec![1, 2],
+                record(1, "zero"),
+                &context,
+                0,
+            )
+            .unwrap();
+        multi_store
+            .store(
+                "multi",
+                &[user_msg("one"), assistant_msg("answer one")],
+                vec![3, 4],
+                record(1, "one"),
+                &context,
+                1,
+            )
+            .unwrap();
+        let multi = serde_json::to_value(multi_store.get_session_data("multi").unwrap()).unwrap();
+        assert_eq!(multi["trajectories"].as_array().unwrap().len(), 2);
+        assert_eq!(multi["trajectories"][0]["trajectory_id"], 0);
+        assert_eq!(multi["trajectories"][1]["trajectory_id"], 1);
     }
 
     #[test]
@@ -1311,10 +1768,7 @@ mod tests {
     // (`hash_messages_with_context` + `compute_parent_hash`) would have
     // produced, so the on-disk prefix tree stays compatible.
 
-    fn extend_for_assistant(
-        lookup: &PrefixLookup,
-        assistant: &ChatMessage,
-    ) -> PrefixHash {
+    fn extend_for_assistant(lookup: &PrefixLookup, assistant: &ChatMessage) -> PrefixHash {
         let mut hasher = lookup.running_hasher.clone();
         hash_message_into(&mut hasher, assistant);
         finalize_hash(&hasher)
@@ -1410,14 +1864,7 @@ mod tests {
         let reference = make_store();
         reference.create_session("s");
         reference
-            .store(
-                "s",
-                &all_msgs,
-                vec![1, 2, 3],
-                record(3, "stop"),
-                &ctx,
-                42,
-            )
+            .store("s", &all_msgs, vec![1, 2, 3], record(3, "stop"), &ctx, 42)
             .unwrap();
 
         // Reused: caller passes hashes obtained from the lookup.
@@ -1447,6 +1894,89 @@ mod tests {
         assert_eq!(r.trajectory_id, n.trajectory_id);
         assert_eq!(r.accumulated_token_ids, n.accumulated_token_ids);
         assert_eq!(r.turn_records.len(), n.turn_records.len());
+
+        // Pure-text nodes keep one token buffer: incremental lookup falls
+        // back to the expanded/training sequence because both are identical.
+        {
+            let session = reused
+                .get_session_arc("s")
+                .expect("the text session should exist");
+            let state = session.lock();
+            let entry = state
+                .entries
+                .get(&leaf_hash)
+                .expect("the text prefix should be stored");
+            assert!(entry.reusable_prefix_token_ids.is_none());
+        }
+
+        let mut next_request = all_msgs;
+        next_request.push(user_msg("e"));
+        let matched = reused
+            .find_prefix_with_lookup("s", &next_request, &ctx)
+            .unwrap()
+            .matched
+            .expect("the text prefix should remain reusable");
+        assert_eq!(matched.pretokenized_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn stored_token_sequences_deduplicates_identical_reusable_ids() {
+        let token_ids = StoredTokenSequences::with_reusable(vec![1, 2, 3], vec![1, 2, 3]);
+
+        assert_eq!(token_ids.expanded, vec![1, 2, 3]);
+        assert!(token_ids.reusable.is_none());
+    }
+
+    #[test]
+    fn multimodal_prefix_reuses_unexpanded_ids_but_exports_expanded_trajectory() {
+        let store = make_store();
+        let ctx = render_context();
+        let first_turn = vec![user_msg("<image> describe"), assistant_msg("cat")];
+        let leaf_hash = hash_messages_with_context(&first_turn, &ctx);
+        store
+            .store_with_hashes_and_reusable(
+                "mm-session",
+                leaf_hash,
+                None,
+                StoredTokenSequences::with_reusable(
+                    vec![10, 99, 99, 99, 20], // training sequence
+                    vec![10, 42, 20],         // one media anchor
+                ),
+                record(5, "stop"),
+                0,
+            )
+            .unwrap();
+
+        {
+            let session = store
+                .get_session_arc("mm-session")
+                .expect("the multimodal session should exist");
+            let state = session.lock();
+            let entry = state
+                .entries
+                .get(&leaf_hash)
+                .expect("the multimodal prefix should be stored");
+            assert!(entry.reusable_prefix_token_ids.is_some());
+        }
+
+        let next_request = vec![
+            user_msg("<image> describe"),
+            assistant_msg("cat"),
+            user_msg("and this <image>?"),
+        ];
+        let lookup = store
+            .find_prefix_with_lookup("mm-session", &next_request, &ctx)
+            .unwrap();
+        let matched = lookup
+            .matched
+            .expect("the first multimodal turn should match");
+        assert_eq!(matched.pretokenized_ids, vec![10, 42, 20]);
+
+        let trajectories = store.get_all_trajectories("mm-session");
+        assert_eq!(
+            trajectories[0].accumulated_token_ids,
+            vec![10, 99, 99, 99, 20]
+        );
     }
 
     #[test]
@@ -1466,11 +1996,7 @@ mod tests {
             record(2, "stop"),
             &ctx,
         );
-        let query = vec![
-            user_msg("hi"),
-            assistant_msg("hello"),
-            user_msg("more"),
-        ];
+        let query = vec![user_msg("hi"), assistant_msg("hello"), user_msg("more")];
 
         let legacy_hit = store.find_prefix("s1", &query, &ctx).unwrap();
         let lookup = store.find_prefix_with_lookup("s1", &query, &ctx).unwrap();
