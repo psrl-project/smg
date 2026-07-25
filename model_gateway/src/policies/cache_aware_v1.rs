@@ -55,19 +55,48 @@ use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::Rng;
 use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{
-    normalize_model_key, utils::PeriodicTask, CacheAwareConfig, LoadBalancingPolicy,
-    SelectWorkerInfo, TreeHandle, TreeKind,
+    effective_kv_used_tokens, normalize_model_key, utils::PeriodicTask, worker_kv_capacity,
+    CacheAwareConfig, LoadBalancingPolicy, ScoreTraceCtx, SelectWorkerInfo, TreeHandle, TreeKind,
 };
 use crate::{
     mesh::adapters::tree_sync::{RepairEntry, TreeRepairPage},
+    observability::logging::SCORE_TRACE_TARGET,
     worker::{KvEventMonitor, Worker},
 };
 
 /// Latest per-worker backend load snapshot stream, keyed by worker URL.
 pub(crate) type LoadReceiver = watch::Receiver<HashMap<String, WorkerLoadResponse>>;
+
+/// Format `inst<id>/dp<rank>` for candidate `idx` using the score-trace
+/// instance-id slice (indexed identically to `workers`). Used only when
+/// building `score_trace.log` lines.
+fn score_inst_label(st: &ScoreTraceCtx, workers: &[Arc<dyn Worker>], idx: usize) -> String {
+    let inst = st.instance_ids.get(idx).map(String::as_str).unwrap_or("?");
+    let dp = workers[idx].dp_rank().unwrap_or(0);
+    format!("inst{inst}/dp{dp}")
+}
+
+/// Candidate index whose instance id equals the request's previous-round
+/// instance (`prev_instance_id`), if that instance is among `workers`.
+fn score_prev_idx(st: &ScoreTraceCtx, workers: &[Arc<dyn Worker>]) -> Option<usize> {
+    let prev = st.prev_instance_id?;
+    (0..workers.len()).find(|&idx| st.instance_ids.get(idx).map(String::as_str) == Some(prev))
+}
+
+/// Render the previous-round instance for a load-based (non-scoring) channel:
+/// `inst../dp..(load=N)`, or a reason string when there is no prev candidate.
+fn score_prev_load_label(st: &ScoreTraceCtx, workers: &[Arc<dyn Worker>]) -> String {
+    match st.prev_instance_id {
+        None => "none(first_turn)".to_string(),
+        Some(prev) => match score_prev_idx(st, workers) {
+            Some(idx) => format!("{}(load={})", score_inst_label(st, workers, idx), workers[idx].load()),
+            None => format!("inst{prev}(not_a_candidate)"),
+        },
+    }
+}
 
 /// Cache-aware routing policy
 ///
@@ -305,29 +334,88 @@ impl CacheAwareV1Policy {
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold)
     }
 
-    /// Min and max backend KV-cache utilization (0.0–1.0) across healthy workers
-    /// that have a `WorkerMonitor` snapshot entry, as `(min, max)`. `None` when
-    /// no receiver is wired or no healthy worker has a load entry (→ caller
-    /// relies on the request-count spread).
+    /// Min and max effective KV-cache utilization (0.0–1.0) across healthy workers,
+    /// as `(min, max)`. Reads engine_stats + inflight speculation (see
+    /// `effective_kv_used_tokens`) so the value reflects just-admitted requests
+    /// without waiting for the next load poll. `None` when no healthy worker has a
+    /// `max_model_len`/`max_total_tokens` label (→ caller relies on request-count spread).
     fn backend_token_usage_bounds(
         &self,
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
     ) -> Option<(f64, f64)> {
-        let guard = self.load_rx.read();
-        let rx = guard.as_ref()?;
-        let loads = rx.borrow();
         let mut bounds: Option<(f64, f64)> = None;
         for &idx in healthy_indices {
-            if let Some(load) = loads.get(workers[idx].url()) {
-                let usage = load.effective_token_usage();
-                bounds = Some(match bounds {
-                    Some((min, max)) => (min.min(usage), max.max(usage)),
-                    None => (usage, usage),
-                });
+            let worker = &workers[idx];
+            let capacity = worker_kv_capacity(worker);
+            if capacity <= 0 {
+                continue;
             }
+            let used = effective_kv_used_tokens(worker);
+            let usage = (used as f64 / capacity as f64).clamp(0.0, 1.0);
+            bounds = Some(match bounds {
+                Some((min, max)) => (min.min(usage), max.max(usage)),
+                None => (usage, usage),
+            });
         }
         bounds
+    }
+
+    /// KV-capacity admission gate using live engine_stats + speculative inflight.
+    ///
+    /// Rejects when the candidate worker would queue (`num_waiting_reqs > 0`) or
+    /// when the effective KV occupancy (snapshot + in-flight estimate) plus
+    /// `new_request_tokens` would exceed the worker's `max_model_len` capacity.
+    ///
+    /// Returns `false` (admit) when the gate is disabled, when the worker has not
+    /// yet reported any engine snapshot, or when no capacity label is set —
+    /// degrading gracefully so the routing loop never deadlocks on missing data.
+    fn admission_rejects(&self, worker: &Arc<dyn Worker>, new_request_tokens: i64) -> bool {
+        if !self.config.enable_kv_admission_control {
+            return false;
+        }
+        // No snapshot yet → admit (graceful degrade).
+        if worker.engine_stats_timestamp_ms() == 0 {
+            return false;
+        }
+        let stats = worker.engine_stats_arc();
+        if stats.scheduler_stats.num_waiting_reqs > 0 {
+            return true;
+        }
+        let capacity = worker_kv_capacity(worker);
+        if capacity <= 0 {
+            return false; // no capacity label → can't check, admit.
+        }
+        let threshold_tokens = (capacity as f64 * f64::from(self.config.kv_capacity_threshold).clamp(0.0, 1.0)) as i64;
+        effective_kv_used_tokens(worker) + new_request_tokens > threshold_tokens
+    }
+
+    /// Least-loaded healthy worker that passes the admission gate for
+    /// `new_request_tokens` of new KV (matched prefix = 0, conservative — used
+    /// by fallback paths that have abandoned cache affinity). Replaces the
+    /// unconditional first-healthy / random / min-load fallbacks when the gate
+    /// is enabled, so a fully-gated-out request returns `None` (re-enqueued by
+    /// the routing loop) instead of being force-routed to a saturated engine.
+    /// Reuses the `(load, processed, idx)` ordering from `select_worker`.
+    fn first_admitting_by_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        new_request_tokens: i64,
+    ) -> Option<usize> {
+        let mut best: Option<(usize, usize, usize)> = None;
+        for &idx in healthy_indices {
+            if self.admission_rejects(&workers[idx], new_request_tokens) {
+                continue;
+            }
+            let state = workers[idx].routing_state();
+            let key = (state.load, state.processed, idx);
+            match best {
+                Some(b) if key >= b => {}
+                _ => best = Some(key),
+            }
+        }
+        best.map(|(_, _, idx)| idx)
     }
 
     /// Initialize the trees with worker URLs (used only during initial setup)
@@ -472,8 +560,10 @@ impl CacheAwareV1Policy {
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
         min_load_idx: Option<usize>,
         model_id: &str,
+        base_tokens: i64,
     ) -> Option<usize> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -485,9 +575,44 @@ impl CacheAwareV1Policy {
         // Shortest queue when imbalanced. The min-load index is gathered upstream
         // in select_worker with the (load, processed_requests, idx) tie-break
         // from #1714 (spreads load when decode outpaces prefill).
-        let min_load_idx = min_load_idx?;
+        //
+        // KV-capacity admission gate: the imbalanced path abandons cache
+        // affinity, so the matched prefix is treated as 0 (conservative). If the
+        // min-load worker would be saturated, fall back to the least-loaded
+        // worker that still admits; if none admits, return None so the routing
+        // loop re-enqueues the request rather than force-routing to a full
+        // engine. The gate only applies to gRPC (token) requests — HTTP/text
+        // requests have no token capacity signal.
+        let gate_active = self.config.enable_kv_admission_control && info.tokens.is_some();
+        let chosen_idx = match min_load_idx {
+            Some(idx) if gate_active && self.admission_rejects(&workers[idx], base_tokens) => {
+                self.first_admitting_by_load(workers, healthy_indices, base_tokens)?
+            }
+            Some(idx) => idx,
+            None => return None,
+        };
 
-        let worker_url = workers[min_load_idx].url();
+        // Score trace: imbalance channel abandoned cache affinity for
+        // shortest-queue — label the channel + best/prev instance loads.
+        if let Some(st) = info.score_trace.as_ref() {
+            info!(
+                target: SCORE_TRACE_TARGET,
+                event = "route_decision",
+                channel = "imbalanced_min_load",
+                request_id = st.request_id,
+                prompt_id = st.prompt_id,
+                trigger = "count/kv spread imbalance",
+                best = %format!(
+                    "{}(load={})",
+                    score_inst_label(st, workers, chosen_idx),
+                    workers[chosen_idx].load()
+                ),
+                prev = %score_prev_load_label(st, workers),
+                "min-load (imbalanced)"
+            );
+        }
+
+        let worker_url = workers[chosen_idx].url();
 
         // Even in imbalanced mode, update the appropriate tree to maintain cache state
         // Prefer token tree for gRPC requests, fall back to string tree for HTTP
@@ -554,9 +679,9 @@ impl CacheAwareV1Policy {
         }
 
         // Increment processed counter
-        workers[min_load_idx].increment_processed();
+        workers[chosen_idx].increment_processed();
 
-        Some(min_load_idx)
+        Some(chosen_idx)
     }
 }
 
@@ -752,17 +877,33 @@ impl LoadBalancingPolicy for CacheAwareV1Policy {
         // All workers should be from the same model
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
+        // Full request token footprint (prompt + response-so-far) used by the
+        // KV-capacity admission gate. The cache-hit prefix is subtracted at each
+        // candidate, so only genuinely-new KV is counted against capacity.
+        let base_tokens: i64 = info
+            .tokens
+            .map_or(0, |t| t.len() as i64)
+            + info.response_token_count.unwrap_or(0) as i64;
+
         // Abandon cache affinity for shortest-queue when the pool is imbalanced —
         // by request count (using the loads already gathered above), or (for
         // long-context workloads) by backend KV usage.
         if self.is_imbalanced(workers, &healthy_indices, min_load, max_load) {
-            return self.select_worker_min_load(workers, info, min_load_idx, model_id);
+            return self.select_worker_min_load(
+                workers,
+                info,
+                &healthy_indices,
+                min_load_idx,
+                model_id,
+                base_tokens,
+            );
         }
 
         // Cache-aware routing when balanced — three types (mutually exclusive):
         //   1. Event-driven: PositionalIndexer overlap scoring (gRPC + KV events)
         //   2. Approximate token tree: TokenTree prefix matching (gRPC, no events)
         //   3. Approximate string tree: Tree prefix matching (HTTP)
+        let st = info.score_trace.as_ref();
         if let Some(tokens) = request_tokens {
             if self.has_event_indexer(model_id) {
                 self.select_worker_event_driven(
@@ -771,6 +912,8 @@ impl LoadBalancingPolicy for CacheAwareV1Policy {
                     &healthy_indices,
                     min_load_idx,
                     model_id,
+                    base_tokens,
+                    st,
                 )
             } else {
                 self.select_worker_with_tokens(
@@ -779,11 +922,20 @@ impl LoadBalancingPolicy for CacheAwareV1Policy {
                     &healthy_indices,
                     min_load_idx,
                     model_id,
+                    base_tokens,
+                    st,
                 )
             }
         } else {
             let text = request_text.unwrap_or("");
-            self.select_worker_with_text(workers, text, &healthy_indices, min_load_idx, model_id)
+            self.select_worker_with_text(
+                workers,
+                text,
+                &healthy_indices,
+                min_load_idx,
+                model_id,
+                st,
+            )
         }
     }
 
@@ -801,6 +953,20 @@ impl LoadBalancingPolicy for CacheAwareV1Policy {
 
     fn name(&self) -> &'static str {
         "cache_aware_v1"
+    }
+
+    fn on_version_bump(&self, worker_url: &str) {
+        // Model weights changed: the engine cleared its KV cache for the old
+        // version, so the cache-affinity prefixes we recorded for this instance
+        // are stale (they would mislead cache-hit routing and any KV-marginal
+        // estimate). Drop the instance's tenant from every per-model tree.
+        let tenant: Arc<str> = Arc::from(worker_url);
+        for tree in self.token_trees.iter() {
+            tree.value().evict_tenant(&tenant, 0);
+        }
+        for tree in self.string_trees.iter() {
+            tree.value().remove_tenant_all(&tenant);
+        }
     }
 
     fn needs_request_text(&self) -> bool {
@@ -838,23 +1004,60 @@ impl CacheAwareV1Policy {
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
         model_id: &str,
+        base_tokens: i64,
+        st: Option<&ScoreTraceCtx>,
     ) -> Option<usize> {
         let guard = self.kv_monitor.read();
         let monitor = guard.as_ref()?;
         let tiered_indexer = monitor.get_indexer(model_id)?;
 
-        if let Some(idx) =
-            self.score_overlap_tiered(workers, tokens, healthy_indices, &tiered_indexer)
-        {
+        if let Some(idx) = self.score_overlap_tiered(
+            workers,
+            tokens,
+            healthy_indices,
+            &tiered_indexer,
+            base_tokens,
+            st,
+        ) {
             return Some(idx);
         }
 
-        // No cache overlap — min-load fallback
-        let min_idx = min_load_idx?;
+        // No cache overlap — min-load fallback. Apply the admission gate
+        // (matched=0; no overlap means no resident prefix to subtract). If the
+        // min-load worker is saturated, fall back to the least-loaded admitting
+        // worker; if none admits, return None (re-enqueue).
+        let min_idx = match min_load_idx {
+            Some(idx)
+                if self.config.enable_kv_admission_control
+                    && self.admission_rejects(&workers[idx], base_tokens) =>
+            {
+                self.first_admitting_by_load(workers, healthy_indices, base_tokens)?
+            }
+            Some(idx) => idx,
+            None => return None,
+        };
         debug!(
             worker = workers[min_idx].url(),
             model_id, "Event-driven routing: no overlap, min-load fallback"
         );
+        // Score trace: event-driven path found no cache overlap for any
+        // candidate, so it fell through to shortest-queue — label the channel.
+        if let Some(st) = st {
+            info!(
+                target: SCORE_TRACE_TARGET,
+                event = "route_decision",
+                channel = "ev_min_load_fallback",
+                request_id = st.request_id,
+                prompt_id = st.prompt_id,
+                best = %format!(
+                    "{}(load={})",
+                    score_inst_label(st, workers, min_idx),
+                    workers[min_idx].load()
+                ),
+                prev = %score_prev_load_label(st, workers),
+                "event-driven: no overlap, min-load fallback"
+            );
+        }
         workers[min_idx].increment_processed();
         Some(min_idx)
     }
@@ -872,9 +1075,23 @@ impl CacheAwareV1Policy {
         tokens: &[u32],
         healthy_indices: &[usize],
         indexer: &TieredIndexer,
+        base_tokens: i64,
+        st: Option<&ScoreTraceCtx>,
     ) -> Option<usize> {
         let mut weighted: Vec<f64> = vec![0.0; workers.len()];
         let mut tree_sizes: Vec<usize> = vec![0; workers.len()];
+        // GPU-resident matched prefix per worker (blocks * gpu block_size). Only
+        // the GPU tier reduces the new-KV the engine must allocate — an LMCache
+        // hit still has to be loaded onto the GPU, consuming KV capacity — so
+        // the admission gate subtracts only GPU-tier matched tokens.
+        let mut gpu_matched: Vec<usize> = vec![0; workers.len()];
+        // Raw per-tier overlap block counts per worker, retained for the
+        // `score_trace.log` breakdown (matched tokens = raw * block_size,
+        // weighted contribution = weight * raw).
+        let mut gpu_raw: Vec<u32> = vec![0; workers.len()];
+        let mut lmcache_raw: Vec<u32> = vec![0; workers.len()];
+        let mut gpu_block: usize = self.config.block_size;
+        let mut lmcache_block: usize = self.config.block_size;
 
         for (tier, weight) in [
             (Tier::GPU, self.config.gpu_overlap_weight),
@@ -884,6 +1101,11 @@ impl CacheAwareV1Policy {
                 continue;
             }
             let block_size = indexer.block_size(tier).unwrap_or(self.config.block_size);
+            if matches!(tier, Tier::GPU) {
+                gpu_block = block_size;
+            } else {
+                lmcache_block = block_size;
+            }
             let content_hashes = compute_request_content_hashes(tokens, block_size);
             if content_hashes.is_empty() {
                 continue;
@@ -897,6 +1119,12 @@ impl CacheAwareV1Policy {
                 if let Some(wid) = pi.worker_id(workers[idx].url()) {
                     if let Some(&score) = overlap.scores.get(&wid) {
                         weighted[idx] += weight * f64::from(score);
+                        if matches!(tier, Tier::GPU) {
+                            gpu_matched[idx] = (score as usize) * block_size;
+                            gpu_raw[idx] = score;
+                        } else {
+                            lmcache_raw[idx] = score;
+                        }
                     }
                     tree_sizes[idx] += overlap.tree_sizes.get(&wid).copied().unwrap_or(0);
                 }
@@ -906,7 +1134,13 @@ impl CacheAwareV1Policy {
         let best_idx = healthy_indices
             .iter()
             .copied()
-            .filter(|&idx| weighted[idx] > 0.0)
+            .filter(|&idx| {
+                weighted[idx] > 0.0
+                    && !self.admission_rejects(
+                        &workers[idx],
+                        base_tokens.saturating_sub(gpu_matched[idx] as i64),
+                    )
+            })
             .max_by(|&a, &b| {
                 let load_a = workers[a].load();
                 let load_b = workers[b].load();
@@ -914,7 +1148,26 @@ impl CacheAwareV1Policy {
                     .total_cmp(&weighted[b])
                     .then(load_b.cmp(&load_a))
                     .then(tree_sizes[b].cmp(&tree_sizes[a]))
-            })?;
+            });
+
+        // Score trace: emit the per-tier GPU/LMCache breakdown for the chosen
+        // (best) instance and the request's previous-round instance. Only when a
+        // positive-overlap winner exists; the no-overlap case is logged by the
+        // caller's min-load fallback instead (one line per decision).
+        if let (Some(st), Some(best)) = (st, best_idx) {
+            self.emit_tiered_score_trace(
+                st,
+                workers,
+                &weighted,
+                &gpu_raw,
+                &lmcache_raw,
+                gpu_block,
+                lmcache_block,
+                best,
+            );
+        }
+
+        let best_idx = best_idx?;
 
         debug!(
             worker = workers[best_idx].url(),
@@ -925,6 +1178,92 @@ impl CacheAwareV1Policy {
         Some(best_idx)
     }
 
+    /// Emit one `score_trace.log` line for the event-driven tiered channel,
+    /// showing the GPU + LMCache score breakdown (raw block count, matched
+    /// tokens, weight, weighted contribution, total) for the chosen (`best`)
+    /// instance and the request's previous-round (`prev`) instance. `best` and
+    /// `prev` may be the same instance (identical numbers).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_tiered_score_trace(
+        &self,
+        st: &ScoreTraceCtx,
+        workers: &[Arc<dyn Worker>],
+        weighted: &[f64],
+        gpu_raw: &[u32],
+        lmcache_raw: &[u32],
+        gpu_block: usize,
+        lmcache_block: usize,
+        best_idx: usize,
+    ) {
+        let gpu_w = self.config.gpu_overlap_weight;
+        let lmc_w = self.config.lmcache_overlap_weight;
+        let group = |idx: usize| -> String {
+            let gr = gpu_raw[idx];
+            let lr = lmcache_raw[idx];
+            format!(
+                "{}{{gpu_raw={gr} gpu_tok={gt} gpu_wtd={gwt:.3} lmc_raw={lr} lmc_tok={lt} lmc_wtd={lwt:.3} total={tot:.3}}}",
+                score_inst_label(st, workers, idx),
+                gt = gr as usize * gpu_block,
+                gwt = gpu_w * f64::from(gr),
+                lt = lr as usize * lmcache_block,
+                lwt = lmc_w * f64::from(lr),
+                tot = weighted[idx],
+            )
+        };
+        let prev = match st.prev_instance_id {
+            None => "none(first_turn)".to_string(),
+            Some(prev) => match score_prev_idx(st, workers) {
+                Some(idx) => group(idx),
+                None => format!("inst{prev}(not_a_candidate)"),
+            },
+        };
+        info!(
+            target: SCORE_TRACE_TARGET,
+            event = "score",
+            channel = "event_driven_tiered",
+            request_id = st.request_id,
+            prompt_id = st.prompt_id,
+            gpu_weight = gpu_w,
+            lmcache_weight = lmc_w,
+            gpu_block_size = gpu_block,
+            lmcache_block_size = lmcache_block,
+            best = %group(best_idx),
+            prev = %prev,
+            "kv-aware tiered score"
+        );
+    }
+
+    /// Emit one `score_trace.log` line for an approximate-tree channel (token or
+    /// string). These channels model no cache tiers, so there is no GPU/LMCache
+    /// breakdown — the `channel` name + `match_rate`/`hit` explain the decision.
+    fn emit_approx_score_trace(
+        &self,
+        st: &ScoreTraceCtx,
+        workers: &[Arc<dyn Worker>],
+        channel: &'static str,
+        selected: usize,
+        hit: bool,
+        match_rate: f32,
+    ) {
+        info!(
+            target: SCORE_TRACE_TARGET,
+            event = "route_decision",
+            channel,
+            request_id = st.request_id,
+            prompt_id = st.prompt_id,
+            match_rate,
+            cache_threshold = self.config.cache_threshold,
+            hit,
+            best = %format!(
+                "{}(load={})",
+                score_inst_label(st, workers, selected),
+                workers[selected].load()
+            ),
+            prev = %score_prev_load_label(st, workers),
+            "approx-tree decision"
+        );
+    }
+
     /// Select worker using token-based tree (gRPC path)
     fn select_worker_with_tokens(
         &self,
@@ -933,6 +1272,8 @@ impl CacheAwareV1Policy {
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
         model_id: &str,
+        base_tokens: i64,
+        st: Option<&ScoreTraceCtx>,
     ) -> Option<usize> {
         let tree = self
             .token_trees
@@ -951,18 +1292,28 @@ impl CacheAwareV1Policy {
             //     worker — insert for it;
             //   * matched worker gone/unhealthy: select nothing and DON'T insert
             //     (closure returns None), falling back to first-healthy below.
+            //
+            // KV-capacity admission gate: a candidate is dropped (closure returns
+            // None, skipping the insert) when it would queue or overflow. The
+            // cache-hit prefix is already resident, so only `base - matched` new
+            // KV is counted. Dropped candidates fall through to the gated
+            // fallback below.
             let mut selected_idx: Option<usize> = None;
+            // Captured for score_trace.log (set inside the match closure).
+            let mut match_rate: f32 = 0.0;
+            let mut cache_hit = false;
             let result = tree.match_and_insert_with(tokens, |result| {
-                let match_rate = if result.input_token_count == 0 {
+                match_rate = if result.input_token_count == 0 {
                     0.0
                 } else {
                     result.matched_token_count as f32 / result.input_token_count as f32
                 };
+                cache_hit = match_rate > self.config.cache_threshold;
 
-                selected_idx = if match_rate > self.config.cache_threshold {
+                let candidate = if cache_hit {
                     // Cache hit: scan healthy_indices for the tenant (hash-free;
-                    // url() is cheap). "Healthy" excludes circuit-broken workers, so
-                    // a CB-tripped tenant falls through to min-load (intended).
+                    // url() is cheap). "Healthy" excludes circuit-broken workers,
+                    // so a CB-tripped tenant falls through to min-load (intended).
                     let tenant_url: &str = &result.tenant;
                     healthy_indices
                         .iter()
@@ -971,6 +1322,11 @@ impl CacheAwareV1Policy {
                 } else {
                     min_load_idx
                 };
+
+                let matched = if cache_hit { result.matched_token_count } else { 0 };
+                let new_tokens = base_tokens.saturating_sub(matched as i64);
+                selected_idx = candidate
+                    .filter(|&idx| !self.admission_rejects(&workers[idx], new_tokens));
 
                 // Insert for the selected worker (None => no insert, exactly
                 // like the old `if let Some(idx)` guard around insert_tokens).
@@ -996,21 +1352,65 @@ impl CacheAwareV1Policy {
                         .token_tree
                         .insert(kv_index::hash_token_path(tokens), matched_prefix);
                 }
+                if let Some(st) = st {
+                    self.emit_approx_score_trace(
+                        st, workers, "approx_token_tree", idx, cache_hit, match_rate,
+                    );
+                }
                 workers[idx].increment_processed();
                 return Some(idx);
             }
 
-            // Selected worker no longer exists or unhealthy - fall back to first healthy
-            // Stale entries will be cleaned up by LRU eviction
-            healthy_indices.first().copied()
+            // Selected worker no longer exists / unhealthy, OR was rejected by
+            // the admission gate. When the gate is enabled, pick the
+            // least-loaded admitting worker (inserting for it so cache state
+            // tracks the routing) and return None if none admits — the routing
+            // loop re-enqueues. When the gate is disabled, preserve the original
+            // first-healthy fallback (no insert; stale entries age out via LRU).
+            if self.config.enable_kv_admission_control {
+                let idx = self.first_admitting_by_load(workers, healthy_indices, base_tokens)?;
+                tree.insert_tokens(tokens, workers[idx].url());
+                if let Some(st) = st {
+                    self.emit_approx_score_trace(
+                        st, workers, "approx_token_tree_gate_fallback", idx, cache_hit, match_rate,
+                    );
+                }
+                workers[idx].increment_processed();
+                Some(idx)
+            } else {
+                let idx = healthy_indices.first().copied();
+                if let (Some(st), Some(idx)) = (st, idx) {
+                    self.emit_approx_score_trace(
+                        st, workers, "approx_token_tree_stale_fallback", idx, cache_hit, match_rate,
+                    );
+                }
+                idx
+            }
         } else {
             debug!(
                 "Warning: No token tree found for model '{}', using random worker selection",
                 model_id
             );
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            if self.config.enable_kv_admission_control {
+                let idx = self.first_admitting_by_load(workers, healthy_indices, base_tokens)?;
+                if let Some(st) = st {
+                    self.emit_approx_score_trace(
+                        st, workers, "approx_token_tree_no_tree", idx, false, 0.0,
+                    );
+                }
+                workers[idx].increment_processed();
+                Some(idx)
+            } else {
+                let mut rng = rand::rng();
+                let random_idx = rng.random_range(0..healthy_indices.len());
+                let idx = healthy_indices[random_idx];
+                if let Some(st) = st {
+                    self.emit_approx_score_trace(
+                        st, workers, "approx_token_tree_no_tree", idx, false, 0.0,
+                    );
+                }
+                Some(idx)
+            }
         }
     }
 
@@ -1022,6 +1422,7 @@ impl CacheAwareV1Policy {
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
         model_id: &str,
+        st: Option<&ScoreTraceCtx>,
     ) -> Option<usize> {
         let tree = self
             .string_trees
@@ -1034,14 +1435,18 @@ impl CacheAwareV1Policy {
             // + insert_text pair. Selection logic is unchanged (see the token
             // path for the per-branch rationale).
             let mut selected_idx: Option<usize> = None;
+            // Captured for score_trace.log (set inside the match closure).
+            let mut match_rate: f32 = 0.0;
+            let mut cache_hit = false;
             let result = tree.match_and_insert_with(text, |result| {
-                let match_rate = if result.input_char_count == 0 {
+                match_rate = if result.input_char_count == 0 {
                     0.0
                 } else {
                     result.matched_char_count as f32 / result.input_char_count as f32
                 };
+                cache_hit = match_rate > self.config.cache_threshold;
 
-                selected_idx = if match_rate > self.config.cache_threshold {
+                selected_idx = if cache_hit {
                     // Cache hit: scan healthy_indices for the tenant (hash-free;
                     // url() is cheap). "Healthy" excludes circuit-broken workers, so
                     // a CB-tripped tenant falls through to min-load (intended).
@@ -1078,13 +1483,24 @@ impl CacheAwareV1Policy {
                         .insert(path_hash, matched_prefix);
                 }
 
+                if let Some(st) = st {
+                    self.emit_approx_score_trace(
+                        st, workers, "approx_string_tree", idx, cache_hit, match_rate,
+                    );
+                }
                 workers[idx].increment_processed();
                 return Some(idx);
             }
 
             // Selected worker no longer exists or unhealthy - fall back to first healthy
             // Stale entries will be cleaned up by LRU eviction
-            healthy_indices.first().copied()
+            let idx = healthy_indices.first().copied();
+            if let (Some(st), Some(idx)) = (st, idx) {
+                self.emit_approx_score_trace(
+                    st, workers, "approx_string_tree_stale_fallback", idx, cache_hit, match_rate,
+                );
+            }
+            idx
         } else {
             debug!(
                 "Warning: No string tree found for model '{}', using random worker selection",
@@ -1092,7 +1508,13 @@ impl CacheAwareV1Policy {
             );
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            let idx = healthy_indices[random_idx];
+            if let Some(st) = st {
+                self.emit_approx_score_trace(
+                    st, workers, "approx_string_tree_no_tree", idx, false, 0.0,
+                );
+            }
+            Some(idx)
         }
     }
 }
@@ -1100,6 +1522,506 @@ impl CacheAwareV1Policy {
 impl Default for CacheAwareV1Policy {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse};
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    use super::*;
+    use crate::policies::kv_admits;
+    use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+    fn no_health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        }
+    }
+
+    /// Healthy workers (health checks disabled) for the given URLs.
+    fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
+        urls.iter()
+            .map(|u| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*u)
+                        .worker_type(WorkerType::Regular)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// One DP rank reporting the given KV state. `token_usage` is derived so
+    /// `is_imbalanced`'s KV triggers stay quiet unless we want them loud.
+    fn kv_snap(num_waiting: i32, used: i64, max: i64) -> WorkerLoadResponse {
+        let usage = if max > 0 {
+            (used as f64) / (max as f64)
+        } else {
+            0.0
+        };
+        WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                num_waiting_reqs: num_waiting,
+                num_used_tokens: used as i32,
+                max_total_num_tokens: max as i32,
+                token_usage: usage,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Inject per-worker (by index) KV snapshots; bind the sender to keep the
+    /// watch channel open.
+    fn inject_snaps(
+        policy: &CacheAwareV1Policy,
+        workers: &[Arc<dyn Worker>],
+        snaps: &[WorkerLoadResponse],
+    ) -> watch::Sender<HashMap<String, WorkerLoadResponse>> {
+        let map: HashMap<String, WorkerLoadResponse> = workers
+            .iter()
+            .zip(snaps)
+            .map(|(w, s)| (w.url().to_string(), s.clone()))
+            .collect();
+        let (tx, rx) = watch::channel(map);
+        policy.set_load_receiver(Some(rx));
+        tx
+    }
+
+    fn gated_policy() -> CacheAwareV1Policy {
+        CacheAwareV1Policy::with_config(CacheAwareConfig {
+            enable_kv_admission_control: true,
+            // Disable imbalance KV triggers so tests control which path runs;
+            // count-spread still works when we set worker.load() directly.
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            ..Default::default()
+        })
+    }
+
+    // ---- pure predicate ----
+
+    #[test]
+    fn kv_admits_reduces_to_single_rank() {
+        // waiting>0 => reject.
+        assert!(!kv_admits(&kv_snap(1, 0, 100), 10));
+        // fits => admit.
+        assert!(kv_admits(&kv_snap(0, 0, 100), 10));
+        // overflow => reject.
+        assert!(!kv_admits(&kv_snap(0, 95, 100), 10));
+        // exact fit (==) => admit.
+        assert!(kv_admits(&kv_snap(0, 90, 100), 10));
+        // empty snapshot => admit (no data, avoid deadlock).
+        assert!(kv_admits(&WorkerLoadResponse::default(), 10));
+    }
+
+    // ---- shared admission gate (LoadBalancingPolicy::admits default) ----
+
+    #[test]
+    fn admission_gate_count_cap_and_waiting_switch() {
+        use crate::policies::{AdmissionGateConfig, RequestNumBalancePolicy};
+        use crate::worker::EngineStats;
+
+        let policy = RequestNumBalancePolicy::new();
+        let cfg = AdmissionGateConfig {
+            max_concurrent_seqs_per_instance: 3,
+            reject_on_waiting: true,
+        };
+        let info = SelectWorkerInfo {
+            request_text: None,
+            tokens: None,
+            headers: None,
+            hash_ring: None,
+            priority_groups: None,
+            response_token_count: None,
+            score_trace: None,
+        };
+
+        // No snapshot yet (timestamp 0) and load 0 < cap => admit (count cap only).
+        let w: Arc<dyn Worker> = make_workers(&["http://gate-a:8000"]).remove(0);
+        assert!(policy.admits(&w, &info, &cfg));
+
+        // Count cap: load reaches the cap => reject, even without a snapshot.
+        for _ in 0..3 {
+            w.increment_load();
+        }
+        assert!(!policy.admits(&w, &info, &cfg));
+
+        // Neutered gate (count cap 0, no waiting gate) => always admit.
+        let off = AdmissionGateConfig {
+            max_concurrent_seqs_per_instance: 0,
+            reject_on_waiting: false,
+        };
+        assert!(policy.admits(&w, &info, &off));
+
+        // Waiting switch ON: a fresh worker whose snapshot reports any waiting => reject.
+        let w2: Arc<dyn Worker> = make_workers(&["http://gate-b:8000"]).remove(0);
+        let mut stats = EngineStats::default();
+        stats.scheduler_stats.num_waiting_reqs = 1;
+        w2.update_engine_stats(stats, 0);
+        assert!(!policy.admits(&w2, &info, &cfg));
+
+        // Waiting switch OFF: same worker with waiting=1 => admit (ignore queue).
+        let no_wait_gate = AdmissionGateConfig {
+            reject_on_waiting: false,
+            ..cfg
+        };
+        assert!(policy.admits(&w2, &info, &no_wait_gate));
+    }
+
+    #[test]
+    fn kv_admits_any_rank_dp() {
+        // One full rank, one free rank => admit (request lands on the free one).
+        let mut load = WorkerLoadResponse::default();
+        load.loads = vec![kv_snap(1, 99, 100).loads[0].clone(), kv_snap(0, 0, 100).loads[0].clone()];
+        assert!(kv_admits(&load, 10));
+        // Both ranks waiting => reject.
+        let mut load = WorkerLoadResponse::default();
+        load.loads = vec![kv_snap(1, 0, 100).loads[0].clone(), kv_snap(1, 0, 100).loads[0].clone()];
+        assert!(!kv_admits(&load, 10));
+    }
+
+    // ---- select_worker integration ----
+
+    #[test]
+    fn gate_disabled_preserves_always_route() {
+        // Gate off: even with every engine saturated, a worker is still chosen.
+        let policy = CacheAwareV1Policy::with_config(CacheAwareConfig {
+            enable_kv_admission_control: false,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let _tx = inject_snaps(
+            &policy,
+            &workers,
+            &[kv_snap(1, 99, 100), kv_snap(1, 99, 100)],
+        );
+        let tokens: Vec<u32> = (1..=32).collect();
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(idx < 2);
+    }
+
+    #[test]
+    fn gate_rejects_all_returns_none() {
+        // Gate on, every engine has a waiting queue => no candidate admits =>
+        // None (routing loop re-enqueues). KV usage kept low so count/KV
+        // imbalance triggers stay quiet and the token-tree path is exercised.
+        let policy = gated_policy();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        workers[0].update_engine_stats(engine_stats_with_waiting(1), 0);
+        workers[1].update_engine_stats(engine_stats_with_waiting(1), 0);
+        let tokens: Vec<u32> = (1..=32).collect();
+        let idx = policy.select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                tokens: Some(&tokens),
+                ..Default::default()
+            },
+        );
+        assert!(idx.is_none(), "all-saturated pool must return None, got {idx:?}");
+    }
+
+    #[test]
+    fn gate_prefix_subtraction_admits_cache_hit() {
+        // base = 32 tokens. Worker A already holds the full prefix (cache hit =>
+        // matched=32), so new KV = 0. Without subtraction A would overflow
+        // (95+32>100); with subtraction it admits (95+0<=100). Assert A wins.
+        let policy = gated_policy();
+        // Workers need a capacity label for the KV overflow check.
+        let workers = vec![
+            make_worker_with_capacity("http://w1:8000", 100),
+            make_worker_with_capacity("http://w2:8000", 100),
+        ];
+        policy.init_workers(&workers);
+        // First route with no engine stats (timestamp=0 → always admit): seeds tree on A.
+        let tokens: Vec<u32> = (1..=32).collect();
+        let first = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Now set A to 95 tokens used, no waiting. B stays unconstrained.
+        // 95 + 32 (full request) > 100, but 95 + 0 (matched prefix subtracted) <= 100.
+        workers[first].update_engine_stats(engine_stats_with_tokens(95, 5), 0);
+        let second = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "cache-hit worker must be re-selected thanks to prefix subtraction"
+        );
+    }
+
+    #[test]
+    fn gate_min_load_fallback_picks_admitting_worker() {
+        // Force count-spread imbalance (A load 20, B load 0) so the min-load
+        // path runs. B (the min-load pick) is saturated; A has room. The gate
+        // must reject B and fall back to A.
+        let policy = gated_policy();
+        let w = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&w);
+        for _ in 0..20 {
+            w[0].increment_load();
+        }
+        // B saturated (waiting); A has no snapshot → always admits.
+        w[1].update_engine_stats(engine_stats_with_waiting(1), 0);
+        let tokens: Vec<u32> = (1..=32).collect();
+        let idx = policy
+            .select_worker(
+                &w,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(idx, 0, "saturated min-load worker rejected; A (room) selected");
+    }
+
+    #[test]
+    fn gate_all_min_load_saturated_returns_none() {
+        // Imbalanced (count spread) and BOTH workers saturated => min-load path
+        // rejects both => None.
+        let policy = gated_policy();
+        let w = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&w);
+        for _ in 0..20 {
+            w[0].increment_load();
+        }
+        w[0].update_engine_stats(engine_stats_with_waiting(1), 0);
+        w[1].update_engine_stats(engine_stats_with_waiting(1), 0);
+        let tokens: Vec<u32> = (1..=32).collect();
+        let idx = policy.select_worker(
+            &w,
+            &SelectWorkerInfo {
+                tokens: Some(&tokens),
+                ..Default::default()
+            },
+        );
+        assert!(idx.is_none(), "all-saturated imbalanced pool must return None");
+    }
+
+    #[test]
+    fn gate_missing_snapshot_admits() {
+        // Only A has a snapshot (saturated); B has none => B admits (no data).
+        let policy = gated_policy();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        // A: waiting=1 → rejected. B: no engine_stats (timestamp=0) → always admits.
+        workers[0].update_engine_stats(engine_stats_with_waiting(1), 0);
+        let tokens: Vec<u32> = (1..=32).collect();
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "worker without a snapshot admits (graceful no-data)");
+    }
+
+    #[test]
+    fn gate_string_path_skipped() {
+        // HTTP/text requests carry no tokens, so the gate is skipped and a
+        // saturated pool still routes (string-tree path unchanged).
+        let policy = gated_policy();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let _tx = inject_snaps(
+            &policy,
+            &workers,
+            &[kv_snap(1, 99, 100), kv_snap(1, 99, 100)],
+        );
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(idx < 2);
+    }
+
+    // ---- engine_stats + inflight speculation (new KV read path) ----
+
+    use crate::worker::stats::{EngineSchedulerStats, EngineStats};
+    use std::collections::HashMap;
+
+    fn make_worker_with_capacity(url: &str, capacity: i64) -> Arc<dyn Worker> {
+        let mut labels = HashMap::new();
+        labels.insert("max_model_len".to_string(), capacity.to_string());
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .labels(labels)
+                .build(),
+        ) as Arc<dyn Worker>
+    }
+
+    fn engine_stats_with_tokens(prompt_tokens: usize, running: usize) -> EngineStats {
+        let mut map = HashMap::new();
+        for i in 0..running {
+            map.insert(format!("req-{i}"), prompt_tokens / running.max(1));
+        }
+        let total = map.values().sum();
+        EngineStats {
+            timestamp: chrono::Utc::now(),
+            scheduler_stats: EngineSchedulerStats {
+                req_id_to_prompt_token_num: map,
+                num_running_reqs: running,
+                total_prompt_tokens: total,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn engine_stats_with_waiting(waiting: usize) -> EngineStats {
+        EngineStats {
+            timestamp: chrono::Utc::now(),
+            scheduler_stats: EngineSchedulerStats {
+                num_waiting_reqs: waiting,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// inflight_tokens tightens the gate: worker admits at snapshot-only usage
+    /// but is rejected once inflight pushes effective used + new > capacity.
+    #[test]
+    fn spec_inflight_tightens_gate() {
+        let policy = gated_policy();
+        let w = make_worker_with_capacity("http://w1:8000", 100);
+        let workers = vec![w.clone()];
+        policy.init_workers(&workers);
+
+        // Snapshot: 60 tokens used (3 running), capacity 100 → 40 free.
+        w.update_engine_stats(engine_stats_with_tokens(60, 3), 0);
+
+        // First route: 30 new tokens, no inflight → 60+0+30=90 ≤ 100 → admits.
+        let tokens1: Vec<u32> = (1..=30).collect();
+        let idx = policy.select_worker(
+            &workers,
+            &SelectWorkerInfo { tokens: Some(&tokens1), ..Default::default() },
+        );
+        assert!(idx.is_some(), "should admit when 60+30 <= 100");
+
+        // Register 20 inflight tokens (a request admitted but not yet in snapshot).
+        let _id = w.register_inflight_tokens(20);
+
+        // Second route with DIFFERENT tokens (no cache hit → new_tokens = 32).
+        // effective_used = 60+20 = 80. 80+32 = 112 > 100 → reject → None.
+        let tokens2: Vec<u32> = (100..=131).collect();
+        let idx2 = policy.select_worker(
+            &workers,
+            &SelectWorkerInfo { tokens: Some(&tokens2), ..Default::default() },
+        );
+        assert!(idx2.is_none(), "inflight pushed over capacity → None (re-enqueue)");
+    }
+
+    /// No engine snapshot → always admit (graceful degrade).
+    #[test]
+    fn spec_no_snapshot_admits() {
+        let policy = gated_policy();
+        let w = make_worker_with_capacity("http://w1:8000", 100);
+        let workers = vec![w.clone()];
+        policy.init_workers(&workers);
+        // No update_engine_stats call → timestamp = 0.
+        let tokens: Vec<u32> = (1..=90).collect();
+        let idx = policy.select_worker(
+            &workers,
+            &SelectWorkerInfo { tokens: Some(&tokens), ..Default::default() },
+        );
+        assert!(idx.is_some(), "no snapshot → admit");
+    }
+
+    /// Waiting queue rejects even when KV has space.
+    #[test]
+    fn spec_waiting_queue_rejects() {
+        let policy = gated_policy();
+        let w = make_worker_with_capacity("http://w1:8000", 100);
+        let workers = vec![w.clone()];
+        policy.init_workers(&workers);
+        // Only 10 tokens used, but waiting > 0 → reject.
+        w.update_engine_stats(engine_stats_with_waiting(1), 0);
+        let tokens: Vec<u32> = (1..=10).collect();
+        let idx = policy.select_worker(
+            &workers,
+            &SelectWorkerInfo { tokens: Some(&tokens), ..Default::default() },
+        );
+        assert!(idx.is_none(), "waiting queue → reject");
+    }
+
+    /// No capacity label → admit even if gate is on (can't check, don't block).
+    #[test]
+    fn spec_no_capacity_label_admits() {
+        let policy = gated_policy();
+        let workers = make_workers(&["http://w1:8000"]);
+        policy.init_workers(&workers);
+        workers[0].update_engine_stats(engine_stats_with_tokens(90, 5), 0);
+        let tokens: Vec<u32> = (1..=50).collect();
+        let idx = policy.select_worker(
+            &workers,
+            &SelectWorkerInfo { tokens: Some(&tokens), ..Default::default() },
+        );
+        assert!(idx.is_some(), "no max_model_len label → admit");
+    }
+
+    /// KV imbalance trigger uses effective usage (snapshot + inflight).
+    #[test]
+    fn spec_imbalance_trigger_sees_effective_usage() {
+        let policy = CacheAwareV1Policy::with_config(CacheAwareConfig {
+            enable_kv_admission_control: true,
+            overload_token_usage_threshold: 0.9,
+            balance_token_usage_threshold: 0.2, // tight spread threshold
+            ..Default::default()
+        });
+        let w1 = make_worker_with_capacity("http://w1:8000", 100);
+        let w2 = make_worker_with_capacity("http://w2:8000", 100);
+        let workers = vec![w1.clone(), w2.clone()];
+        policy.init_workers(&workers);
+
+        // Both workers low at 10 tokens. Spread = 0 → NOT imbalanced yet.
+        w1.update_engine_stats(engine_stats_with_tokens(10, 1), 0);
+        w2.update_engine_stats(engine_stats_with_tokens(10, 1), 0);
+        let healthy = vec![0, 1];
+        assert!(!policy.is_imbalanced(&workers, &healthy, 1, 1));
+
+        // Add 40 inflight to w1 → effective w1 = 50, w2 = 10, spread = 0.4 > 0.2 → imbalanced.
+        let _id = w1.register_inflight_tokens(40);
+        assert!(
+            policy.is_imbalanced(&workers, &healthy, 1, 1),
+            "inflight on w1 should flip imbalanced"
+        );
     }
 }
 

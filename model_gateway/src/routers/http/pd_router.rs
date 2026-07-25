@@ -875,6 +875,7 @@ impl PDRouter {
                     hash_ring,
                     response_token_count: None,
                     priority_groups: None,
+                    score_trace: None,
                 },
             )
             .ok_or_else(|| {

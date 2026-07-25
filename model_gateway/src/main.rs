@@ -193,6 +193,12 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
+    /// KV-capacity admission control: reject candidates that would queue behind
+    /// waiting requests or exceed KV token capacity; if all candidates are
+    /// rejected the request is re-enqueued by the routing loop. Off by default.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    enable_kv_admission_control: bool,
+
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
     eviction_interval: u64,
@@ -1034,6 +1040,8 @@ impl CliArgs {
                 lmcache_overlap_weight: self.lmcache_overlap_weight,
                 balance_token_usage_threshold: self.balance_token_usage_threshold,
                 overload_token_usage_threshold: self.overload_token_usage_threshold,
+                enable_kv_admission_control: self.enable_kv_admission_control,
+                kv_capacity_threshold: 1.0,
             },
             "cache_aware_v1" => PolicyConfig::CacheAwareV1 {
                 cache_threshold: self.cache_threshold,
@@ -1046,6 +1054,8 @@ impl CliArgs {
                 lmcache_overlap_weight: self.lmcache_overlap_weight,
                 balance_token_usage_threshold: self.balance_token_usage_threshold,
                 overload_token_usage_threshold: self.overload_token_usage_threshold,
+                enable_kv_admission_control: self.enable_kv_admission_control,
+                kv_capacity_threshold: 1.0,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,

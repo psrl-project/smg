@@ -32,7 +32,7 @@ use super::WorkerSelectorStrategy;
 use crate::{
     config::types::CandidateSortKey,
     observability::metrics::{metrics_labels, Metrics},
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{PolicyRegistry, ScoreTraceCtx, SelectWorkerInfo},
     routers::{
         error,
         grpc::{
@@ -118,6 +118,8 @@ pub(crate) struct PsrlWorkerSelector {
     /// that concurrent dispatch tasks cannot all read equal loads and pick the
     /// same worker before any increment has been registered.
     selection_lock: parking_lot::Mutex<()>,
+    /// Strategy-agnostic admission gate applied to candidates in Stage 5.
+    gate_config: crate::policies::AdmissionGateConfig,
 }
 
 impl PsrlWorkerSelector {
@@ -128,10 +130,13 @@ impl PsrlWorkerSelector {
         candidate_sort_key: CandidateSortKey,
         enable_group_sticky: bool,
         kv_transfer: Option<Arc<KvTransferCoordinator>>,
+        gate_config: crate::policies::AdmissionGateConfig,
     ) -> Self {
         info!(
             enable_group_sticky,
             kv_transfer_enabled = kv_transfer.is_some(),
+            max_concurrent_seqs_per_instance = gate_config.max_concurrent_seqs_per_instance,
+            admission_reject_on_waiting = gate_config.reject_on_waiting,
             "PSRL worker selector initialized (sticky config)"
         );
         Self {
@@ -142,6 +147,7 @@ impl PsrlWorkerSelector {
             enable_group_sticky,
             kv_transfer,
             selection_lock: parking_lot::Mutex::new(()),
+            gate_config,
         }
     }
 
@@ -228,11 +234,16 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
         }
 
         // ── Stage 2: trajectory sticky pin ──────────────────────────────────
-        // Only `is_sticky` pins to the previous instance. Non-sticky requests
-        // keep `rollout_instance_hint` as the KV-transfer source but are free
-        // to land on any eligible worker (policy / cache-aware / load balance).
+        // `is_sticky` pins the whole trajectory to the previous instance;
+        // `force_pin_once` pins only this first selection (set by the session
+        // hang/continue scheduler when readmitting a hung session onto a chosen
+        // instance, and cleared by the routing loop on the first loopback).
+        // Either flag routes directly to the hinted instance. Non-sticky
+        // requests (including partial-rollout loopbacks) keep
+        // `rollout_instance_hint` as the KV-transfer source but are free to land
+        // on any eligible worker (policy / cache-aware / load balance).
         // Coordinator-side imbalance migration is independent of this stage.
-        if meta.is_sticky {
+        if meta.is_sticky || meta.force_pin_once {
             if let Some(ref hint) = meta.rollout_instance_hint {
                 let pinned: Vec<Arc<dyn Worker>> = candidates
                     .iter()
@@ -471,34 +482,134 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
 
         // Atomically select worker and increment its load to prevent TOCTOU.
         // All async work (RPCs) in Stages 1–4 completes before this point;
-        // the lock is held only for the synchronous find-min + increment step.
+        // the lock is held only for the synchronous gate + find-min + increment.
         let selected = {
             let _lock = self.selection_lock.lock();
+
+            // ── Admission gate (strategy-agnostic, always active) ───────────
+            // Keep only candidates that can accept the request without pushing
+            // the instance into a queued/overloaded state. Under `selection_lock`
+            // so the `load()` count cap is exact vs the `increment_load()` below.
+            // If every candidate is rejected, return None → the routing loop
+            // re-enqueues the request (wait) instead of piling onto a full
+            // instance (matches the old Python router's `_can_run_directly`).
+            // Neuter by setting the limbs permissively (count cap 0 / large,
+            // reject_on_waiting false, overload_kv >= 1.0).
+            let (gated_candidates, gated_groups): (Vec<Arc<dyn Worker>>, Vec<i64>) = {
+                let gate_info = SelectWorkerInfo {
+                    request_text: text,
+                    tokens,
+                    headers,
+                    hash_ring: hash_ring.clone(),
+                    priority_groups: None,
+                    response_token_count: meta.response_token_count,
+                    score_trace: None,
+                };
+                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                let mut cands = Vec::with_capacity(sorted_candidates.len());
+                let mut groups = Vec::with_capacity(sorted_candidates.len());
+                for (i, w) in sorted_candidates.iter().enumerate() {
+                    match policy.admission_reject_reason(w, &gate_info, &self.gate_config) {
+                        None => {
+                            cands.push(w.clone());
+                            groups.push(priority_groups[i]);
+                        }
+                        Some(reason) => {
+                            // Fine-grained admission diagnostic: speculative
+                            // (router's view) vs real (engine snapshot) + how
+                            // stale that snapshot is. Emitted on the dedicated
+                            // `route_trace` target so it lands in route_trace.log
+                            // regardless of the global (warn) log level.
+                            let ts = w.engine_stats_timestamp_ms();
+                            let st = w.engine_stats_arc();
+                            info!(
+                                target: "route_trace",
+                                event = "admission_reject",
+                                request_id,
+                                prompt_id = meta.prompt_id,
+                                worker = %w.url(),
+                                reason,
+                                spec_load = w.load(),
+                                spec_inflight_tokens = w.inflight_tokens_sum(),
+                                real_running = st.scheduler_stats.num_running_reqs,
+                                real_waiting = st.scheduler_stats.num_waiting_reqs,
+                                real_kv_usage = st.scheduler_stats.kv_cache_usage,
+                                stats_age_ms = now_ms.saturating_sub(ts),
+                                stats_ever = ts != 0,
+                                reject_on_waiting = self.gate_config.reject_on_waiting,
+                                max_concurrent = self.gate_config.max_concurrent_seqs_per_instance,
+                                "admission reject"
+                            );
+                        }
+                    }
+                }
+                (cands, groups)
+            };
+
+            if gated_candidates.is_empty() {
+                info!(
+                    target: "route_trace",
+                    event = "admission_all_rejected",
+                    request_id,
+                    num_candidates = sorted_candidates.len(),
+                    "admission: ALL candidates rejected; re-enqueue (wait)"
+                );
+                return None;
+            }
+
             // Log per-worker loads before selection so we can confirm balance.
-            let loads_before: Vec<(String, usize)> = sorted_candidates
+            let loads_before: Vec<(String, usize)> = gated_candidates
                 .iter()
                 .map(|w| (w.url().to_string(), w.load()))
                 .collect();
+            // Build score-trace display metadata only when the dedicated
+            // `score_trace` target is enabled — instance-id resolution costs a
+            // registry lookup per candidate, so it stays off the hot path
+            // otherwise. `instance_ids` is indexed identically to
+            // `gated_candidates` (same convention as `priority_groups`).
+            let score_trace_data = tracing::enabled!(
+                target: crate::observability::logging::SCORE_TRACE_TARGET,
+                tracing::Level::INFO
+            )
+            .then(|| {
+                let instance_ids: Vec<String> = gated_candidates
+                    .iter()
+                    .map(|w| self.worker_instance_id(w).0)
+                    .collect();
+                let prev = meta
+                    .rollout_instance_hint
+                    .as_ref()
+                    .map(|(id, _)| id.clone());
+                (instance_ids, prev)
+            });
             let idx = policy.select_worker(
-                &sorted_candidates,
+                &gated_candidates,
                 &SelectWorkerInfo {
                     request_text: text,
                     tokens,
                     headers,
                     hash_ring,
-                    priority_groups: Some(&priority_groups),
+                    priority_groups: Some(&gated_groups),
                     response_token_count: meta.response_token_count,
+                    score_trace: score_trace_data.as_ref().map(|(ids, prev)| {
+                        ScoreTraceCtx {
+                            request_id,
+                            prompt_id: meta.prompt_id,
+                            instance_ids: ids,
+                            prev_instance_id: prev.as_deref(),
+                        }
+                    }),
                 },
             )?;
-            sorted_candidates[idx].increment_load();
+            gated_candidates[idx].increment_load();
             info!(
                 request_id,
-                selected_url = %sorted_candidates[idx].url(),
+                selected_url = %gated_candidates[idx].url(),
                 selected_load_before = loads_before[idx].1,
                 candidate_loads = ?loads_before.iter().map(|(u, l)| format!("{}={}", u, l)).collect::<Vec<_>>(),
                 "PSRL Stage 5: worker selected"
             );
-            sorted_candidates[idx].clone()
+            gated_candidates[idx].clone()
         };
 
         Metrics::record_worker_selection(
@@ -619,6 +730,8 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
             let stats = selected.engine_stats().scheduler_stats;
             let prompt_tokens = tokens.map(<[u32]>::len).unwrap_or(0);
             let response_tokens = meta.response_token_count.unwrap_or(0);
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let stats_ts = selected.engine_stats_timestamp_ms();
             info!(
                 target: "route_trace",
                 event = "route",
@@ -633,6 +746,12 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                 dst_running = stats.num_running_reqs,
                 dst_waiting = stats.num_waiting_reqs,
                 dst_kv_cache_usage = stats.kv_cache_usage,
+                // Speculative (router's view) vs real (engine snapshot) + staleness,
+                // so we can tell whether the gate admitted on stale data.
+                spec_load = selected.load(),
+                spec_inflight_tokens = selected.inflight_tokens_sum(),
+                stats_age_ms = now_ms.saturating_sub(stats_ts),
+                stats_ever = stats_ts != 0,
                 "route"
             );
         }
@@ -764,6 +883,7 @@ mod tests {
             CandidateSortKey::Version,
             true,
             None,
+            crate::policies::AdmissionGateConfig::default(),
         );
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://worker-a:8000")
@@ -784,6 +904,7 @@ mod tests {
             CandidateSortKey::Version,
             true,
             None,
+            crate::policies::AdmissionGateConfig::default(),
         )
     }
 
@@ -794,6 +915,7 @@ mod tests {
             version_tag,
             is_validate: false,
             is_sticky: false,
+            force_pin_once: false,
             rollout_instance_hint: None,
             response_token_count: None,
         }
@@ -846,6 +968,19 @@ mod tests {
         let pinned: Vec<_> = instances.iter().filter(|inst| *inst == &hint).collect();
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0], &hint);
+    }
+
+    /// Stage 2 gate: either `is_sticky` or `force_pin_once` enables the pin.
+    #[test]
+    fn stage2_pin_gate_honours_force_pin_once() {
+        // force_pin_once alone (without is_sticky) must enable the pin.
+        let mut meta = make_meta(1);
+        meta.force_pin_once = true;
+        assert!(meta.is_sticky || meta.force_pin_once);
+
+        // Neither flag → no pin.
+        let plain = make_meta(1);
+        assert!(!(plain.is_sticky || plain.force_pin_once));
     }
 
     /// WorkerSelectionKey ordering follows ascending indicator order.

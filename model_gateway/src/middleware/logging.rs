@@ -8,13 +8,16 @@ use std::time::Duration;
 
 use axum::{extract::Request, response::Response};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
-use tracing::{error, field::Empty, info, info_span, warn, Span};
+use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{metrics::matched_path_label, request_id::RequestId};
 use crate::observability::{
     metrics::{method_to_static_str, Metrics},
     otel_trace::extract_trace_context_http,
+};
+use crate::routers::error::{
+    extract_error_code_from_response, PROMPT_OVERFLOW_ERROR_CODE,
 };
 
 /// Custom span maker that includes request ID
@@ -95,10 +98,21 @@ impl<B> OnResponse<B> for ResponseLogger {
                 "request failed with server error"
             );
         } else if status.is_client_error() {
-            warn!(
-                target: "smg::response",
-                "request failed with client error"
-            );
+            // prompt_overflow is an expected RL termination; do not treat it as
+            // a generic client error. Other 4xx responses keep the WARN.
+            let error_code = extract_error_code_from_response(response);
+            if error_code == PROMPT_OVERFLOW_ERROR_CODE {
+                debug!(
+                    target: "smg::response",
+                    error_code,
+                    "request terminated with prompt_overflow"
+                );
+            } else {
+                warn!(
+                    target: "smg::response",
+                    "request failed with client error"
+                );
+            }
         } else {
             info!(
                 target: "smg::response",

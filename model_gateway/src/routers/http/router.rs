@@ -186,6 +186,7 @@ impl Router {
                 hash_ring,
                 response_token_count: None,
                 priority_groups: None,
+                score_trace: None,
             },
         )?;
 
@@ -579,6 +580,7 @@ impl Router {
                 hash_ring,
                 response_token_count: None,
                 priority_groups: None,
+                score_trace: None,
             },
         ) {
             Some(i) => i,

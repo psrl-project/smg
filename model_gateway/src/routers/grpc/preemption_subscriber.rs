@@ -108,19 +108,31 @@ pub async fn subscribe_preemptions(instance_id: WorkerId, client: VllmEngineClie
                                 continue;
                             }
 
-                            debug!(
-                                "Received {} preempted request(s) from {:?}",
-                                event.request_ids.len(),
-                                instance_id
+                            let req_ids = event.request_ids;
+                            let n = req_ids.len();
+                            info!(
+                                target: "route_trace",
+                                event = "preempt_recv",
+                                instance = ?instance_id,
+                                num_reqs = n,
+                                age_ms = (age_ns / 1_000_000) as u64,
+                                "preemption event received"
                             );
 
                             // Batch abort: one RPC for all IDs in the event,
                             // reducing latency from O(N × RTT) to O(1 RTT).
-                            if let Err(e) = client.abort_request(event.request_ids).await {
-                                warn!(
+                            match client.abort_request(req_ids).await {
+                                Ok(_) => info!(
+                                    target: "route_trace",
+                                    event = "preempt_abort_ok",
+                                    instance = ?instance_id,
+                                    num_reqs = n,
+                                    "aborted preempted requests"
+                                ),
+                                Err(e) => warn!(
                                     "Failed to batch-abort preempted requests on {:?}: {}",
                                     instance_id, e
-                                );
+                                ),
                             }
                         }
                         Ok(None) => {

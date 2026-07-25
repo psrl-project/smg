@@ -43,6 +43,8 @@ impl PolicyFactory {
                 lmcache_overlap_weight,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                enable_kv_admission_control,
+                kv_capacity_threshold,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -55,6 +57,8 @@ impl PolicyFactory {
                     lmcache_overlap_weight: *lmcache_overlap_weight,
                     balance_token_usage_threshold: *balance_token_usage_threshold,
                     overload_token_usage_threshold: *overload_token_usage_threshold,
+                    enable_kv_admission_control: *enable_kv_admission_control,
+                    kv_capacity_threshold: *kv_capacity_threshold,
                 };
                 Ok(Arc::new(CacheAwarePolicy::with_config(config)))
             }
@@ -69,6 +73,8 @@ impl PolicyFactory {
                 lmcache_overlap_weight,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                enable_kv_admission_control,
+                kv_capacity_threshold,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -81,6 +87,8 @@ impl PolicyFactory {
                     lmcache_overlap_weight: *lmcache_overlap_weight,
                     balance_token_usage_threshold: *balance_token_usage_threshold,
                     overload_token_usage_threshold: *overload_token_usage_threshold,
+                    enable_kv_admission_control: *enable_kv_admission_control,
+                    kv_capacity_threshold: *kv_capacity_threshold,
                 };
                 Ok(Arc::new(CacheAwareV1Policy::with_config(config)))
             }
@@ -213,7 +221,7 @@ mod tests {
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RoundRobin).unwrap();
         assert_eq!(policy.name(), "round_robin");
 
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::Passthrough);
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::Passthrough).unwrap();
         assert_eq!(policy.name(), "passthrough");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
@@ -233,6 +241,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+        enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
         })
         .unwrap();
         assert_eq!(policy.name(), "cache_aware");

@@ -166,8 +166,12 @@ mod pd_routing_unit_tests {
                     eviction_interval_secs: 60,
                     max_tree_size: 1000000,
                     block_size: 16,
+                    gpu_overlap_weight: 1.0,
+                    lmcache_overlap_weight: 0.5,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
                 },
             ),
             (

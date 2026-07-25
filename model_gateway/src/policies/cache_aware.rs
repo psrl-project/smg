@@ -50,7 +50,9 @@ use std::{
 };
 
 use dashmap::DashMap;
-use kv_index::{compute_request_content_hashes, PositionalIndexer, Tier, TokenTree, Tree};
+use kv_index::{
+    compute_request_content_hashes, PositionalIndexer, Tier, TieredIndexer, TokenTree, Tree,
+};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::Rng;
@@ -1250,8 +1252,12 @@ mod tests {
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+        enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -1406,6 +1412,8 @@ mod tests {
             eviction_interval_secs: 0,
             balance_token_usage_threshold: 0.3,
             overload_token_usage_threshold: 0.95,
+            enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
             ..Default::default()
         });
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -1764,6 +1772,32 @@ mod tests {
         indexer
     }
 
+    /// Helper: create a `TieredIndexer` (GPU tier) and store blocks for a worker.
+    /// Mirror of `setup_indexer_with_blocks`, but returns the type `KvEventMonitor`
+    /// now stores (`Arc<TieredIndexer>` instead of `Arc<PositionalIndexer>`).
+    fn setup_tiered_indexer_with_blocks(
+        worker_url: &str,
+        token_chunks: &[&[u32]],
+        jump_size: usize,
+    ) -> Arc<TieredIndexer> {
+        let indexer = Arc::new(TieredIndexer::new(jump_size));
+        let worker_id = indexer.intern_worker(Tier::GPU, worker_url).unwrap();
+        let mut wb = WorkerBlockMap::default();
+        let blocks: Vec<StoredBlock> = token_chunks
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| StoredBlock {
+                seq_hash: SequenceHash(i as u64 + 1),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer
+            .tier(Tier::GPU)
+            .apply_stored(worker_id, &blocks, None, &mut wb)
+            .unwrap();
+        indexer
+    }
+
     fn test_config() -> CacheAwareConfig {
         CacheAwareConfig {
             eviction_interval_secs: 0,
@@ -2049,7 +2083,7 @@ mod tests {
         // Set up monitor with indexer data for "unknown" model
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
         let indexer =
-            setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+            setup_tiered_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -2088,7 +2122,7 @@ mod tests {
 
         // Monitor has indexer with data, but tokens don't match
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let indexer = setup_tiered_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -2125,7 +2159,7 @@ mod tests {
         policy.init_workers(&workers);
 
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        let indexer = setup_tiered_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
 
@@ -2226,14 +2260,17 @@ mod tests {
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
 
         // Store blocks using block_size=8 (tokens chunked in groups of 8)
-        let indexer = Arc::new(PositionalIndexer::new(4));
-        let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
+        let indexer = Arc::new(TieredIndexer::new(4));
+        let w1_id = indexer.intern_worker(Tier::GPU, "http://w1:8000").unwrap();
         let mut wb = WorkerBlockMap::default();
         let block = vec![StoredBlock {
             seq_hash: SequenceHash(1),
             content_hash: compute_content_hash(&[1, 2, 3, 4, 5, 6, 7, 8]),
         }];
-        indexer.apply_stored(w1_id, &block, None, &mut wb).unwrap();
+        indexer
+            .tier(Tier::GPU)
+            .apply_stored(w1_id, &block, None, &mut wb)
+            .unwrap();
         monitor
             .indexers
             .insert("unknown".to_string(), indexer.clone());
@@ -2266,6 +2303,8 @@ mod tests {
             block_size: 4,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
             ..Default::default()
         });
 
@@ -2327,7 +2366,7 @@ mod tests {
 
         // Set up monitor with an empty indexer
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let empty_indexer = Arc::new(PositionalIndexer::new(4));
+        let empty_indexer = Arc::new(TieredIndexer::new(4));
         monitor
             .indexers
             .insert("unknown".to_string(), empty_indexer);

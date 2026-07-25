@@ -41,6 +41,8 @@ class RouterArgs:
     lmcache_overlap_weight: float = 0.5  # Weight for LMCache-tier (off-GPU) cache hits
     balance_token_usage_threshold: float = 1.0  # KV spread trigger; >= 1.0 disables
     overload_token_usage_threshold: float = 1.0  # KV ceiling trigger; >= 1.0 disables
+    enable_kv_admission_control: bool = False  # Reject candidates that would queue/overflow KV; re-enqueue instead
+    kv_capacity_threshold: float = 1.0  # Fraction of KV capacity at which to refuse admission (e.g. 0.9 reserves headroom for decode); 1.0 = full capacity
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -403,6 +405,26 @@ class RouterArgs:
             help=(
                 "KV-utilization ceiling (0.0-1.0): hottest backend above it triggers shedding."
                 " >= 1.0 disables (default)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}enable-kv-admission-control",
+            action="store_true",
+            default=RouterArgs.enable_kv_admission_control,
+            help=(
+                "KV-capacity admission control: reject candidates that would queue behind"
+                " waiting requests or exceed KV token capacity; the request is re-enqueued"
+                " by the routing loop instead. Off by default."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}kv-capacity-threshold",
+            type=float,
+            default=RouterArgs.kv_capacity_threshold,
+            help=(
+                "Fraction of KV capacity (0.0–1.0] at which admission is refused when"
+                " enable_kv_admission_control is on. Values below 1.0 reserve headroom"
+                " for response-token growth during decode (e.g. 0.9). Default: 1.0."
             ),
         )
         routing_group.add_argument(

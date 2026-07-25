@@ -4,7 +4,31 @@ use axum::response::Response;
 use http::StatusCode;
 use tonic::Code;
 
-use crate::routers::error;
+use crate::routers::error::{self, PROMPT_OVERFLOW_ERROR_CODE};
+
+const PROMPT_OVERFLOW_MARKERS: &[&str] = &[
+    "longer than the maximum model length",
+    "exceeds the model's maximum context length",
+];
+
+/// Return whether `status` is a prompt-overflow INVALID_ARGUMENT.
+///
+/// Prefers the servicer's `x-smg-error-code` trailing metadata when present,
+/// then falls back to well-known vLLM / servicer message markers.
+pub(crate) fn is_prompt_overflow_status(status: &tonic::Status) -> bool {
+    if status.code() != Code::InvalidArgument {
+        return false;
+    }
+    if let Some(value) = status.metadata().get("x-smg-error-code") {
+        if value.to_str().ok() == Some(PROMPT_OVERFLOW_ERROR_CODE) {
+            return true;
+        }
+    }
+    let message = status.message();
+    PROMPT_OVERFLOW_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
@@ -52,5 +76,37 @@ impl<T> TonicResultExt for Result<T, tonic::Status> {
     fn cb_status_code(&self) -> u16 {
         self.as_ref()
             .map_or_else(|e| e.http_status().as_u16(), |_| 200)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::metadata::MetadataMap;
+
+    #[test]
+    fn detects_prompt_overflow_from_message() {
+        let status = tonic::Status::invalid_argument(
+            "The prompt (length 32828) is longer than the maximum model length of 32768.",
+        );
+        assert!(is_prompt_overflow_status(&status));
+    }
+
+    #[test]
+    fn detects_prompt_overflow_from_metadata() {
+        let mut metadata = MetadataMap::new();
+        metadata.insert("x-smg-error-code", PROMPT_OVERFLOW_ERROR_CODE.parse().unwrap());
+        let status = tonic::Status::with_metadata(
+            Code::InvalidArgument,
+            "overlong",
+            metadata,
+        );
+        assert!(is_prompt_overflow_status(&status));
+    }
+
+    #[test]
+    fn ignores_other_invalid_argument() {
+        let status = tonic::Status::invalid_argument("temperature must be >= 0");
+        assert!(!is_prompt_overflow_status(&status));
     }
 }

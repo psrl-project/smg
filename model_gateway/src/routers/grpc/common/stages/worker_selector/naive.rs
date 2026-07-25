@@ -92,6 +92,7 @@ impl WorkerSelectorStrategy for NaiveWorkerSelector {
                     hash_ring,
                     priority_groups: None,
                     response_token_count: None,
+                    score_trace: None,
                 },
             )?;
             available[idx].increment_load();

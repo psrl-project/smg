@@ -24,6 +24,12 @@ struct ErrorDetail<'a> {
 
 pub const HEADER_X_SMG_ERROR_CODE: &str = "X-SMG-Error-Code";
 
+/// Expected RL termination: prompt exceeded the worker's max_model_len.
+///
+/// Distinct from generic 400s / `start_generation_failed`. Downstream (PSRL)
+/// maps this header to `PromptOverflowError` and truncates the trajectory.
+pub const PROMPT_OVERFLOW_ERROR_CODE: &str = "prompt_overflow";
+
 pub fn internal_error(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::INTERNAL_SERVER_ERROR, code, message)
 }

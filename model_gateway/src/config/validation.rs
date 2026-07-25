@@ -253,6 +253,8 @@ impl ConfigValidator {
                 lmcache_overlap_weight,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                enable_kv_admission_control: _,
+                kv_capacity_threshold: _,
             }
             | PolicyConfig::CacheAwareV1 {
                 cache_threshold,
@@ -265,6 +267,8 @@ impl ConfigValidator {
                 lmcache_overlap_weight,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                enable_kv_admission_control: _,
+                kv_capacity_threshold: _,
             } => {
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -993,6 +997,8 @@ mod tests {
                 lmcache_overlap_weight: 0.5,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+            enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
             },
         );
 
@@ -1017,6 +1023,8 @@ mod tests {
                 lmcache_overlap_weight: 0.5,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+            enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
             },
         );
 
@@ -1076,6 +1084,8 @@ mod tests {
                 lmcache_overlap_weight: 0.5,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+            enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
             },
         );
 
@@ -1125,6 +1135,8 @@ mod tests {
                     lmcache_overlap_weight: 0.5,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,

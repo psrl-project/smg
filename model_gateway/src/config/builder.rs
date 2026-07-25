@@ -136,6 +136,8 @@ impl RouterConfigBuilder {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            enable_kv_admission_control: false,
+            kv_capacity_threshold: 1.0,
         };
         self
     }
@@ -345,6 +347,17 @@ impl RouterConfigBuilder {
 
     pub fn psrl_kv_transfer(mut self, config: KvTransferConfig) -> Self {
         self.config.psrl.kv_transfer = config;
+        self
+    }
+
+    /// Configure the strategy-agnostic admission gate (PSRL selector Stage 5).
+    pub fn psrl_admission(
+        mut self,
+        max_concurrent_seqs_per_instance: usize,
+        reject_on_waiting: bool,
+    ) -> Self {
+        self.config.psrl.max_concurrent_seqs_per_instance = max_concurrent_seqs_per_instance;
+        self.config.psrl.admission_reject_on_waiting = reject_on_waiting;
         self
     }
 

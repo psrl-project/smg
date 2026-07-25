@@ -144,6 +144,8 @@ mod tests {
             registry.register(Arc::clone(w)).unwrap();
         }
         let job_queue = Arc::new(std::sync::OnceLock::new());
+        let instance_to_version_after_sync: Arc<dashmap::DashMap<(String, usize), i64>> =
+            Arc::new(dashmap::DashMap::new());
 
         Arc::new(AppContext {
             client: reqwest::Client::new(),
@@ -171,12 +173,21 @@ mod tests {
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             wasm_manager: None,
-            worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
+            worker_service: Arc::new(WorkerService::new(
+                registry,
+                job_queue,
+                router_config,
+                instance_to_version_after_sync.clone(),
+            )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            preemption_monitor: None,
+            routing_loop_runtime: None,
+            instance_to_version_after_sync,
+            tito_store: None,
         })
     }
 

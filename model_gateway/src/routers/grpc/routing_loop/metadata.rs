@@ -13,6 +13,13 @@ pub(crate) struct RoutingMeta {
     pub version_tag: i64,
     pub is_validate: bool,
     pub is_sticky: bool,
+    /// One-shot pin: when set, this request is pinned to `rollout_instance_hint`
+    /// for its FIRST worker selection only, independent of `is_sticky`. Unlike
+    /// `is_sticky` (which pins for the whole trajectory), this is cleared on the
+    /// first partial-rollout / preemption loopback so re-dispatch falls back to
+    /// free routing. Set by the session hang/continue scheduler when it readmits
+    /// a hung session onto a chosen instance.
+    pub force_pin_once: bool,
     pub rollout_instance_hint: Option<(String, usize)>,
     /// Number of tokens already generated in previous partial-rollout iterations.
     pub response_token_count: Option<usize>,
@@ -39,6 +46,9 @@ pub(crate) fn parse_routing_request_meta(
     let is_sticky = parse_bool_header(headers, "x-is-sticky")
         .or_else(|| parse_bool_from_body(body, "is_sticky"))
         .unwrap_or(false);
+    let force_pin_once = parse_bool_header(headers, "x-force-pin-once")
+        .or_else(|| parse_bool_from_body(body, "force_pin_once"))
+        .unwrap_or(false);
     let rollout_instance_hint = parse_rollout_instance_hint_from_headers(headers)
         .or_else(|| parse_rollout_instance_hint_from_body(body));
     let response_token_count = parse_usize_header(headers, "x-response-token-count");
@@ -49,6 +59,7 @@ pub(crate) fn parse_routing_request_meta(
         version_tag,
         is_validate,
         is_sticky,
+        force_pin_once,
         rollout_instance_hint,
         response_token_count,
     })
@@ -238,6 +249,7 @@ mod tests {
                 version_tag: 3,
                 is_validate: true,
                 is_sticky: true,
+                force_pin_once: false,
                 rollout_instance_hint: Some(("worker-a".to_string(), 2)),
                 response_token_count: None,
             })
@@ -284,9 +296,37 @@ mod tests {
                 version_tag: -1,
                 is_validate: false,
                 is_sticky: false,
+                force_pin_once: false,
                 rollout_instance_hint: Some(("worker-c".to_string(), 4)),
                 response_token_count: None,
             })
         );
+    }
+
+    #[test]
+    fn parse_force_pin_once_header() {
+        // force_pin_once is set independently of is_sticky and pins the request
+        // to the hinted instance for its first selection.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("9"));
+        headers.insert("x-prompt-id", HeaderValue::from_static("9"));
+        headers.insert("x-force-pin-once", HeaderValue::from_static("true"));
+        headers.insert("x-base-worker-id", HeaderValue::from_static("worker-d"));
+        headers.insert("x-target-dp-rank", HeaderValue::from_static("1"));
+
+        let meta = parse_routing_request_meta(Some(&headers), None).unwrap();
+        assert!(meta.force_pin_once);
+        assert!(!meta.is_sticky);
+        assert_eq!(meta.rollout_instance_hint, Some(("worker-d".to_string(), 1)));
+    }
+
+    #[test]
+    fn parse_force_pin_once_defaults_false() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("9"));
+        headers.insert("x-prompt-id", HeaderValue::from_static("9"));
+
+        let meta = parse_routing_request_meta(Some(&headers), None).unwrap();
+        assert!(!meta.force_pin_once);
     }
 }

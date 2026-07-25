@@ -21,6 +21,12 @@ const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 /// stdout and the main `smg` log.
 pub const ROUTE_TRACE_TARGET: &str = "route_trace";
 
+/// Dedicated tracing target for KV-cache-aware-v1 per-decision score events.
+/// Events with this target land in their own `score_trace` file (prev-instance
+/// vs best-instance score breakdown + decision channel) and are kept out of
+/// stdout and the main `smg` log, exactly like [`ROUTE_TRACE_TARGET`].
+pub const SCORE_TRACE_TARGET: &str = "score_trace";
+
 /// All workspace crate names (hyphens → underscores to match tracing targets).
 /// When no explicit log targets are configured, these crates get the configured
 /// log level while all external deps default to WARN.
@@ -144,7 +150,8 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         EnvFilter::new(filter_string)
     });
 
-    let mut layers = Vec::with_capacity(3);
+    // stdout + smg.log + route_trace.log + score_trace.log (+ optional otel).
+    let mut layers = Vec::with_capacity(5);
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_ansi(config.colorize)
@@ -156,11 +163,15 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         stdout_layer
             .json()
             .flatten_event(true)
-            .with_filter(filter_fn(|meta| meta.target() != ROUTE_TRACE_TARGET))
+            .with_filter(filter_fn(|meta| {
+                meta.target() != ROUTE_TRACE_TARGET && meta.target() != SCORE_TRACE_TARGET
+            }))
             .boxed()
     } else {
         stdout_layer
-            .with_filter(filter_fn(|meta| meta.target() != ROUTE_TRACE_TARGET))
+            .with_filter(filter_fn(|meta| {
+                meta.target() != ROUTE_TRACE_TARGET && meta.target() != SCORE_TRACE_TARGET
+            }))
             .boxed()
     };
 
@@ -211,11 +222,15 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
             file_layer
                 .json()
                 .flatten_event(true)
-                .with_filter(filter_fn(|meta| meta.target() != ROUTE_TRACE_TARGET))
+                .with_filter(filter_fn(|meta| {
+                    meta.target() != ROUTE_TRACE_TARGET && meta.target() != SCORE_TRACE_TARGET
+                }))
                 .boxed()
         } else {
             file_layer
-                .with_filter(filter_fn(|meta| meta.target() != ROUTE_TRACE_TARGET))
+                .with_filter(filter_fn(|meta| {
+                    meta.target() != ROUTE_TRACE_TARGET && meta.target() != SCORE_TRACE_TARGET
+                }))
                 .boxed()
         };
 
@@ -258,6 +273,44 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         };
 
         layers.push(route_layer);
+
+        // Dedicated KV-cache-aware-v1 score trace file. Only events emitted with
+        // the `score_trace` target land here (kept out of stdout and smg.log
+        // above). Fixed filename, truncated on each startup (no daily rotation).
+        let score_path = log_dir.join(format!("{SCORE_TRACE_TARGET}.log"));
+        let score_writer: Box<dyn std::io::Write + Send> = match File::create(&score_path) {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!("Failed to create score trace file {score_path:?}: {e}");
+                }
+                Box::new(std::io::sink())
+            }
+        };
+        let (score_non_blocking, score_guard) = tracing_appender::non_blocking(score_writer);
+        file_guards.push(score_guard);
+
+        let score_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
+            .with_writer(score_non_blocking);
+
+        let score_layer = if config.json_format {
+            score_layer
+                .json()
+                .flatten_event(true)
+                .with_filter(filter_fn(|meta| meta.target() == SCORE_TRACE_TARGET))
+                .boxed()
+        } else {
+            score_layer
+                .with_filter(filter_fn(|meta| meta.target() == SCORE_TRACE_TARGET))
+                .boxed()
+        };
+
+        layers.push(score_layer);
     }
 
     if let Some(otel_layer_config) = &otel_layer_config {

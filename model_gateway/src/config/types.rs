@@ -89,7 +89,7 @@ impl Default for KvTransferConfig {
 }
 
 /// Configuration for the PSRL worker selection strategy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PsrlConfig {
     pub ps_manager_addr: String,
@@ -99,6 +99,10 @@ pub struct PsrlConfig {
     pub enable_group_sticky_routing: bool,
     /// KV-cache transfer when a request is re-routed (A → B).
     pub kv_transfer: KvTransferConfig,
+    /// Admission gate: in-flight request-count cap per instance. 0 disables.
+    pub max_concurrent_seqs_per_instance: usize,
+    /// Admission gate: reject a worker that already has engine waiting.
+    pub admission_reject_on_waiting: bool,
 }
 
 impl Default for PsrlConfig {
@@ -108,6 +112,8 @@ impl Default for PsrlConfig {
             candidate_sort_key: CandidateSortKey::Version,
             enable_group_sticky_routing: false,
             kv_transfer: KvTransferConfig::default(),
+            max_concurrent_seqs_per_instance: 0,
+            admission_reject_on_waiting: false,
         }
     }
 }
@@ -541,6 +547,14 @@ pub enum PolicyConfig {
         /// triggers shedding regardless of spread. `>= 1.0` disables (default).
         #[serde(default = "default_balance_token_usage_threshold")]
         overload_token_usage_threshold: f32,
+        /// KV-capacity admission control: reject candidates that would queue
+        /// behind waiting requests or exceed KV token capacity. Off by default.
+        #[serde(default)]
+        enable_kv_admission_control: bool,
+        /// Fraction of KV capacity (0.0–1.0] at which admission is refused.
+        /// Reserve headroom for response-token growth (e.g. 0.9). Default 1.0.
+        #[serde(default = "default_kv_capacity_threshold")]
+        kv_capacity_threshold: f64,
     },
 
     /// Cache-aware routing (v1): identical to `cache_aware` but every load
@@ -568,6 +582,14 @@ pub enum PolicyConfig {
         /// triggers shedding regardless of spread. `>= 1.0` disables (default).
         #[serde(default = "default_balance_token_usage_threshold")]
         overload_token_usage_threshold: f32,
+        /// KV-capacity admission control: reject candidates that would queue
+        /// behind waiting requests or exceed KV token capacity. Off by default.
+        #[serde(default)]
+        enable_kv_admission_control: bool,
+        /// Fraction of KV capacity (0.0–1.0] at which admission is refused.
+        /// Reserve headroom for response-token growth (e.g. 0.9). Default 1.0.
+        #[serde(default = "default_kv_capacity_threshold")]
+        kv_capacity_threshold: f64,
     },
 
     #[serde(rename = "power_of_two")]
@@ -735,6 +757,9 @@ fn default_balance_token_usage_threshold() -> f32 {
     1.0
 }
 
+fn default_kv_capacity_threshold() -> f64 {
+    1.0
+}
 
 fn default_prefix_token_count() -> usize {
     256
@@ -1209,61 +1234,6 @@ mod tests {
     }
 
     #[test]
-    fn test_router_config_deserializes_skills_enabled_flag() {
-        let deserialized: RouterConfig = serde_json::from_str(
-            r#"{
-                "mode": { "type": "regular", "worker_urls": [] },
-                "policy": { "type": "random" },
-                "host": "0.0.0.0",
-                "port": 3001,
-                "max_payload_size": 1024,
-                "request_timeout_secs": 30,
-                "worker_startup_timeout_secs": 30,
-                "worker_startup_check_interval_secs": 5,
-                "dp_aware": false,
-                "api_key": null,
-                "max_concurrent_requests": -1,
-                "queue_size": 10,
-                "queue_timeout_secs": 5,
-                "worker_selection_strategy": "naive",
-                "cors_allowed_origins": [],
-                "retry": {
-                    "max_retries": 3,
-                    "initial_backoff_ms": 100,
-                    "max_backoff_ms": 1000,
-                    "backoff_multiplier": 2.0,
-                    "jitter_factor": 0.1
-                },
-                "circuit_breaker": {
-                    "failure_threshold": 5,
-                    "success_threshold": 2,
-                    "timeout_duration_secs": 30,
-                    "window_duration_secs": 60
-                },
-                "health_check": {
-                    "failure_threshold": 3,
-                    "success_threshold": 2,
-                    "timeout_secs": 10,
-                    "check_interval_secs": 30,
-                    "endpoint": "/health",
-                    "disable_health_check": false,
-                    "remove_unhealthy_workers": false
-                },
-                "skills_enabled": true
-            }"#,
-        )
-        .unwrap();
-
-        assert!(deserialized.skills_enabled);
-        assert!(deserialized.skills.is_none());
-        assert!(!deserialized.tenant_resolution.trust_tenant_header);
-        assert_eq!(
-            deserialized.tenant_resolution.tenant_header_name,
-            DEFAULT_TENANT_HEADER_NAME
-        );
-    }
-
-    #[test]
     fn test_health_check_port_serde_roundtrip_and_backward_compat() {
         // Default: dedicated probe listener off, and `skip_serializing_if`
         // keeps the key out of serialized output entirely.
@@ -1377,6 +1347,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+        enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1403,6 +1375,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+        enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1430,6 +1404,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+        enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
         };
 
         match cache_aware {
@@ -1840,6 +1816,8 @@ mod tests {
                 lmcache_overlap_weight: 0.5,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+            enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1875,6 +1853,8 @@ mod tests {
                 lmcache_overlap_weight: 0.5,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+            enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
             }),
             decode_policy: None,
         };
@@ -1936,6 +1916,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+        enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

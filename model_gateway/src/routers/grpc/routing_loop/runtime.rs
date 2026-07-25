@@ -1162,6 +1162,11 @@ async fn dispatch_entry_with_partial_rollout(
             if let Ok(v) = HeaderValue::from_str(&dp_rank.to_string()) {
                 headers.insert("x-target-dp-rank", v);
             }
+            // Clear the one-shot pin: `force_pin_once` only pins the FIRST
+            // selection of a turn. Once this request loops back (partial rollout
+            // / preemption re-dispatch), the scheduler's readmission intent has
+            // been honoured, so subsequent iterations fall back to free routing.
+            headers.remove("x-force-pin-once");
 
             counter!("smg_partial_rollout_abort_reenqueue_total").increment(1);
             ctx.state.partial_rollout_state = Some(partial_state);

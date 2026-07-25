@@ -386,6 +386,8 @@ struct Router {
     lmcache_overlap_weight: f64,
     balance_token_usage_threshold: f32,
     overload_token_usage_threshold: f32,
+    enable_kv_admission_control: bool,
+    kv_capacity_threshold: f64,
     max_concurrent_seqs_per_instance: usize,
     delta_throughput_threshold: f64,
     max_prompt_length: usize,
@@ -549,6 +551,8 @@ impl Router {
                     lmcache_overlap_weight: self.lmcache_overlap_weight,
                     balance_token_usage_threshold: self.balance_token_usage_threshold,
                     overload_token_usage_threshold: self.overload_token_usage_threshold,
+                    enable_kv_admission_control: self.enable_kv_admission_control,
+                    kv_capacity_threshold: self.kv_capacity_threshold,
                 },
                 PolicyType::CacheAwareV1 => ConfigPolicyConfig::CacheAwareV1 {
                     cache_threshold: self.cache_threshold,
@@ -561,6 +565,8 @@ impl Router {
                     lmcache_overlap_weight: self.lmcache_overlap_weight,
                     balance_token_usage_threshold: self.balance_token_usage_threshold,
                     overload_token_usage_threshold: self.overload_token_usage_threshold,
+                    enable_kv_admission_control: self.enable_kv_admission_control,
+                    kv_capacity_threshold: self.kv_capacity_threshold,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
                     kv_pressure_weight: 0.5,
@@ -874,6 +880,12 @@ impl Router {
             .psrl_candidate_sort_key(candidate_sort_key)
             .psrl_enable_group_sticky(self.psrl_enable_group_sticky)
             .psrl_kv_transfer(kv_transfer_config)
+            // `enable_kv_admission_control` (legacy arg name) now carries the
+            // strict reject-on-waiting switch; the gate is always on otherwise.
+            .psrl_admission(
+                self.max_concurrent_seqs_per_instance,
+                self.enable_kv_admission_control,
+            )
             .build()
     }
 }
@@ -900,6 +912,8 @@ impl Router {
         lmcache_overlap_weight = 0.5,
         balance_token_usage_threshold = 1.0,
         overload_token_usage_threshold = 1.0,
+        enable_kv_admission_control = false,
+        kv_capacity_threshold = 1.0f64,
         max_concurrent_seqs_per_instance = 100,
         delta_throughput_threshold = 0.5,
         max_prompt_length = 8192,
@@ -1038,6 +1052,8 @@ impl Router {
         lmcache_overlap_weight: f64,
         balance_token_usage_threshold: f32,
         overload_token_usage_threshold: f32,
+        enable_kv_admission_control: bool,
+        kv_capacity_threshold: f64,
         max_concurrent_seqs_per_instance: usize,
         delta_throughput_threshold: f64,
         max_prompt_length: usize,
@@ -1189,6 +1205,8 @@ impl Router {
             lmcache_overlap_weight,
             balance_token_usage_threshold,
             overload_token_usage_threshold,
+            enable_kv_admission_control,
+            kv_capacity_threshold,
             max_concurrent_seqs_per_instance,
             delta_throughput_threshold,
             max_prompt_length,

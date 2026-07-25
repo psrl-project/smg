@@ -224,12 +224,25 @@ impl RequestPipeline {
                 }
                 Ok(None) => continue,
                 Err(response) => {
-                    error!(
-                        function = "execute_post_selection_execution",
-                        stage = stage.name(),
-                        status = %response.status(),
-                        "Execution stage failed"
-                    );
+                    // Only demote the expected prompt-overflow 400; other
+                    // execution failures (including other 400s) stay ERROR.
+                    let error_code = error::extract_error_code_from_response(&response);
+                    if error_code == error::PROMPT_OVERFLOW_ERROR_CODE {
+                        debug!(
+                            function = "execute_post_selection_execution",
+                            stage = stage.name(),
+                            status = %response.status(),
+                            error_code,
+                            "Execution stage returned prompt_overflow"
+                        );
+                    } else {
+                        error!(
+                            function = "execute_post_selection_execution",
+                            stage = stage.name(),
+                            status = %response.status(),
+                            "Execution stage failed"
+                        );
+                    }
                     return Err(response);
                 }
             }

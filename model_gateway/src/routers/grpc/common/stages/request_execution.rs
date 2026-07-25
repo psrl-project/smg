@@ -16,7 +16,7 @@ use crate::{
                 ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant,
                 ProtoStream,
             },
-            utils::tonic_ext::{TonicResultExt, TonicStatusExt},
+            utils::tonic_ext::{is_prompt_overflow_status, TonicResultExt, TonicStatusExt},
         },
     },
     worker::{RuntimeType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
@@ -274,6 +274,17 @@ impl RequestExecutionStage {
         workers.record_outcome(result.cb_status_code());
 
         let stream = result.map_err(|e| {
+            // Prompt overflow is an expected RL termination (truncate & train),
+            // not a gateway failure. Emit a dedicated error code and log at
+            // debug so default RUST_LOG=warn stays quiet; real failures remain ERROR.
+            if is_prompt_overflow_status(&e) {
+                debug!(
+                    function = "execute_single",
+                    error = %e,
+                    "Prompt exceeds max_model_len; returning prompt_overflow"
+                );
+                return e.to_http_error(error::PROMPT_OVERFLOW_ERROR_CODE, e.message().to_string());
+            }
             error!(function = "execute_single", error = %e, "Failed to start generation");
             e.to_http_error(
                 "start_generation_failed",

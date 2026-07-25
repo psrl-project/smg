@@ -1187,6 +1187,7 @@ mod tests {
                 r#"{"image_processor_type":"Phi3VImageProcessor"}"#,
             )
             .unwrap(),
+            video_preprocessor_config: None,
         });
         reg.insert("tok-uuid-rm".to_string(), cfg.clone());
         assert!(reg.get("tok-uuid-rm").is_some());
@@ -1210,6 +1211,7 @@ mod tests {
                 r#"{"image_processor_type":"Phi3VImageProcessor"}"#,
             )
             .unwrap(),
+            video_preprocessor_config: None,
         });
         reg.insert("tok-uuid-3".to_string(), cfg.clone());
 

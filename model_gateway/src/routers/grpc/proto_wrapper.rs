@@ -1759,7 +1759,7 @@ mod tests {
         vllm_req.set_data_parallel_rank(2);
         assert!(matches!(
             &vllm_req,
-            ProtoGenerateRequest::Vllm(req) if req.data_parallel_rank == Some(2)
+            ProtoGenerateRequest::Vllm(req) if req.data_parallel_rank == 2
         ));
 
         let mut sglang_req = ProtoGenerateRequest::Sglang(Box::default());

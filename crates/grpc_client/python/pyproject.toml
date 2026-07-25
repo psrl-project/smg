@@ -1,5 +1,9 @@
 [build-system]
-requires = ["setuptools>=68.0", "grpcio-tools>=1.81.1"]
+# Pin to 1.78.0 (matching crates/psrl_state/python) so the bundled protoc stamps
+# gencode 6.31, compatible with the protobuf 6.33 runtime pinned by vllm/ray/wandb.
+# grpcio-tools >= 1.81 ships a protoc that stamps gencode 7.35, which the 6.33
+# runtime refuses to load (VersionError: runtime cannot be older than gencode).
+requires = ["setuptools>=68.0", "grpcio-tools==1.78.0"]
 build-backend = "setuptools.build_meta"
 
 [project]

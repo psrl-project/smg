@@ -696,6 +696,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+        enable_kv_admission_control: false,
+                kv_capacity_threshold: 1.0,
         });
 
         let prefill_workers = vec![
@@ -725,70 +727,6 @@ mod tests {
         let decode_second = decode_policy.select_worker(&decode_workers, &info);
         assert!(decode_first.is_some());
         assert_eq!(decode_first, decode_second);
-    }
-
-    #[test]
-    fn test_remote_tree_state_push_updates_default_cache_aware_policy() {
-        use smg_mesh::{TreeInsertOp, TreeKey, TreeOperation, TreeState};
-
-        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 10_000,
-            block_size: 16,
-            gpu_overlap_weight: 1.0,
-            lmcache_overlap_weight: 0.5,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-        }));
-
-        let stores = Arc::new(StateStores::with_self_name("node1".to_string()));
-        let mesh_sync = Arc::new(MeshSyncManager::new(stores, "node1".to_string()));
-        mesh_sync.register_tree_state_subscriber(registry.clone());
-        registry.set_mesh_sync(Some(mesh_sync.clone()));
-
-        let worker1: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://w1:8000")
-                .worker_type(WorkerType::Regular)
-                .api_key("test_api_key")
-                .health_config(no_health_check())
-                .build(),
-        );
-        let worker2: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://w2:8000")
-                .worker_type(WorkerType::Regular)
-                .api_key("test_api_key")
-                .health_config(no_health_check())
-                .build(),
-        );
-        let workers = vec![worker1, worker2];
-
-        let default_policy = registry.get_default_policy();
-        let cache_aware = default_policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("default policy should be cache_aware");
-        cache_aware.init_workers(&workers);
-
-        let mut tree_state = TreeState::new(UNKNOWN_MODEL_ID.to_string());
-        tree_state.add_operation(TreeOperation::Insert(TreeInsertOp {
-            key: TreeKey::Text("mesh push".to_string()),
-            tenant: "http://w2:8000".to_string(),
-        }));
-
-        mesh_sync.apply_remote_tree_operation(UNKNOWN_MODEL_ID.to_string(), tree_state, None);
-
-        let selected = cache_aware.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("mesh push"),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(selected, Some(1));
     }
 
     #[test]

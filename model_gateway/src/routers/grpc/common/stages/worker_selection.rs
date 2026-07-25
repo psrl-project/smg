@@ -321,6 +321,7 @@ fn select_pd_pair(
         hash_ring,
         response_token_count: None,
         priority_groups: None,
+        score_trace: None,
     };
     let prefill_idx = policy.select_worker(&available_prefill, &info)?;
     let decode_idx = policy.select_worker(&available_decode, &info)?;

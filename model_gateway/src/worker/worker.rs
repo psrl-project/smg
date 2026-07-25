@@ -254,6 +254,25 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// incorporates the corresponding requests (agreement-gated rebase).
     fn rebase_inflight_tokens(&self) {}
 
+    /// Cheap `Arc` clone of the latest engine stats (bumps a refcount rather
+    /// than deep-cloning the per-request maps like [`Worker::engine_stats`]).
+    /// Used on the per-candidate admission hot path.
+    fn engine_stats_arc(&self) -> Arc<EngineStats> {
+        Arc::new(EngineStats::default())
+    }
+
+    /// Millisecond timestamp of the last applied engine snapshot, or 0 if the
+    /// worker has never reported stats. The admission gate uses `0` as the
+    /// "no snapshot yet" signal to skip the snapshot-derived limbs.
+    fn engine_stats_timestamp_ms(&self) -> u64 {
+        0
+    }
+
+    /// Reset the in-flight load counter to zero. Called on a model-version bump,
+    /// where the engine clears its run/wait queues, so the speculative occupancy
+    /// must be re-based to avoid wedging the agreement-gated rebase. Default no-op.
+    fn reset_load(&self) {}
+
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
 
@@ -849,6 +868,22 @@ impl WorkerRuntime {
         self.inflight_tokens.lock().clear();
     }
 
+    /// Reset the in-flight load counter to zero (model-version bump).
+    pub fn reset_load(&self) {
+        self.load_counter.store(0, Ordering::Relaxed);
+    }
+
+    /// Cheap `Arc` clone of the latest engine snapshot (refcount bump, no deep
+    /// clone of the per-request token maps).
+    pub fn engine_stats_arc(&self) -> Arc<EngineStats> {
+        self.engine_stats.load_full()
+    }
+
+    /// Millisecond timestamp of the last applied snapshot; 0 if never updated.
+    pub fn engine_stats_timestamp_ms(&self) -> u64 {
+        self.engine_stats_timestamp_ms.load(Ordering::Acquire)
+    }
+
     // ── Routing-key load ────────────────────────────────────────────
 
     pub fn routing_key_load(&self) -> usize {
@@ -1105,6 +1140,19 @@ impl Worker for BasicWorker {
 
     fn engine_stats(&self) -> EngineStats {
         self.runtime.load().engine_stats()
+    }
+
+    fn engine_stats_arc(&self) -> Arc<EngineStats> {
+        self.runtime.load().engine_stats_arc()
+    }
+
+    fn engine_stats_timestamp_ms(&self) -> u64 {
+        self.runtime.load().engine_stats_timestamp_ms()
+    }
+
+    fn reset_load(&self) {
+        self.runtime.load().reset_load();
+        self.update_running_requests_metrics();
     }
 
     fn dyn_weight_version(&self) -> u64 {
@@ -1598,6 +1646,7 @@ mod tests {
             failure_threshold: 5,
             success_threshold: 3,
             disable_health_check: true,
+            ..Default::default()
         };
         assert_eq!(config.timeout_secs, 10);
         assert_eq!(config.check_interval_secs, 60);
@@ -1698,6 +1747,7 @@ mod tests {
             failure_threshold: 4,
             success_threshold: 2,
             disable_health_check: false,
+            ..Default::default()
         };
 
         use crate::worker::BasicWorkerBuilder;

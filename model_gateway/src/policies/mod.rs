@@ -126,6 +126,64 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    /// Admission gate: whether `worker` can accept a new request without pushing
+    /// the instance into a queued / overloaded state.
+    ///
+    /// Applied by the PSRL worker selector to every candidate *before* delegating
+    /// the final pick, so it governs all routing methods uniformly (the old
+    /// per-policy `enable_kv_admission_control` only affected cache-aware). When
+    /// every candidate is rejected the selector returns `None` and the routing
+    /// loop re-enqueues the request (wait) instead of piling onto a full instance.
+    ///
+    /// The default gates on three signals: the in-flight request-count cap
+    /// (`worker.load()`, exact and race-free under the selector lock), the engine
+    /// waiting queue, and a coarse KV-usage ceiling. `cache_aware_v1` overrides
+    /// this with a prefix-tree-based marginal-KV estimate. Returns `true` to admit.
+    fn admits(
+        &self,
+        worker: &Arc<dyn Worker>,
+        info: &SelectWorkerInfo,
+        cfg: &AdmissionGateConfig,
+    ) -> bool {
+        self.admission_reject_reason(worker, info, cfg).is_none()
+    }
+
+    /// Same gate as [`LoadBalancingPolicy::admits`] but returns *why* a candidate
+    /// was rejected (`None` = admit), so the selector can emit fine-grained
+    /// diagnostics (which limb fired, on what speculative-vs-real values).
+    /// Overriding this is the single point a policy customizes admission.
+    fn admission_reject_reason(
+        &self,
+        worker: &Arc<dyn Worker>,
+        _info: &SelectWorkerInfo,
+        cfg: &AdmissionGateConfig,
+    ) -> Option<&'static str> {
+        if admission_count_full(worker, cfg) {
+            return Some("count_cap");
+        }
+        if cfg.reject_on_waiting
+            && worker.engine_stats_timestamp_ms() != 0
+            && worker.engine_stats_arc().scheduler_stats.num_waiting_reqs > 0
+        {
+            return Some("waiting_queue");
+        }
+        None
+    }
+
+    /// Drop any speculative per-instance state for a worker whose model version
+    /// just bumped (a Pull / weight sync).
+    ///
+    /// On a version bump the engine interrupts and clears its run/wait queues and
+    /// its KV cache for the old weights, so any router-side speculative state for
+    /// that instance (cache-affinity / hypothetical KV trees, per-instance token
+    /// deltas, …) is stale and must be dropped. This is a uniform concern across
+    /// strategies — every stateful policy should override it — so it lives on the
+    /// trait with a no-op default rather than being special-cased per policy.
+    /// Called from the worker weight-version update path with the instance URL.
+    fn on_version_bump(&self, _worker_url: &str) {
+        // Default: no-op for policies without per-instance speculative state
+    }
+
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -163,6 +221,19 @@ pub struct CacheAwareConfig {
     /// engine exceeds it the pool is treated as imbalanced regardless of spread.
     /// A safety valve, best set high (e.g. 0.9). `>= 1.0` disables it (default).
     pub overload_token_usage_threshold: f32,
+    /// KV-capacity admission control (port of the old Python router's
+    /// `_can_run_directly`). When enabled, `select_worker` rejects any candidate
+    /// that would either queue behind existing waiting requests or exceed its KV
+    /// token capacity (`num_used_tokens + new_request_tokens >
+    /// max_total_num_tokens`); if every healthy candidate is rejected the call
+    /// returns `None` and the routing loop re-enqueues the request for the next
+    /// tick. Off by default to preserve current always-route behavior.
+    pub enable_kv_admission_control: bool,
+    /// Fraction of KV capacity (0.0–1.0] at which admission is refused. A value
+    /// below 1.0 reserves headroom for response-token growth during decode
+    /// (e.g. 0.9 rejects when effective_used + new > 0.9 × capacity). Default
+    /// 1.0 means reject only at full capacity (original behavior).
+    pub kv_capacity_threshold: f64,
 }
 
 impl Default for CacheAwareConfig {
@@ -178,8 +249,107 @@ impl Default for CacheAwareConfig {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            enable_kv_admission_control: false,
+            kv_capacity_threshold: 1.0,
         }
     }
+}
+
+/// KV-capacity admission predicate (port of the old Python router's
+/// `_can_run_directly`).
+///
+/// An engine **admits** a request directly iff some DP rank has no waiting
+/// queue *and* room for `new_request_tokens`. The scheduler places a request on
+/// exactly one rank, so one uncongested rank with capacity means the request
+/// runs directly — hence the per-rank predicate is OR-reduced across ranks.
+/// Summing ranks would be wrong (a request can't be split), and a worst-case
+/// (max-used rank) check would be needlessly pessimistic. Reduces to the
+/// Python single-instance check when `loads.len() == 1`. An empty snapshot is
+/// treated as "admit" (no data ⇒ no gate, avoid deadlock).
+pub(crate) fn kv_admits(load: &WorkerLoadResponse, new_request_tokens: i64) -> bool {
+    if load.loads.is_empty() {
+        return true;
+    }
+    load.loads.iter().any(|r| {
+        r.num_waiting_reqs == 0
+            && (r.num_used_tokens as i64 + new_request_tokens) <= r.max_total_num_tokens as i64
+    })
+}
+
+/// Worker KV-cache capacity in tokens, derived from the `max_model_len` or
+/// `max_total_tokens` worker label. Returns 0 when neither label is set,
+/// which disables KV-capacity checks for that worker.
+pub(crate) fn worker_kv_capacity(worker: &Arc<dyn Worker>) -> i64 {
+    let labels = &worker.metadata().spec.labels;
+    labels
+        .get("max_model_len")
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| {
+            labels
+                .get("max_total_tokens")
+                .and_then(|v| v.parse::<i64>().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Effective KV-token occupancy: engine-snapshot tokens + speculative inflight.
+///
+/// Mirrors `ThroughputRuntime::current_token_num`: uses exact per-request token
+/// maps when populated; falls back to `kv_cache_usage × capacity` when maps are
+/// empty but the queue is non-zero; otherwise returns 0 (no stats or idle).
+/// The `inflight_tokens_sum()` delta covers requests admitted since the last
+/// snapshot and is cleared once the snapshot's request count agrees with the
+/// router's in-flight counter (engine_stats agreement-gated rebase).
+pub(crate) fn effective_kv_used_tokens(worker: &Arc<dyn Worker>) -> i64 {
+    let stats = worker.engine_stats_arc();
+    let has_queue =
+        stats.scheduler_stats.num_running_reqs > 0 || stats.scheduler_stats.num_waiting_reqs > 0;
+
+    let engine_tokens: i64 = if stats.total_token_num() > 0 {
+        stats.total_token_num() as i64
+    } else if has_queue {
+        // Per-request token maps not populated — derive from kv_cache_usage ratio.
+        let capacity = worker_kv_capacity(worker);
+        if capacity > 0 {
+            (stats.scheduler_stats.kv_cache_usage * capacity as f64).ceil() as i64
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    engine_tokens + worker.inflight_tokens_sum() as i64
+}
+
+/// Admission gate params for the PSRL worker selector (Stage 5). Always active;
+/// default (count cap 0, `reject_on_waiting` false) is a no-op. No coarse KV-usage
+/// limb: a reactive hard KV cutoff oscillates (bang-bang); use the count cap for
+/// flow control and the reservation-based path for KV.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionGateConfig {
+    /// Reject when in-flight request count reaches this cap. `0` disables.
+    pub max_concurrent_seqs_per_instance: usize,
+    /// When true, reject any worker with `num_waiting_reqs > 0` (strict). Separate
+    /// from `max_num_waiting_reqs_after_preemption` (vLLM preemption notification).
+    pub reject_on_waiting: bool,
+}
+
+impl Default for AdmissionGateConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_seqs_per_instance: 0,
+            reject_on_waiting: false,
+        }
+    }
+}
+
+/// Whether `worker` is at or above the in-flight request-count cap. Reads the
+/// exact `load()` counter (race-free under the selector lock). `cap == 0`
+/// disables the check.
+pub(crate) fn admission_count_full(worker: &Arc<dyn Worker>, cfg: &AdmissionGateConfig) -> bool {
+    cfg.max_concurrent_seqs_per_instance > 0
+        && worker.load() >= cfg.max_concurrent_seqs_per_instance
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +392,23 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     }
 }
 
+/// Display/correlation metadata for `score_trace.log` (KV-cache-aware-v1
+/// per-decision score trace). Populated by the PSRL worker selector only when
+/// the `score_trace` target is enabled; a `None` `SelectWorkerInfo::score_trace`
+/// makes score tracing a no-op (zero extra work on the hot path).
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreTraceCtx<'a> {
+    /// Request id, for correlating with `route_trace.log`.
+    pub request_id: i64,
+    /// Prompt id, for correlating with `route_trace.log`.
+    pub prompt_id: i64,
+    /// Instance id per candidate, indexed identically to the `workers` slice
+    /// passed to `select_worker` (same convention as `priority_groups`).
+    pub instance_ids: &'a [String],
+    /// Instance id the request ran on last round (rollout hint), if any.
+    pub prev_instance_id: Option<&'a str>,
+}
+
 /// Information passed to policy for worker selection
 #[derive(Debug, Clone, Default)]
 pub struct SelectWorkerInfo<'a> {
@@ -256,6 +443,10 @@ pub struct SelectWorkerInfo<'a> {
     ///
     /// `None` means all workers are treated as equal priority (default behaviour).
     pub priority_groups: Option<&'a [i64]>,
+    /// Display/correlation metadata for the KV-cache-aware-v1 `score_trace.log`.
+    /// `None` (default) disables score tracing entirely; set by the PSRL worker
+    /// selector only when the `score_trace` target is enabled.
+    pub score_trace: Option<ScoreTraceCtx<'a>>,
 }
 
 #[cfg(test)]

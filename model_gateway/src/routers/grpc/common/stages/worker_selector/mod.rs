@@ -108,6 +108,10 @@ pub(crate) fn build_strategy(
                 config.candidate_sort_key,
                 config.enable_group_sticky_routing,
                 kv_transfer,
+                crate::policies::AdmissionGateConfig {
+                    max_concurrent_seqs_per_instance: config.max_concurrent_seqs_per_instance,
+                    reject_on_waiting: config.admission_reject_on_waiting,
+                },
             )))
         }
     }

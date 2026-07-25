@@ -942,11 +942,23 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
             let step_duration = step_start.elapsed();
 
-            self.state_store
-                .update(instance_id, |s| {
-                    s.context = context.clone();
-                })
-                .await?;
+            // Persist the (possibly mutated) context back to shared state — but ONLY
+            // when the step actually ran. A skipped step returns before mutating
+            // anything, yet still holds a *stale* snapshot read at the top of this
+            // attempt (line above). Writing that snapshot back would blindly clobber
+            // any field a concurrently-running parallel step mutated in the meantime
+            // (whole-context overwrite, no field-level merge) — a classic lost-update
+            // race. Concretely: in `worker_registration` the inactive branch's steps
+            // Skip instantly for a local/external worker; if their write-back lands
+            // after `detect_connection_mode` set `connection_mode`, it resets it to
+            // `None`, and downstream steps fail with `ContextValueNotFound`.
+            if !matches!(result, Ok(Ok(StepResult::Skip))) {
+                self.state_store
+                    .update(instance_id, |s| {
+                        s.context = context.clone();
+                    })
+                    .await?;
+            }
 
             match result {
                 Ok(Ok(StepResult::Success)) => {

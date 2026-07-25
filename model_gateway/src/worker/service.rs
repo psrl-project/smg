@@ -660,6 +660,20 @@ impl WorkerService {
             for (worker_id, worker, rank, weight_version) in items {
                 let updated = worker.update_dyn_weight_version(weight_version);
                 debug_assert!(updated, "support check must make update infallible");
+                // Model-version bump: the engine interrupts/clears its run+wait
+                // queues, so the router's speculative occupancy is now stale.
+                // Reset the load counter and drop inflight-token estimates,
+                // otherwise the agreement-gated rebase (`waiting_and_running ==
+                // load()`) can never re-fire and the KV estimate stays wedged.
+                worker.reset_load();
+                worker.rebase_inflight_tokens();
+                // Drop the policy's stale per-instance speculative state
+                // (cache-affinity / hypothetical-KV trees) for this instance.
+                if let Some(registry) = self.policy_registry.as_ref() {
+                    registry
+                        .get_policy_or_default(worker.model_id())
+                        .on_version_bump(worker.url());
+                }
                 if let Ok(version_tag) = i64::try_from(weight_version) {
                     self.instance_to_version_after_sync
                         .insert((base_worker_id.clone(), rank), version_tag);

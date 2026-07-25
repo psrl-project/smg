@@ -83,6 +83,25 @@ def _tensor_from_proto(td: vllm_engine_pb2.TensorData) -> torch.Tensor:
     return torch.frombuffer(bytearray(td.data), dtype=torch_dtype).reshape(*td.shape)
 
 
+# Must match model_gateway `PROMPT_OVERFLOW_ERROR_CODE` / PSRL header recognition.
+_PROMPT_OVERFLOW_ERROR_CODE = "prompt_overflow"
+
+
+class PromptOverflowError(ValueError):
+    """Prompt exceeds the engine max_model_len (expected RL truncation)."""
+
+
+async def _abort_invalid_argument(
+    context: grpc.aio.ServicerContext,
+    exc: BaseException,
+) -> None:
+    """Abort with INVALID_ARGUMENT; attach prompt_overflow metadata when applicable."""
+    metadata = ()
+    if isinstance(exc, PromptOverflowError):
+        metadata = (("x-smg-error-code", _PROMPT_OVERFLOW_ERROR_CODE),)
+    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc), trailing_metadata=metadata)
+
+
 class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     """
     gRPC servicer implementing the VllmEngine service.
@@ -327,18 +346,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
             # Validate prompt length before any park/admission/engine work.
             # This catches overlong prompts at the SMG boundary and returns
-            # INVALID_ARGUMENT (400) instead of letting them reach the engine
-            # where they'd surface as EngineGenerateError (500).
+            # INVALID_ARGUMENT (400) with x-smg-error-code=prompt_overflow
+            # instead of letting them reach the engine as EngineGenerateError (500).
             if input_type == "tokenized":
                 prompt_len = len(request.tokenized.input_ids)
                 max_model_len = self.engine.model_config.max_model_len
                 if prompt_len > max_model_len:
-                    raise ValueError(
+                    raise PromptOverflowError(
                         f"The prompt (length {prompt_len}) is longer than the "
                         f"maximum model length of {max_model_len}."
                     )
                 if prompt_len == max_model_len and self.engine.model_config.runner_type == "generate":
-                    raise ValueError(
+                    raise PromptOverflowError(
                         f"The prompt (length {prompt_len}) plus the number of "
                         f"requested output tokens (at least 1) is longer than the "
                         f"maximum model length of {max_model_len}."
@@ -458,8 +477,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 await self.engine.abort(output_collector.request_id, internal=True)
             raise
         except ValueError as e:
-            # Invalid request error (equiv to 400).
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+            # Invalid request error (equiv to 400). PromptOverflowError attaches
+            # x-smg-error-code=prompt_overflow so the gateway can demote logs.
+            await _abort_invalid_argument(context, e)
         except Exception as e:
             logger.exception("Error in Generate for request %s", request_id)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
@@ -882,6 +902,52 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         if isinstance(event, BlockStored):
             cache_level = 0 if (event.medium is None or event.medium == "GPU") else 1
+
+            # region agent log
+            try:
+                _dbg_a = globals().setdefault(
+                    "_DBG_KVEVENT_AGG",
+                    {"stored_level0": 0, "stored_level1": 0, "mediums": {}},
+                )
+                _dbg_a["stored_level0" if cache_level == 0 else "stored_level1"] += 1
+                _dbg_mk = f"{type(event.medium).__name__}:{event.medium!r}"
+                _dbg_a["mediums"][_dbg_mk] = _dbg_a["mediums"].get(_dbg_mk, 0) + 1
+                _dbg_tot = _dbg_a["stored_level0"] + _dbg_a["stored_level1"]
+                if _dbg_tot % 2000 == 0 or (
+                    cache_level == 1 and _dbg_a["stored_level1"] <= 3
+                ):
+                    import json as _dbg_json
+                    import os as _dbg_os
+                    import time as _dbg_time
+
+                    with open(
+                        "/apdcephfs_zwfy10/share_303541817/lhy/.cursor/debug-48f20e.log",
+                        "a",
+                    ) as _dbg_f:
+                        _dbg_f.write(
+                            _dbg_json.dumps(
+                                {
+                                    "sessionId": "48f20e",
+                                    "runId": "run1",
+                                    "hypothesisId": "H1+H5",
+                                    "location": "smg_grpc_servicer/vllm/servicer.py:905",
+                                    "message": "KV BlockStored events bridged to router, by cache_level",
+                                    "data": dict(
+                                        _dbg_a,
+                                        pid=_dbg_os.getpid(),
+                                        last_block_size=int(event.block_size),
+                                        last_n_hashes=len(event.block_hashes),
+                                        last_n_token_ids=len(event.token_ids or []),
+                                    ),
+                                    "timestamp": int(_dbg_time.time() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+            except Exception:
+                pass
+            # endregion
+
             blocks = []
             for i, bh in enumerate(event.block_hashes):
                 start = i * event.block_size
