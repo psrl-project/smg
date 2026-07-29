@@ -1,13 +1,9 @@
-# Cap grpcio-tools at 1.81.x so the bundled protoc emits protobuf-6 gencode.
-# 1.82.x emits protobuf-7 gencode, which the protobuf 6.x runtime (pinned via
-# grpcio-health-checking/reflection in ci_install_e2e_deps.sh) refuses to load.
-# Drop the cap once the whole stack moves to protobuf 7.
+# Use a recent grpcio-tools so generated stubs match the protobuf 7 runtime
+# (smg-grpc-servicer pulls grpcio-reflection/health 1.82+/1.83, which need
+# protobuf>=7.35.1). Restored from the pre-1.78.0 pin on psrl-dev; the old
+# ==1.78.0 / protobuf-6 pin is no longer needed once the stack is on protobuf 7.
 [build-system]
-# Pin to 1.78.0 (matching crates/psrl_state/python) so the bundled protoc stamps
-# gencode 6.31, compatible with the protobuf 6.33 runtime pinned by vllm/ray/wandb.
-# grpcio-tools >= 1.81 ships a protoc that stamps gencode 7.35, which the 6.33
-# runtime refuses to load (VersionError: runtime cannot be older than gencode).
-requires = ["setuptools>=68.0", "grpcio-tools==1.78.0"]
+requires = ["setuptools>=77.0", "grpcio-tools>=1.81.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -17,7 +13,7 @@ description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, an
 requires-python = ">=3.10"
 dependencies = [
     "grpcio>=1.81.1",
-    "protobuf>=5.26.0",
+    "protobuf>=7.35.1,<8",
 ]
 readme = "README.md"
 license = "Apache-2.0"

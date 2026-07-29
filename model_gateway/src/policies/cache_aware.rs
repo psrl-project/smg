@@ -51,7 +51,7 @@ use std::{
 
 use dashmap::DashMap;
 use kv_index::{
-    compute_request_content_hashes, PositionalIndexer, Tier, TieredIndexer, TokenTree, Tree,
+    compute_request_content_hashes, PositionalIndexer, Tier, TokenTree, Tree,
 };
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
@@ -1166,7 +1166,9 @@ impl Default for CacheAwarePolicy {
 
 #[cfg(test)]
 mod tests {
-    use kv_index::{compute_content_hash, SequenceHash, StoredBlock, WorkerBlockMap};
+    use kv_index::{
+        compute_content_hash, SequenceHash, StoredBlock, TieredIndexer, WorkerBlockMap,
+    };
     use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerStatus};
 
     use super::*;

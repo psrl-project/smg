@@ -255,8 +255,8 @@ impl Default for CacheAwareConfig {
     }
 }
 
-/// KV-capacity admission predicate (port of the old Python router's
-/// `_can_run_directly`).
+/// KV-capacity admission predicate on a `WorkerLoadResponse` snapshot (port of
+/// the old Python router's `_can_run_directly`).
 ///
 /// An engine **admits** a request directly iff some DP rank has no waiting
 /// queue *and* room for `new_request_tokens`. The scheduler places a request on
@@ -266,6 +266,12 @@ impl Default for CacheAwareConfig {
 /// (max-used rank) check would be needlessly pessimistic. Reduces to the
 /// Python single-instance check when `loads.len() == 1`. An empty snapshot is
 /// treated as "admit" (no data ⇒ no gate, avoid deadlock).
+///
+/// Production routing no longer calls this: `cache_aware_v1::admission_rejects`
+/// uses live `engine_stats` + speculative inflight (`effective_kv_used_tokens`)
+/// instead of the polled load snapshot. Kept under `cfg(test)` for the unit
+/// tests that lock in the DP OR-reduction semantics.
+#[cfg(test)]
 pub(crate) fn kv_admits(load: &WorkerLoadResponse, new_request_tokens: i64) -> bool {
     if load.loads.is_empty() {
         return true;

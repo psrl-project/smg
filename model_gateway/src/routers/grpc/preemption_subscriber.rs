@@ -14,7 +14,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use smg_grpc_client::VllmEngineClient;
 use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::worker::registry::WorkerId;
 

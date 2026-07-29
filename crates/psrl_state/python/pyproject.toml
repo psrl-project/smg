@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "grpcio-tools==1.78.0"]
+requires = ["setuptools>=68.0", "grpcio-tools>=1.81.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,8 +8,8 @@ dynamic = ["version"]
 description = "PSRL state gRPC proto definitions and generated Python stubs"
 requires-python = ">=3.10"
 dependencies = [
-    "grpcio==1.78.0",
-    "protobuf>=4.25.0",
+    "grpcio>=1.81.1",
+    "protobuf>=7.35.1,<8",
 ]
 readme = "README.md"
 license = { text = "Apache-2.0" }
