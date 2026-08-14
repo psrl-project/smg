@@ -31,7 +31,7 @@ use super::{
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     multimodal::MultimodalComponents,
     pipeline::RequestPipeline,
-    regular::responses,
+    regular::{messages_training, responses, training},
 };
 use crate::{
     app_context::AppContext,
@@ -633,13 +633,13 @@ impl GrpcRouter {
                 }
             }
         } else {
-            responses::route_responses(
+            Box::pin(responses::route_responses(
                 &self.responses_context,
                 Arc::new(body.clone()),
                 headers.cloned(),
                 tenant_meta.clone(),
                 model_id.to_string(),
-            )
+            ))
             .await
         }
     }
@@ -675,13 +675,25 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing messages request for model: {}", model_id);
 
+        let training_request = if training::is_tito_request(headers) {
+            match messages_training::messages_to_training_chat(body) {
+                Ok(request) => Some(Arc::new(request)),
+                Err(message) => {
+                    return error::bad_request("messages_training_conversion_failed", message);
+                }
+            }
+        } else {
+            None
+        };
+
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
-        let pipeline = &self.messages_pipeline;
+        let messages_pipeline = &self.messages_pipeline;
+        let training_pipeline = &self.pipeline;
 
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
         let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
@@ -697,10 +709,48 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let training_request = training_request.clone();
                 async move {
-                    pipeline
-                        .execute_messages(request, headers, model_id, components, Some(tenant_meta))
-                        .await
+                    if let Some(chat_request) = training_request {
+                        match training_pipeline
+                            .execute_chat_for_responses(
+                                chat_request,
+                                headers,
+                                model_id,
+                                components,
+                                Some(tenant_meta),
+                            )
+                            .await
+                        {
+                            Ok(result) => {
+                                match messages_training::training_chat_to_message(
+                                    &result.response,
+                                    &request,
+                                ) {
+                                    Ok(message) => {
+                                        let mut response = axum::Json(message).into_response();
+                                        response.headers_mut().extend(result.headers);
+                                        response
+                                    }
+                                    Err(message) => error::internal_error(
+                                        "messages_training_response_conversion_failed",
+                                        message,
+                                    ),
+                                }
+                            }
+                            Err(response) => response,
+                        }
+                    } else {
+                        messages_pipeline
+                            .execute_messages(
+                                request,
+                                headers,
+                                model_id,
+                                components,
+                                Some(tenant_meta),
+                            )
+                            .await
+                    }
                 }
             },
             |res, _attempt| is_retryable_status(res.status()),
@@ -847,8 +897,7 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_responses_impl(headers, tenant_meta, body, model_id)
-            .await
+        Box::pin(self.route_responses_impl(headers, tenant_meta, body, model_id)).await
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
@@ -938,6 +987,7 @@ impl RouterTrait for GrpcRouter {
             Err(response) => return response,
         };
         let Some(content) = chat_response
+            .response
             .choices
             .first()
             .and_then(|choice| choice.message.content.as_deref())
@@ -969,8 +1019,7 @@ impl RouterTrait for GrpcRouter {
         body: &CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        self.route_messages_impl(headers, tenant_meta, body, model_id)
-            .await
+        Box::pin(self.route_messages_impl(headers, tenant_meta, body, model_id)).await
     }
 
     fn router_type(&self) -> &'static str {

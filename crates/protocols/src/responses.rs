@@ -1610,6 +1610,8 @@ pub enum ResponseInputOutputItem {
         id: Option<String>,
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
@@ -2170,6 +2172,8 @@ pub enum ResponseOutputItem {
         id: Option<String>,
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
@@ -3876,6 +3880,7 @@ impl ResponseOutputItem {
             id: Some(id),
             call_id,
             name,
+            namespace: None,
             arguments,
             output,
             status,
@@ -3923,5 +3928,31 @@ mod tests {
             let serde_tag = serialized.get("type").and_then(|v| v.as_str()).unwrap();
             assert_eq!(tool.as_str(), serde_tag);
         }
+    }
+
+    #[test]
+    fn function_call_namespace_roundtrips_on_input_and_output_items() {
+        let input: ResponseInputOutputItem = serde_json::from_value(serde_json::json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "spawn_agent",
+            "namespace": "multi_agent_v1",
+            "arguments": "{\"task\":\"inspect\"}"
+        }))
+        .unwrap();
+        let input_json = serde_json::to_value(input).unwrap();
+        assert_eq!(input_json["namespace"], "multi_agent_v1");
+
+        let output: ResponseOutputItem = serde_json::from_value(serde_json::json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "spawn_agent",
+            "namespace": "multi_agent_v1",
+            "arguments": "{\"task\":\"inspect\"}",
+            "status": "completed"
+        }))
+        .unwrap();
+        let output_json = serde_json::to_value(output).unwrap();
+        assert_eq!(output_json["namespace"], "multi_agent_v1");
     }
 }

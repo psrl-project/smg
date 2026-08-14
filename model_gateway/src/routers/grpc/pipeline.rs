@@ -5,7 +5,10 @@
 
 use std::{sync::Arc, time::Instant};
 
-use axum::response::{IntoResponse, Response};
+use axum::{
+    http::{self, HeaderMap as ResponseHeaders},
+    response::{IntoResponse, Response},
+};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
@@ -73,6 +76,17 @@ pub(crate) struct RequestPipeline {
     /// Backend type for metrics labeling
     backend_type: &'static str,
     routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
+}
+
+/// Completed canonical Chat response used by protocol adapters.
+///
+/// The native Responses and Messages endpoints render their own wire format,
+/// but PSRL still needs the sticky routing headers selected by the routing
+/// loop. Keeping both values together prevents typed completion paths from
+/// silently dropping worker/version affinity metadata.
+pub(crate) struct ChatPipelineResponse {
+    pub(crate) response: ChatCompletionResponse,
+    pub(crate) headers: ResponseHeaders,
 }
 
 impl RequestPipeline {
@@ -1570,7 +1584,7 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
-    ) -> Result<ChatCompletionResponse, Response> {
+    ) -> Result<ChatPipelineResponse, Response> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
 
@@ -1630,7 +1644,10 @@ impl RequestPipeline {
         }
 
         match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => Ok(response),
+            Some(FinalResponse::Chat(response)) => Ok(ChatPipelineResponse {
+                response,
+                headers: ResponseHeaders::new(),
+            }),
             Some(FinalResponse::Generate(_))
             | Some(FinalResponse::Completion(_))
             | Some(FinalResponse::Embedding(_))
