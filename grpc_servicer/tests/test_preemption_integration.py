@@ -1,11 +1,11 @@
 """Integration smoke test: PreemptionStatLogger → SubscribePreemptionEvents."""
+
 import asyncio
 import time
 from unittest.mock import MagicMock
 
 import pytest
 from smg_grpc_proto import vllm_engine_pb2
-
 from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
 from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
 from vllm.outputs import STREAM_FINISHED
@@ -95,7 +95,7 @@ async def test_generate_admission_close_waits_for_registered_requests():
     servicer.finish_generate_admission()
 
 
-def _make_park_servicer():
+def _make_park_servicer(default_request_seed=None):
     """Build a servicer whose engine.add_request is mocked, suitable for
     driving the Generate() park path with a `text` input (bypasses renderer)."""
     mock_llm = MagicMock()
@@ -109,7 +109,11 @@ def _make_park_servicer():
         return collector
 
     mock_llm.add_request = MagicMock(side_effect=_add_request)
-    servicer = VllmEngineServicer(mock_llm, start_time=time.time())
+    servicer = VllmEngineServicer(
+        mock_llm,
+        start_time=time.time(),
+        default_request_seed=default_request_seed,
+    )
     # Stub the proto→params converters so we don't depend on real vLLM types.
     servicer._sampling_params_from_proto = MagicMock(
         return_value=MagicMock(logprobs=None, prompt_logprobs=None)
@@ -131,6 +135,83 @@ def _make_generate_context():
 
     ctx.send_initial_metadata = MagicMock(side_effect=_send_initial_metadata)
     return ctx
+
+
+@pytest.mark.parametrize(("rank", "expected_rank"), [(None, 0), (0, 0), (3, 3)])
+@pytest.mark.asyncio
+async def test_generate_forwards_data_parallel_rank_with_zero_default(rank, expected_rank):
+    servicer, mock_llm = _make_park_servicer()
+    request = _make_text_request()
+    if rank is not None:
+        request.data_parallel_rank = rank
+
+    async for _ in servicer.Generate(request, _make_generate_context()):
+        pass
+
+    add_request_kwargs = mock_llm.add_request.call_args.kwargs
+    assert add_request_kwargs["data_parallel_rank"] == expected_rank
+    assert servicer.get_active_request_count(expected_rank) == 0
+
+
+@pytest.mark.parametrize(("priority", "expected_priority"), [(None, None), (0, 0), (-7, -7)])
+@pytest.mark.asyncio
+async def test_generate_forwards_only_present_priority(priority, expected_priority):
+    servicer, mock_llm = _make_park_servicer()
+    request = _make_text_request()
+    if priority is not None:
+        request.priority = priority
+
+    async for _ in servicer.Generate(request, _make_generate_context()):
+        pass
+
+    add_request_kwargs = mock_llm.add_request.call_args.kwargs
+    if expected_priority is None:
+        assert "priority" not in add_request_kwargs
+    else:
+        assert add_request_kwargs["priority"] == expected_priority
+
+
+@pytest.mark.asyncio
+async def test_generate_tracks_active_request_until_stream_finishes():
+    servicer, mock_llm = _make_park_servicer()
+    release = asyncio.Event()
+    collector = MagicMock()
+    collector.request_id = "req-active"
+    collector.get_nowait.return_value = None
+
+    async def _get_output():
+        await release.wait()
+        return STREAM_FINISHED
+
+    collector.get = MagicMock(side_effect=_get_output)
+
+    async def _add_request(**kwargs):
+        return collector
+
+    mock_llm.add_request = MagicMock(side_effect=_add_request)
+    request = _make_text_request(request_id="req-active")
+    request.data_parallel_rank = 2
+    generator = servicer.Generate(request, _make_generate_context())
+    pending = asyncio.create_task(generator.__anext__())
+    await asyncio.sleep(0)
+
+    assert servicer.get_active_request_count(2) == 1
+
+    release.set()
+    with pytest.raises(StopAsyncIteration):
+        await pending
+    assert servicer.get_active_request_count(2) == 0
+    await generator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_generate_propagates_default_request_seed():
+    servicer, _ = _make_park_servicer(default_request_seed=17)
+
+    async for _ in servicer.Generate(_make_text_request(), _make_generate_context()):
+        pass
+
+    assert servicer._sampling_params_from_proto.call_args.kwargs["default_seed"] == 17
 
 
 @pytest.mark.asyncio

@@ -213,6 +213,11 @@ impl ResponseProcessor {
         };
 
         // Step 6: Build ChatChoice
+        let routed_experts = complete
+            .routed_experts()
+            .map_err(|error| error.to_string())?
+            .as_ref()
+            .and_then(utils::encode_routed_experts_for_response);
         Ok(ChatChoice {
             index: index as u32,
             message: chat_message,
@@ -220,10 +225,7 @@ impl ResponseProcessor {
             finish_reason: Some(final_finish_reason_str.to_string()),
             matched_stop,
             hidden_states: None,
-            routed_experts: complete
-                .routed_experts()
-                .as_ref()
-                .and_then(utils::encode_routed_experts_for_response),
+            routed_experts,
         })
     }
 
@@ -284,11 +286,12 @@ impl ResponseProcessor {
 
         // Process all choices
         let mut choices = Vec::with_capacity(all_responses.len());
-        for (index, complete) in all_responses.iter().enumerate() {
+        for complete in all_responses {
+            let index = complete.index();
             match self
                 .process_single_choice(
                     complete,
-                    index,
+                    index as usize,
                     chat_request,
                     tokenizer,
                     stop_decoder,
@@ -470,6 +473,11 @@ impl ResponseProcessor {
             };
 
             // Build GenerateResponse struct
+            let routed_experts = complete
+                .routed_experts()
+                .map_err(|error| error::internal_error(error.error_code(), error.to_string()))?
+                .as_ref()
+                .and_then(utils::encode_routed_experts_for_response);
             let meta_info = GenerateMetaInfo {
                 id: dispatch.request_id.clone(),
                 finish_reason,
@@ -490,10 +498,7 @@ impl ResponseProcessor {
                 } else {
                     prompt_token_ids.clone()
                 },
-                routed_experts: complete
-                    .routed_experts()
-                    .as_ref()
-                    .and_then(utils::encode_routed_experts_for_response),
+                routed_experts,
             };
 
             result_array.push(GenerateResponse {
@@ -889,16 +894,18 @@ impl ResponseProcessor {
                 text.push_str(sfx);
             }
 
+            let routed_experts = complete
+                .routed_experts()
+                .map_err(|error| error::internal_error(error.error_code(), error.to_string()))?
+                .as_ref()
+                .and_then(utils::encode_routed_experts_for_response);
             choices.push(CompletionChoice {
                 text,
                 index: i as u32,
                 logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
                 finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
                 matched_stop,
-                routed_experts: complete
-                    .routed_experts()
-                    .as_ref()
-                    .and_then(utils::encode_routed_experts_for_response),
+                routed_experts,
             });
         }
 

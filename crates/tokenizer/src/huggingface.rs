@@ -35,6 +35,7 @@ enum Renderer {
 
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
+    model_type: Option<String>,
     tokenizer: HfTokenizer,
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
@@ -273,7 +274,12 @@ impl HuggingFaceTokenizer {
             .map(detect_renderer_from_config)
             .unwrap_or(Renderer::Jinja);
 
+        let model_type = tokenizer_path
+            .parent()
+            .and_then(crate::factory::load_hf_model_type);
+
         Ok(HuggingFaceTokenizer {
+            model_type,
             tokenizer,
             special_tokens,
             vocab,
@@ -342,6 +348,7 @@ impl HuggingFaceTokenizer {
             .collect();
 
         HuggingFaceTokenizer {
+            model_type: None,
             tokenizer,
             special_tokens,
             vocab,
@@ -528,6 +535,10 @@ impl Decoder for HuggingFaceTokenizer {
 }
 
 impl TokenizerTrait for HuggingFaceTokenizer {
+    fn model_type(&self) -> Option<&str> {
+        self.model_type.as_deref()
+    }
+
     fn vocab_size(&self) -> usize {
         self.tokenizer.get_vocab_size(false)
     }
@@ -602,6 +613,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             Renderer::DeepseekV32 | Renderer::DeepseekV4 => true,
             Renderer::Jinja => self.chat_template.think_in_prefill(),
         }
+    }
+
+    fn chat_template_is_position_dependent(&self) -> bool {
+        matches!(self.renderer, Renderer::Jinja) && self.chat_template.position_dependent()
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {

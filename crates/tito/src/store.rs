@@ -312,6 +312,12 @@ pub struct PrefixMatch {
     pub pretokenized_ids: Vec<u32>,
     /// How many messages from the start were matched (messages[..matched_len] is cached).
     pub matched_message_num: usize,
+    /// True when the appended slice `messages[matched_message_num..]` contains at
+    /// least one assistant turn.  This happens when the harness compacted /
+    /// re-injected the conversation (e.g. Claude Code auto-compact): those
+    /// assistant turns are treated as prompt (mask 0) and are re-tokenized
+    /// incrementally by the engine.
+    pub has_assistant_in_appended: bool,
 }
 
 /// `running_hasher` is the [`PrefixHasher`] state after folding both the
@@ -531,9 +537,11 @@ impl TitoStore {
     /// Look up the longest cached prefix for `messages` and emit hash-chain
     /// state usable by [`Self::store_with_hashes`].
     ///
-    /// Returns `Err(TitoError::AssistantInAppended)` if a HIT candidate would
-    /// require an assistant turn inside the appended slice (client sequencing
-    /// bug).
+    /// If a HIT candidate would require an assistant turn inside the appended
+    /// slice, the hit is still returned: the assistant turns are interpreted as
+    /// **compacted conversation context** (e.g. Claude Code auto-compact) that
+    /// this session's model never generated.  `merge_incremental` re-tokenizes
+    /// them into the prompt and they never receive a training mask (mask 0).
     ///
     /// On a miss, the running hasher and parent hash are still populated,
     /// so the caller can store a root node for the session without paying
@@ -605,8 +613,34 @@ impl TitoStore {
         for (k, hash) in candidates.iter().rev() {
             if let Some(entry) = state.entries.get(hash) {
                 let appended = &messages[*k..];
-                if appended.iter().any(is_assistant_role) {
-                    return Err(TitoError::AssistantInAppended);
+                let has_assistant_in_appended = appended.iter().any(is_assistant_role);
+                if has_assistant_in_appended {
+                    // The harness compacted / re-injected the conversation: the
+                    // appended slice contains assistant turns that this session's
+                    // model never generated.  Keep the hit and treat them as
+                    // prompt — `merge_incremental` re-tokenizes them and the
+                    // training mask stays 0 (only generated output is masked 1).
+                    // WARN in debug mode (compaction is notable there); DEBUG
+                    // otherwise so production logs do not spam on every hit.
+                    if self.is_debug() {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            matched_len = *k,
+                            appended_with_assistant = true,
+                            appended_msg_count = appended.len(),
+                            "TITO HIT — appended slice contains assistant turn(s); \
+                             treating as compacted context (prompt, mask 0)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            matched_len = *k,
+                            appended_with_assistant = true,
+                            appended_msg_count = appended.len(),
+                            "TITO HIT — appended slice contains assistant turn(s); \
+                             treating as compacted context (prompt, mask 0)"
+                        );
+                    }
                 }
                 tracing::debug!(
                     session_id = %session_id,
@@ -614,14 +648,21 @@ impl TitoStore {
                     prefix_tokens = entry.token_ids.len(),
                     "find_prefix_with_lookup: HIT"
                 );
-                let reusable_prefix_token_ids = entry
-                    .reusable_prefix_token_ids
-                    .as_deref()
-                    .unwrap_or(entry.token_ids.as_ref());
+                let reusable_prefix_token_ids = Arc::clone(
+                    entry
+                        .reusable_prefix_token_ids
+                        .as_ref()
+                        .unwrap_or(&entry.token_ids),
+                );
+                // Copying a long token prefix is O(context length). Release the
+                // per-session mutex first so concurrent branches in the same
+                // session are not serialized behind that memory copy.
+                drop(state);
                 return Ok(PrefixLookup {
                     matched: Some(PrefixMatch {
-                        pretokenized_ids: reusable_prefix_token_ids.clone(),
+                        pretokenized_ids: reusable_prefix_token_ids.as_ref().clone(),
                         matched_message_num: *k,
+                        has_assistant_in_appended,
                     }),
                     running_hasher: hasher,
                     parent_hash,
@@ -719,6 +760,33 @@ impl TitoStore {
     ) -> Result<(), TitoError> {
         let arc = self.get_or_create_session_arc(session_id);
         let mut state = arc.lock();
+
+        // A child checkpoint must contain the complete parent token sequence.
+        // This exact check rejects both divergence and the old short-sequence
+        // loophole; boundary trimming is only an export concern.
+        if let Some(ph) = parent_hash {
+            if let Some(parent) = state.entries.get(&ph) {
+                let prev: &[u32] = parent
+                    .reusable_prefix_token_ids
+                    .as_deref()
+                    .unwrap_or(&parent.token_ids);
+                let new_ids: &[u32] = token_ids.reusable.as_deref().unwrap_or(&token_ids.expanded);
+                if !new_ids.starts_with(prev) {
+                    let first = prev
+                        .iter()
+                        .zip(new_ids)
+                        .position(|(a, b)| a != b)
+                        .unwrap_or_else(|| prev.len().min(new_ids.len()));
+                    return Err(TitoError::PrefixMismatch(format!(
+                        "stored prefix {} tokens does not prefix new checkpoint {} tokens \
+                         (first mismatch at {})",
+                        prev.len(),
+                        new_ids.len(),
+                        first
+                    )));
+                }
+            }
+        }
 
         // Leaf tracking: the parent is no longer a leaf once we add a child.
         if let Some(ph) = parent_hash {
@@ -1198,7 +1266,10 @@ mod tests {
     }
 
     #[test]
-    fn find_prefix_assistant_in_appended_returns_error() {
+    fn find_prefix_assistant_in_appended_returns_hit() {
+        // An assistant turn inside the appended slice (compacted context) must
+        // not reject the request: the hit is returned and the assistant turn is
+        // treated as prompt (mask 0).
         let store = make_store();
         store.create_session("s1");
         let ctx = render_context();
@@ -1217,10 +1288,9 @@ mod tests {
             tool_msg("result", "call_1"),
             assistant_msg("again"),
         ];
-        assert!(matches!(
-            store.find_prefix("s1", &msgs, &ctx),
-            Err(TitoError::AssistantInAppended)
-        ));
+        let hit = store.find_prefix("s1", &msgs, &ctx).unwrap().unwrap();
+        assert_eq!(hit.pretokenized_ids, vec![1, 2, 3]);
+        assert_eq!(hit.matched_message_num, 2);
     }
 
     #[test]
@@ -1925,6 +1995,110 @@ mod tests {
 
         assert_eq!(token_ids.expanded, vec![1, 2, 3]);
         assert!(token_ids.reusable.is_none());
+    }
+
+    #[test]
+    fn prefix_validation_is_exact_and_rejects_short_or_divergent_children() {
+        let store = make_store();
+        store.create_session("s");
+        // Boundary trim configuration must not weaken trajectory integrity.
+        store.set_session_max_trim_tokens("s", 1);
+
+        let parent_hash: PrefixHash = [1u8; 32];
+        store
+            .store_with_hashes(
+                "s",
+                parent_hash,
+                None,
+                vec![10, 20, 30],
+                record(3, "stop"),
+                0,
+            )
+            .unwrap();
+
+        // Clean extension preserves every parent token.
+        store
+            .store_with_hashes(
+                "s",
+                [2u8; 32],
+                Some(parent_hash),
+                vec![10, 20, 30, 151645, 198],
+                record(5, "stop"),
+                0,
+            )
+            .unwrap();
+
+        let short_err = store
+            .store_with_hashes(
+                "s",
+                [4u8; 32],
+                Some(parent_hash),
+                vec![10, 20],
+                record(2, "stop"),
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(short_err, TitoError::PrefixMismatch(_)));
+
+        // Genuine divergence inside the shared prefix must be rejected.
+        let err = store
+            .store_with_hashes(
+                "s",
+                [3u8; 32],
+                Some(parent_hash),
+                vec![99, 20, 30, 40],
+                record(4, "stop"),
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TitoError::PrefixMismatch(_)),
+            "expected PrefixMismatch, got {err:?}"
+        );
+
+        // The rejected node must not have been stored: the trajectory still
+        // points at the clean-extension leaf, not the divergent node.
+        let trajectories = store.get_all_trajectories("s");
+        assert_eq!(trajectories.len(), 1);
+        assert_eq!(
+            trajectories[0].accumulated_token_ids,
+            vec![10, 20, 30, 151645, 198]
+        );
+    }
+
+    #[test]
+    fn prefix_validation_uses_persisted_boundary_adjusted_sequence() {
+        let store = make_store();
+        store.create_session("s");
+        let parent_hash: PrefixHash = [7u8; 32];
+
+        // The expanded training sequence retains the generated delimiter, while
+        // the reusable sequence is the adapter-adjusted boundary used by the
+        // next request (GLM removes such a delimiter; Qwen may append one).
+        store
+            .store_with_hashes_and_reusable(
+                "s",
+                parent_hash,
+                None,
+                StoredTokenSequences::with_reusable(vec![10, 99], vec![10]),
+                record(1, "stop"),
+                0,
+            )
+            .unwrap();
+
+        store
+            .store_with_hashes_and_reusable(
+                "s",
+                [8u8; 32],
+                Some(parent_hash),
+                StoredTokenSequences::with_reusable(vec![10, 20, 99], vec![10, 20]),
+                record(2, "stop"),
+                0,
+            )
+            .unwrap();
+
+        let trajectories = store.get_all_trajectories("s");
+        assert_eq!(trajectories[0].accumulated_token_ids, vec![10, 20, 99]);
     }
 
     #[test]

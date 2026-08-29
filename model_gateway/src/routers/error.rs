@@ -24,11 +24,58 @@ struct ErrorDetail<'a> {
 
 pub const HEADER_X_SMG_ERROR_CODE: &str = "X-SMG-Error-Code";
 
+/// Session-scoped request header carrying the prompt-length budget at which the
+/// gateway returns an Anthropic `prompt_too_long` error, driving Claude Code's
+/// reactive compact before the context grows past the training budget. PSRL
+/// injects it at session creation (the harness compaction trigger).
+pub const X_SMG_PROMPT_TOO_LONG_LIMIT: &str = "x-smg-prompt-too-long-limit";
+
 /// Expected RL termination: prompt exceeded the worker's max_model_len.
 ///
 /// Distinct from generic 400s / `start_generation_failed`. Downstream (PSRL)
 /// maps this header to `PromptOverflowError` and truncates the trajectory.
 pub const PROMPT_OVERFLOW_ERROR_CODE: &str = "prompt_overflow";
+pub const PROMPT_TOO_LONG_ERROR_CODE: &str = "prompt_too_long";
+pub const INVALID_PROMPT_TOO_LONG_LIMIT_ERROR_CODE: &str = "invalid_prompt_too_long_limit";
+
+/// Parse and validate the optional session prompt budget.
+/// A present header must be a positive integer; malformed configuration must
+/// not silently change behavior between preparation and execution paths.
+pub fn prompt_too_long_limit(headers: Option<&HeaderMap>) -> Result<Option<usize>, Response> {
+    let Some(value) = headers.and_then(|headers| headers.get(X_SMG_PROMPT_TOO_LONG_LIMIT)) else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| {
+        bad_request(
+            INVALID_PROMPT_TOO_LONG_LIMIT_ERROR_CODE,
+            format!("{X_SMG_PROMPT_TOO_LONG_LIMIT} must be a positive integer"),
+        )
+    })?;
+    let limit = raw
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            bad_request(
+                INVALID_PROMPT_TOO_LONG_LIMIT_ERROR_CODE,
+                format!("{X_SMG_PROMPT_TOO_LONG_LIMIT} must be a positive integer"),
+            )
+        })?;
+    Ok(Some(limit))
+}
+
+/// The configured value is the largest accepted prompt length.
+pub fn prompt_exceeds_limit(prompt_len: usize, limit: usize) -> bool {
+    prompt_len > limit
+}
+
+pub fn prompt_too_long(prompt_len: usize, limit: usize) -> Response {
+    bad_request(
+        PROMPT_TOO_LONG_ERROR_CODE,
+        format!("Prompt is too long: {prompt_len} tokens > {limit} tokens (approximately)"),
+    )
+}
 
 pub fn internal_error(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::INTERNAL_SERVER_ERROR, code, message)
@@ -167,6 +214,26 @@ pub fn sanitize_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_limit_uses_inclusive_max_boundary() {
+        assert!(!prompt_exceeds_limit(10, 10));
+        assert!(prompt_exceeds_limit(11, 10));
+    }
+
+    #[test]
+    fn prompt_limit_header_is_strictly_validated() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_SMG_PROMPT_TOO_LONG_LIMIT, HeaderValue::from_static("128"));
+        assert_eq!(prompt_too_long_limit(Some(&headers)).unwrap(), Some(128));
+
+        headers.insert(X_SMG_PROMPT_TOO_LONG_LIMIT, HeaderValue::from_static("0"));
+        let response = prompt_too_long_limit(Some(&headers)).unwrap_err();
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            INVALID_PROMPT_TOO_LONG_LIMIT_ERROR_CODE
+        );
+    }
 
     #[test]
     fn test_sanitize_org_id() {

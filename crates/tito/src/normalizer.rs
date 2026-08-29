@@ -100,6 +100,29 @@ pub fn finalize_hash(hasher: &PrefixHasher) -> PrefixHash {
     *hasher.finalize().as_bytes()
 }
 
+/// Recursively sort every JSON object key so semantically identical values
+/// serialize identically regardless of the key order in the input.
+///
+/// Used when hashing tool-call arguments: the model may emit arguments with one
+/// key order while the client (Claude Code) re-serializes the parsed `input`
+/// object with a different order on the next turn.  Key order is irrelevant to
+/// the semantics, so the hash must not depend on it, otherwise the TITO prefix
+/// lookup misses and a new trajectory forks in a purely append-only session.
+pub(crate) fn sort_json_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted: Vec<(String, Value)> = map
+                .into_iter()
+                .map(|(key, value)| (key, sort_json_keys(value)))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_json_keys).collect()),
+        other => other,
+    }
+}
+
 fn hash_render_context_into(hasher: &mut blake3::Hasher, context: &RenderContext) {
     hasher.update(b"tito-render-context-v1\x00");
 
@@ -109,8 +132,17 @@ fn hash_render_context_into(hasher: &mut blake3::Hasher, context: &RenderContext
             hasher.update(tools.len().to_string().as_bytes());
             hasher.update(b"\x00");
             for tool in tools {
-                let canonical = canonicalize_value(tool.clone());
-                hasher.update(canonical.as_bytes());
+                // The chat template renders each tool via `tojson` in its
+                // *native* (request) key order — serde_json and minijinja both
+                // enable `preserve_order`.  The gateway canonicalizes tool
+                // schemas upstream (`canonicalize_json_value` in
+                // message_utils), so the RenderContext here always carries the
+                // canonical form: semantically identical tools hash the same
+                // across turns (stable prefix HIT) while genuinely different
+                // tools (different keys/values) still produce a different
+                // canonical serialization and invalidate the prefix.
+                let serialized = serde_json::to_string(tool).unwrap_or_default();
+                hasher.update(serialized.as_bytes());
                 hasher.update(b"\x00");
             }
         }
@@ -132,12 +164,15 @@ fn hash_render_context_into(hasher: &mut blake3::Hasher, context: &RenderContext
     hasher.update(b"template_kwargs\x00");
     match &context.template_kwargs {
         Some(kwargs) => {
+            // Top-level keys are iterated in sorted order for determinism
+            // (templates access kwargs by key); values are hashed in native
+            // order to match any `| tojson` rendering.
             let sorted: BTreeMap<_, _> = kwargs.iter().collect();
             for (key, value) in sorted {
                 hasher.update(key.as_bytes());
                 hasher.update(b"\x00");
-                let canonical = canonicalize_value(value.clone());
-                hasher.update(canonical.as_bytes());
+                let serialized = serde_json::to_string(value).unwrap_or_default();
+                hasher.update(serialized.as_bytes());
                 hasher.update(b"\x00");
             }
         }
@@ -198,10 +233,22 @@ pub fn hash_message_into(hasher: &mut blake3::Hasher, msg: &ChatMessage) {
                 hasher.update(b"\x00");
                 hasher.update(tc.function.name.as_bytes());
                 hasher.update(b"\x00");
-                // Canonicalize JSON arguments
+                // Tool-call arguments: hash a *canonical* form so semantically
+                // identical arguments match regardless of the JSON key order the
+                // model emitted vs. what the client re-serialized on the next
+                // turn.  Claude Code re-sends tool `input` as a fresh object with
+                // its own key order; an order-sensitive hash makes the prefix
+                // lookup miss and forks a new trajectory even in a purely
+                // append-only session.  Key order is semantically irrelevant, so
+                // sort recursively before serializing.
                 let args = tc.function.arguments.as_deref().unwrap_or("{}");
-                let canonical = canonicalize_json(args);
-                hasher.update(canonical.as_bytes());
+                let serialized = serde_json::from_str::<Value>(args)
+                    .map(|v| {
+                        serde_json::to_string(&sort_json_keys(v))
+                            .unwrap_or_else(|_| args.to_string())
+                    })
+                    .unwrap_or_else(|_| args.to_string());
+                hasher.update(serialized.as_bytes());
                 hasher.update(b"\x00");
             }
         }
@@ -346,6 +393,61 @@ pub fn assistants_diagnostic_summary(messages: &[ChatMessage]) -> String {
     out
 }
 
+/// Render a one-line role classification of every message, including
+/// tool-call ids/names for assistant messages.
+///
+/// Debug aid for compacted-context prefix hits (assistant turns inside the
+/// appended slice): it confirms which messages the engine is about to
+/// re-tokenize incrementally and what tool-call state they carry.
+pub fn messages_structure_summary(messages: &[ChatMessage]) -> String {
+    use openai_protocol::chat::MessageContent;
+
+    let mut out = String::from("[");
+    for (i, msg) in messages.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let label = match msg {
+            ChatMessage::System { .. } => "system".to_string(),
+            ChatMessage::User { .. } => "user".to_string(),
+            ChatMessage::Developer { .. } => "developer".to_string(),
+            ChatMessage::Function { name, .. } => format!("function({name})"),
+            ChatMessage::Tool { tool_call_id, .. } => format!("tool(call={tool_call_id})"),
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+                reasoning_content,
+                ..
+            } => {
+                let content_info = match content {
+                    None => "None".to_string(),
+                    Some(MessageContent::Text(s)) => format!("Text({})", s.len()),
+                    Some(MessageContent::Parts(p)) => format!("Parts({})", p.len()),
+                };
+                let rc = if reasoning_content.as_deref().is_some_and(|s| !s.is_empty()) {
+                    "rc"
+                } else {
+                    "no-rc"
+                };
+                match tool_calls.as_deref() {
+                    None => format!("assistant({content_info},{rc})"),
+                    Some(tcs) => {
+                        let calls = tcs
+                            .iter()
+                            .map(|tc| format!("{}:{}", tc.id, tc.function.name))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("assistant({content_info},{rc},tc=[{calls}])")
+                    }
+                }
+            }
+        };
+        out.push_str(&label);
+    }
+    out.push(']');
+    out
+}
+
 fn short_sha(bytes: &[u8]) -> String {
     let h = blake3::hash(bytes);
     let prefix = &h.as_bytes()[..4];
@@ -354,36 +456,6 @@ fn short_sha(bytes: &[u8]) -> String {
         prefix[0], prefix[1], prefix[2], prefix[3]
     )
 }
-
-fn canonicalize_json(json_str: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(json_str) {
-        Ok(v) => serde_json::to_string(&sort_keys(v)).unwrap_or_else(|_| json_str.to_owned()),
-        Err(_) => json_str.to_owned(),
-    }
-}
-
-fn canonicalize_value(value: Value) -> String {
-    serde_json::to_string(&sort_keys(value)).unwrap_or_default()
-}
-
-fn sort_keys(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let sorted: serde_json::Map<_, _> = map
-                .into_iter()
-                .map(|(k, v)| (k, sort_keys(v)))
-                .collect::<std::collections::BTreeMap<_, _>>()
-                .into_iter()
-                .collect();
-            serde_json::Value::Object(sorted)
-        }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(sort_keys).collect())
-        }
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use openai_protocol::chat::{ChatMessage, MessageContent};
@@ -420,7 +492,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_args_canonicalized() {
+    fn tool_call_args_key_order_does_not_change_hash() {
+        // Tool-call arguments are semantically order-independent: the model may
+        // emit `{"file_path": ..., "old_string": ..., "new_string": ...}` while
+        // Claude Code re-serializes the parsed `input` object on the next turn
+        // as `{"replace_all": ..., "file_path": ...}`.  The prefix hash
+        // canonicalizes (sorts) keys so such re-serialization still HITs and the
+        // trajectory continues instead of forking.
         use openai_protocol::common::{FunctionCallResponse, ToolCall};
         let mk_tool_msg = |args: &str| ChatMessage::Assistant {
             content: None,
@@ -435,9 +513,22 @@ mod tests {
                 },
             }]),
         };
+        // Flat key reorder.
         let m1 = vec![mk_tool_msg(r#"{"b":1,"a":2}"#)];
         let m2 = vec![mk_tool_msg(r#"{"a":2,"b":1}"#)];
         assert_eq!(hash_messages(&m1), hash_messages(&m2));
+        // Nested object key reorder (as with Edit old_string/new_string payloads).
+        let m3 = vec![mk_tool_msg(
+            r#"{"file_path":"monkeytype/stubs.py","old_string":{"z":1,"a":2},"new_string":{"x":3,"y":4}}"#,
+        )];
+        let m4 = vec![mk_tool_msg(
+            r#"{"new_string":{"y":4,"x":3},"file_path":"monkeytype/stubs.py","old_string":{"a":2,"z":1}}"#,
+        )];
+        assert_eq!(hash_messages(&m3), hash_messages(&m4));
+        // Genuinely different content still hashes differently.
+        let m5 = vec![mk_tool_msg(r#"{"a":2,"b":1}"#)];
+        let m6 = vec![mk_tool_msg(r#"{"a":2,"b":2}"#)];
+        assert_ne!(hash_messages(&m5), hash_messages(&m6));
     }
 
     #[test]

@@ -140,6 +140,7 @@ fn parse_special_tokens(config: &serde_json::Value) -> SpecialTokens {
 
 /// Tiktoken tokenizer wrapper — supports both built-in OpenAI encodings and hub-loaded models.
 pub struct TiktokenTokenizer {
+    model_type: Option<String>,
     tokenizer: CoreBPE,
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
@@ -195,6 +196,7 @@ impl TiktokenTokenizer {
         };
 
         Ok(TiktokenTokenizer {
+            model_type: None,
             tokenizer,
             special_tokens,
             vocab: HashMap::new(),
@@ -300,6 +302,7 @@ impl TiktokenTokenizer {
         let renderer = detect_renderer_from_config(dir);
 
         Ok(TiktokenTokenizer {
+            model_type: crate::factory::load_hf_model_type(dir),
             tokenizer,
             special_tokens: config.special_tokens,
             vocab,
@@ -514,6 +517,10 @@ fn is_unknown_tiktoken_decode_error(err: &Error) -> bool {
 }
 
 impl TokenizerTrait for TiktokenTokenizer {
+    fn model_type(&self) -> Option<&str> {
+        self.model_type.as_deref()
+    }
+
     fn vocab_size(&self) -> usize {
         self.vocab_size
     }
@@ -571,6 +578,10 @@ impl TokenizerTrait for TiktokenTokenizer {
 
     fn think_in_prefill(&self) -> bool {
         self.chat_template.think_in_prefill()
+    }
+
+    fn chat_template_is_position_dependent(&self) -> bool {
+        matches!(self.renderer, Renderer::Jinja) && self.chat_template.position_dependent()
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {
@@ -641,6 +652,14 @@ mod tests {
     fn test_tiktoken_creation() {
         let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
         assert_eq!(tokenizer.vocab_size(), 100256);
+        assert_eq!(tokenizer.model_type(), None);
+    }
+
+    #[test]
+    fn checkpoint_model_type_comes_from_config_json() {
+        let dir = write_minimal_tiktoken_dir("{}", Some(r#"{"model_type":"qwen3_5"}"#));
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert_eq!(tokenizer.model_type(), Some("qwen3_5"));
     }
 
     #[test]

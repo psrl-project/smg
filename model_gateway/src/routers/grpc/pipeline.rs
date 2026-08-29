@@ -20,7 +20,7 @@ use openai_protocol::{
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tokio::sync::oneshot;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 // Import embedding-specific, classify-specific, messages-specific, and completion-specific stages
 use super::regular::stages::classify::ClassifyResponseProcessingStage;
@@ -65,6 +65,29 @@ use crate::{
     routers::error,
     worker::WorkerRegistry,
 };
+
+/// Log a pipeline stage failure, downgrading expected client-driven outcomes.
+///
+/// A stage returning a `prompt_too_long` error is **not** a gateway failure: it
+/// is the reactive-context-compaction signal (the accumulated prompt exceeded the
+/// session's compaction budget, so the harness is expected to compact and
+/// retry). Log it as a WARN describing the compaction event instead of an ERROR
+/// so the run log does not drown in expected 400s.
+fn log_stage_failure(stage_name: &str, response: &Response) {
+    if error::extract_error_code_from_response(response) == error::PROMPT_TOO_LONG_ERROR_CODE {
+        warn!(
+            stage = stage_name,
+            status = %response.status(),
+            "Chat context exceeded compaction budget; returned prompt_too_long for reactive compact"
+        );
+    } else {
+        error!(
+            "Stage {} failed with status {}",
+            stage_name,
+            response.status()
+        );
+    }
+}
 
 /// Generic request pipeline for all request types
 ///
@@ -141,11 +164,7 @@ impl RequestPipeline {
                 Ok(Some(response)) => return Err(response),
                 Ok(None) => continue,
                 Err(response) => {
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return Err(response);
                 }
             }
@@ -1010,11 +1029,7 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_CHAT,
                         error_type_from_status(response.status()),
                     );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return response;
                 }
             }
@@ -1107,11 +1122,7 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_GENERATE,
                         error_type_from_status(response.status()),
                     );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return response;
                 }
             }
@@ -1204,11 +1215,7 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_COMPLETIONS,
                         error_type_from_status(response.status()),
                     );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return response;
                 }
             }
@@ -1528,11 +1535,7 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_MESSAGES,
                         error_type_from_status(response.status()),
                     );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return response;
                 }
             }

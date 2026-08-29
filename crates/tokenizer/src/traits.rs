@@ -75,6 +75,14 @@ pub trait Decoder: Send + Sync {
 
 /// Combined tokenizer trait
 pub trait Tokenizer: Encoder + Decoder {
+    /// Exact Hugging Face `config.json::model_type` for this checkpoint.
+    ///
+    /// Callers that need model-family-specific token semantics must use this
+    /// server-loaded metadata rather than a request model name or alias.
+    fn model_type(&self) -> Option<&str> {
+        None
+    }
+
     fn vocab_size(&self) -> usize;
     fn get_special_tokens(&self) -> &SpecialTokens;
     fn token_to_id(&self, token: &str) -> Option<TokenIdType>;
@@ -111,6 +119,12 @@ pub trait Tokenizer: Encoder + Decoder {
 
     /// Whether the template injects `<think>` in the generation prompt.
     fn think_in_prefill(&self) -> bool {
+        false
+    }
+
+    /// Whether assistant rendering depends on message position (for example,
+    /// stock Qwen3.5 templates that compare against `last_query_index`).
+    fn chat_template_is_position_dependent(&self) -> bool {
         false
     }
 

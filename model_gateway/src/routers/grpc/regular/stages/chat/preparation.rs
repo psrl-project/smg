@@ -266,6 +266,24 @@ impl ChatPreparationStage {
             }
         }
 
+        // Step 3.5: Enforce the session's prompt-too-long budget. When the
+        // accumulated prompt exceeds the training compaction limit, return an
+        // Anthropic `prompt_too_long` error so Claude Code reactively compacts
+        // instead of growing past the budget (or hitting the engine overflow
+        // with a message Claude Code cannot recognize).
+        if let Some(limit) = error::prompt_too_long_limit(ctx.input.headers.as_ref())? {
+            let prompt_len = token_ids.len();
+            if error::prompt_exceeds_limit(prompt_len, limit) {
+                warn!(
+                    function = "ChatPreparationStage::execute",
+                    prompt_len,
+                    limit,
+                    "Prompt exceeded compaction budget; returning prompt_too_long for reactive compact"
+                );
+                return Err(error::prompt_too_long(prompt_len, limit));
+            }
+        }
+
         // Step 4: Build tool constraints if needed
         // The tool parser registry handles both structural tag (for native format
         // parsers like Mistral, KimiK2) and generic JSON schema fallback.
@@ -403,6 +421,22 @@ impl ChatPreparationStage {
             error::bad_request("tito_render_context_failed", e)
         })?;
 
+        // Select once from exact server-side metadata. The same immutable
+        // adapter is shared by preparation and capture, avoiding a second
+        // special-token lookup/newline encode on every request.
+        let adapter: Arc<dyn model_adapter::ModelAdapter> =
+            model_adapter::select_adapter_for_tokenizer(&**tokenizer)
+                .map(Into::into)
+                .map_err(|e| {
+                    error!(
+                        function = "ChatPreparationStage::try_tito",
+                        session_id = %session_id,
+                        error = %e,
+                        "Failed to select TITO model adapter from tokenizer metadata"
+                    );
+                    error::bad_request("tito_model_adapter_error", e.to_string())
+                })?;
+
         debug!(
             session_id = %session_id,
             total_messages = messages.len(),
@@ -426,7 +460,18 @@ impl ChatPreparationStage {
         // so the response stage can derive the leaf hash by extending this
         // hasher with the new assistant message.
         let running_hasher = lookup.running_hasher.clone();
-        let parent_hash = lookup.parent_hash;
+        let is_compaction = lookup
+            .matched
+            .as_ref()
+            .is_some_and(|prefix| prefix.has_assistant_in_appended);
+        // Compacted prompts are verified as a complete new prompt and become a
+        // new root/branch. They must never retain a parent edge to a trajectory
+        // whose token stream they rewrote.
+        let parent_hash = if lookup.matched.is_some() && !is_compaction {
+            lookup.parent_hash
+        } else {
+            None
+        };
 
         let resolved_trajectory = store
             .resolve_trajectory_id(&session_id, manual_trajectory_id, parent_hash)
@@ -445,6 +490,7 @@ impl ChatPreparationStage {
             session_id: session_id.clone(),
             request: request_arc,
             render_context: render_context.clone(),
+            model_adapter: Arc::clone(&adapter),
             is_tito_hit: false,
             matched_message_num: 0,
             trajectory_id,
@@ -472,6 +518,17 @@ impl ChatPreparationStage {
                     total_messages = messages.len(),
                     "TITO HIT — found cached prefix"
                 );
+                if store.is_debug() && pm.has_assistant_in_appended {
+                    debug!(
+                        session_id = %session_id,
+                        matched_messages = pm.matched_message_num,
+                        appended_messages = %smg_tito::messages_structure_summary(
+                            &messages[pm.matched_message_num..]
+                        ),
+                        "TITO compacted-context hit — appended assistant turn(s) will be \
+                         re-tokenized incrementally and treated as prompt (mask 0)"
+                    );
+                }
                 pm
             }
             None => {
@@ -493,6 +550,7 @@ impl ChatPreparationStage {
                 prefix_token_len = prefix_token_len,
                 "TITO pseudo-hit without reusable prefix tokens — falling through to full retokenize"
             );
+            ctx.state.tito_context.take();
             return Ok(None);
         }
 
@@ -503,24 +561,56 @@ impl ChatPreparationStage {
             "TITO hit — running merge_incremental"
         );
 
-        // Select adapter using model_id
-        let model_id = ctx.input.model_id.as_str();
-        let adapter = model_adapter::select_adapter(model_id);
-
         let appended = &messages[matched_message_num..];
+        // Mirror the production render path: project `reasoning_effort` onto the
+        // template's thinking toggle so the incremental render's generation
+        // prompt / thinking-mode wrapping matches what the full render produces.
+        let thinking = openai_protocol::chat::thinking_from_reasoning_effort(
+            request.reasoning_effort.as_deref(),
+        );
         let merged_ids = match TitoEngine::merge_incremental(
             prefix_match,
             appended,
             &**tokenizer,
             &*adapter,
             &render_context,
+            thinking,
         ) {
             Ok(ids) => ids,
             Err(e) => {
                 warn!(session_id = %session_id, error = %e, "TITO merge_incremental failed — falling through");
+                // A failed token-prefix proof is a genuine TITO miss. Do not
+                // let response processing store a node derived from this hit.
+                ctx.state.tito_context.take();
                 return Ok(None);
             }
         };
+
+        if is_compaction {
+            let canonical_ids = match TitoEngine::tokenize_full_prompt(
+                messages,
+                &**tokenizer,
+                &render_context,
+                thinking,
+            ) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    warn!(session_id = %session_id, error = %e, "TITO compaction verification failed — falling through");
+                    ctx.state.tito_context.take();
+                    return Ok(None);
+                }
+            };
+            if merged_ids != canonical_ids {
+                warn!(
+                    session_id = %session_id,
+                    merged_tokens = merged_ids.len(),
+                    canonical_tokens = canonical_ids.len(),
+                    "TITO compacted prompt differs from canonical tokenization — falling through"
+                );
+                ctx.state.tito_context.take();
+                return Ok(None);
+            }
+        }
 
         if let Some(ref mut tc) = ctx.state.tito_context {
             tc.is_tito_hit = true;

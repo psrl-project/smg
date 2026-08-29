@@ -3,6 +3,8 @@ use openai_protocol::{
     common::{FunctionCallResponse, ToolCall},
 };
 
+use crate::error::TitoError;
+
 /// Model-specific token boundary adjustment.
 pub trait ModelAdapter: Send + Sync {
     /// Adjust the end of the pretokenized prefix before merging with incremental tokens.
@@ -89,7 +91,7 @@ impl ModelAdapter for DefaultAdapter {
 pub struct Qwen3Adapter {
     pub im_end_id: u32,
     pub newline_id: u32,
-    trailing_ids: [u32; 1],
+    trailing_ids: [u32; 2],
 }
 
 impl Qwen3Adapter {
@@ -97,7 +99,14 @@ impl Qwen3Adapter {
         Self {
             im_end_id,
             newline_id,
-            trailing_ids: [newline_id],
+            // Also trim a trailing `<|im_end|>` (plus the template's following
+            // newline) from both compared sequences. A truncated/aborted final
+            // assistant turn legitimately ends without the closing stop token in
+            // the recorded token stream, while the chat-template reference
+            // always appends one; without this the validator's structural
+            // pre-check reports a spurious `special_token_count` mismatch on the
+            // last turn. Tail-only, so mid-sequence differences are still caught.
+            trailing_ids: [im_end_id, newline_id],
         }
     }
 }
@@ -130,7 +139,7 @@ impl ModelAdapter for Qwen3Adapter {
 pub struct Qwen35Adapter {
     pub im_end_id: u32,
     pub newline_id: u32,
-    trailing_ids: [u32; 1],
+    trailing_ids: [u32; 2],
 }
 
 impl Qwen35Adapter {
@@ -138,7 +147,8 @@ impl Qwen35Adapter {
         Self {
             im_end_id,
             newline_id,
-            trailing_ids: [newline_id],
+            // See Qwen3Adapter::new — trim a trailing <|im_end|> plus newline.
+            trailing_ids: [im_end_id, newline_id],
         }
     }
 }
@@ -170,7 +180,7 @@ impl ModelAdapter for Qwen35Adapter {
 pub struct QwenNextAdapter {
     pub im_end_id: u32,
     pub newline_id: u32,
-    trailing_ids: [u32; 1],
+    trailing_ids: [u32; 2],
 }
 
 impl QwenNextAdapter {
@@ -178,7 +188,8 @@ impl QwenNextAdapter {
         Self {
             im_end_id,
             newline_id,
-            trailing_ids: [newline_id],
+            // See Qwen3Adapter::new — trim a trailing <|im_end|> plus newline.
+            trailing_ids: [im_end_id, newline_id],
         }
     }
 }
@@ -244,41 +255,85 @@ impl ModelAdapter for Glm47Adapter {
     }
 }
 
-/// Select an adapter at runtime based on a model identifier string.
+/// Select an adapter at runtime, deriving the model-specific special-token IDs
+/// from the tokenizer's actual vocabulary and the exact server-side
+/// `config.json::model_type`.
 ///
-/// The `model_identifier` may be either an exact `hf_model_type` value (e.g. `"qwen3"`,
-/// `"chatglm"`) or a full model-id string (e.g. `"Qwen3.5-7B-Instruct"`).  Matching is
-/// case-insensitive substring search so both forms work correctly.
-pub fn select_adapter(model_identifier: &str) -> Box<dyn ModelAdapter> {
-    let lower = model_identifier.to_ascii_lowercase();
+/// Checkpoints of the same family can use different added-token IDs (e.g.
+/// Qwen3-4B-Instruct-2507 has `<|im_end|>` = 151645 while Qwen3.5-4B uses
+/// 248046), so missing required tokens are typed errors rather than guessed IDs.
+pub fn select_adapter_for_tokenizer(
+    tokenizer: &dyn llm_tokenizer::traits::Tokenizer,
+) -> Result<Box<dyn ModelAdapter>, TitoError> {
+    let model_type = tokenizer
+        .model_type()
+        .ok_or(TitoError::ModelTypeUnavailable)?;
+    select_adapter(model_type, tokenizer)
+}
 
-    // GLM family — check before "qwen" to avoid any future overlap.
-    if lower.contains("glm") || lower.contains("chatglm") {
-        return Box::new(Glm47Adapter::new(64795, 64796));
-    }
+fn required_token_id(
+    tokenizer: &dyn llm_tokenizer::traits::Tokenizer,
+    model_type: &str,
+    token: &'static str,
+) -> Result<u32, TitoError> {
+    tokenizer
+        .token_to_id(token)
+        .ok_or_else(|| TitoError::RequiredTokenMissing {
+            model_type: model_type.to_owned(),
+            token,
+        })
+}
 
-    // Qwen family — most-specific variants first so generic "qwen3" substring
-    // does not swallow Qwen3.5 or later families.
-    //
-    // "qwen3.5" / "qwen-3.5" both contain "qwen3.5" or "qwen_3.5" after normalisation;
-    // we normalise dots/dashes/underscores to a single form for reliable matching.
-    let normalised = lower.replace(['.', '-', '_'], "");
-    if normalised.contains("qwen35") || normalised.contains("qwen3point5") {
-        return Box::new(Qwen35Adapter::new(151645, 198));
+fn required_encoded_token_id(
+    tokenizer: &dyn llm_tokenizer::traits::Tokenizer,
+    model_type: &str,
+    token: &'static str,
+) -> Result<u32, TitoError> {
+    let encoding =
+        tokenizer
+            .encode(token, false)
+            .map_err(|_| TitoError::RequiredTokenEncoding {
+                model_type: model_type.to_owned(),
+                token,
+            })?;
+    match encoding.token_ids() {
+        [id] => Ok(*id),
+        _ => Err(TitoError::RequiredTokenEncoding {
+            model_type: model_type.to_owned(),
+            token,
+        }),
     }
-    if normalised.contains("qwen3") {
-        return Box::new(Qwen3Adapter::new(151645, 198));
-    }
-    // Generic "qwen" catch-all for future / unknown Qwen variants.
-    if lower.contains("qwen") {
-        return Box::new(QwenNextAdapter::new(151645, 198));
-    }
+}
 
-    Box::new(DefaultAdapter)
+fn select_adapter(
+    model_type: &str,
+    tokenizer: &dyn llm_tokenizer::traits::Tokenizer,
+) -> Result<Box<dyn ModelAdapter>, TitoError> {
+    match model_type {
+        "qwen2" | "qwen2_moe" | "qwen2_vl" | "qwen2_5_vl" | "qwen3" | "qwen3_moe" | "qwen3_vl"
+        | "qwen3_vl_moe" => {
+            let im_end = required_token_id(tokenizer, model_type, "<|im_end|>")?;
+            let newline = required_encoded_token_id(tokenizer, model_type, "\n")?;
+            Ok(Box::new(Qwen3Adapter::new(im_end, newline)))
+        }
+        "qwen3_5" | "qwen3_5_moe" => {
+            let im_end = required_token_id(tokenizer, model_type, "<|im_end|>")?;
+            let newline = required_encoded_token_id(tokenizer, model_type, "\n")?;
+            Ok(Box::new(Qwen35Adapter::new(im_end, newline)))
+        }
+        "glm4_moe" | "glm_moe_dsa" | "glm4v_moe" => {
+            let observation = required_token_id(tokenizer, model_type, "<|observation|>")?;
+            let user = required_token_id(tokenizer, model_type, "<|user|>")?;
+            Ok(Box::new(Glm47Adapter::new(observation, user)))
+        }
+        _ => Ok(Box::new(DefaultAdapter)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use llm_tokenizer::mock::MockTokenizer;
+
     use super::*;
 
     #[test]
@@ -336,7 +391,15 @@ mod tests {
     fn adapter_trailing_token_ids() {
         assert_eq!(
             Qwen3Adapter::new(151645, 198).trailing_token_ids(),
-            &[198u32]
+            &[151645u32, 198]
+        );
+        assert_eq!(
+            Qwen35Adapter::new(151645, 198).trailing_token_ids(),
+            &[151645u32, 198]
+        );
+        assert_eq!(
+            QwenNextAdapter::new(151645, 198).trailing_token_ids(),
+            &[151645u32, 198]
         );
         assert_eq!(
             Glm47Adapter::new(64795, 64796).trailing_token_ids(),
@@ -346,65 +409,28 @@ mod tests {
     }
 
     #[test]
-    fn select_adapter_returns_qwen3_for_qwen3_type() {
-        let adapter = select_adapter("qwen3");
-        let _ = adapter.adjust_prefix_boundary(&[1, 2, 3]);
+    fn adapter_selection_requires_server_model_type() {
+        let error = match select_adapter_for_tokenizer(&MockTokenizer::new()) {
+            Ok(_) => panic!("missing model_type must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, TitoError::ModelTypeUnavailable));
     }
 
     #[test]
-    fn select_adapter_returns_qwen3_for_model_id() {
-        // "Qwen3-7B-Instruct" → Qwen3Adapter (appends newline after im_end)
-        let adapter = select_adapter("Qwen3-7B-Instruct");
-        let ids = vec![1u32, 2, 151645];
-        let result = adapter.adjust_prefix_boundary(&ids);
-        assert_eq!(result.last(), Some(&198u32));
+    fn model_alias_is_not_used_as_hf_model_type() {
+        let tokenizer = MockTokenizer::new();
+        let adapter = select_adapter("Qwen3-7B-Instruct", &tokenizer).unwrap();
+        let ids = [1, 2, 1002];
+        assert_eq!(adapter.adjust_prefix_boundary(&ids), ids);
     }
 
     #[test]
-    fn select_adapter_returns_qwen35_for_qwen35_model_id() {
-        // "Qwen3.5-7B-Instruct" → Qwen35Adapter (same boundary logic, distinct type)
-        let adapter = select_adapter("Qwen3.5-7B-Instruct");
-        let ids = vec![1u32, 2, 151645];
-        let result = adapter.adjust_prefix_boundary(&ids);
-        assert_eq!(result.last(), Some(&198u32));
-        assert_eq!(result.len(), 4);
-    }
-
-    #[test]
-    fn select_adapter_qwen35_does_not_match_qwen3_adapter() {
-        // Ensure "Qwen3.5" doesn't accidentally resolve to bare Qwen3Adapter.
-        // Both produce the same boundary behaviour, but type names should differ.
-        let adapter35 = select_adapter("Qwen3.5-14B");
-        let adapter3 = select_adapter("Qwen3-7B");
-        // Both append newline; what matters is that the dispatch path ran correctly
-        // (no panic, correct token appended).
-        let ids = vec![151645u32];
-        assert_eq!(adapter35.adjust_prefix_boundary(&ids).last(), Some(&198u32));
-        assert_eq!(adapter3.adjust_prefix_boundary(&ids).last(), Some(&198u32));
-    }
-
-    #[test]
-    fn select_adapter_returns_qwen_next_for_unknown_qwen_variant() {
-        // Generic "qwen" without a recognised version → QwenNextAdapter
-        let adapter = select_adapter("Qwen-VL-Plus");
-        let ids = vec![1u32, 2, 151645];
-        let result = adapter.adjust_prefix_boundary(&ids);
-        assert_eq!(result.last(), Some(&198u32));
-    }
-
-    #[test]
-    fn select_adapter_returns_glm_for_model_id() {
-        // "GLM-4-9B-Chat" → Glm47Adapter (strips observation token)
-        let adapter = select_adapter("GLM-4-9B-Chat");
-        let ids = vec![1u32, 2, 64795];
-        let result = adapter.adjust_prefix_boundary(&ids);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn select_adapter_returns_default_for_unknown() {
-        let adapter = select_adapter("llama3");
-        let ids = vec![1u32, 2, 3];
-        assert_eq!(adapter.adjust_prefix_boundary(&ids), ids.as_slice());
+    fn missing_required_token_is_typed_error() {
+        let error = match select_adapter("qwen3", &MockTokenizer::new()) {
+            Ok(_) => panic!("missing newline token must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, TitoError::RequiredTokenEncoding { .. }));
     }
 }

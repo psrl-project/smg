@@ -10,6 +10,20 @@ use crate::{
     traits,
 };
 
+/// Load the exact Hugging Face model type from a checkpoint directory.
+/// Missing or malformed metadata is represented as `None`; consumers that
+/// require it can turn that absence into a domain-specific typed error.
+pub(crate) fn load_hf_model_type(dir: &Path) -> Option<String> {
+    let value: serde_json::Value =
+        serde_json::from_reader(File::open(dir.join("config.json")).ok()?).ok()?;
+    value
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|model_type| !model_type.is_empty())
+        .map(str::to_owned)
+}
+
 /// Represents the type of tokenizer being used
 #[derive(Debug, Clone)]
 pub enum TokenizerType {

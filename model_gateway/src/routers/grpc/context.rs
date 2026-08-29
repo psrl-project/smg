@@ -479,6 +479,9 @@ pub(crate) struct TitoRequestContext {
     pub session_id: String,
     pub request: Arc<ChatCompletionRequest>,
     pub render_context: smg_tito::RenderContext,
+    /// Model adapter selected once from server-loaded tokenizer metadata and
+    /// reused by merge, validation, and capture.
+    pub model_adapter: Arc<dyn smg_tito::model_adapter::ModelAdapter>,
     pub is_tito_hit: bool,
     /// Number of messages matched by TITO prefix (if is_tito_hit is true).
     /// Used for rollback detection: if new request matches fewer messages, we truncate turn_records.

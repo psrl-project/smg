@@ -207,6 +207,9 @@ message GenerateRequest {
 
   // Opaque JSON blob for connector KV-transfer params (preferred over the legacy typed field).
   optional string kv_transfer_params_json = 9;
+
+  // vLLM request scheduling priority. Lower values are scheduled first.
+  optional int32 priority = 10;
 }
 
 // KV cache transfer parameters for Mooncake PD disaggregation
