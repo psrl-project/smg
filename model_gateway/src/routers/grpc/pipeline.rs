@@ -20,7 +20,7 @@ use openai_protocol::{
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tokio::sync::oneshot;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 // Import embedding-specific, classify-specific, messages-specific, and completion-specific stages
 use super::regular::stages::classify::ClassifyResponseProcessingStage;
@@ -69,16 +69,16 @@ use crate::{
 /// Log a pipeline stage failure, downgrading expected client-driven outcomes.
 ///
 /// A stage returning a `prompt_too_long` error is **not** a gateway failure: it
-/// is the reactive-context-compaction signal (the accumulated prompt exceeded the
+/// is the reactive-context-compaction signal (the accumulated prompt reached the
 /// session's compaction budget, so the harness is expected to compact and
-/// retry). Log it as a WARN describing the compaction event instead of an ERROR
-/// so the run log does not drown in expected 400s.
+/// retry). Log it at DEBUG (instead of WARN/ERROR) so the run log does not
+/// drown in expected 400s; genuine stage failures keep ERROR.
 fn log_stage_failure(stage_name: &str, response: &Response) {
-    if error::extract_error_code_from_response(response) == error::PROMPT_TOO_LONG_ERROR_CODE {
-        warn!(
+    if error::extract_error_code_from_response(response) == "prompt_too_long" {
+        debug!(
             stage = stage_name,
             status = %response.status(),
-            "Chat context exceeded compaction budget; returned prompt_too_long for reactive compact"
+            "Chat context reached compaction budget; returned prompt_too_long for reactive compact"
         );
     } else {
         error!(

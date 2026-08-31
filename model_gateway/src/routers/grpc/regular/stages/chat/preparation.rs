@@ -274,7 +274,7 @@ impl ChatPreparationStage {
         if let Some(limit) = error::prompt_too_long_limit(ctx.input.headers.as_ref())? {
             let prompt_len = token_ids.len();
             if error::prompt_exceeds_limit(prompt_len, limit) {
-                warn!(
+                debug!(
                     function = "ChatPreparationStage::execute",
                     prompt_len,
                     limit,
