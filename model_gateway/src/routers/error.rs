@@ -24,6 +24,12 @@ struct ErrorDetail<'a> {
 
 pub const HEADER_X_SMG_ERROR_CODE: &str = "X-SMG-Error-Code";
 
+/// Session-scoped request header carrying the prompt-length budget at which the
+/// gateway returns an Anthropic `prompt_too_long` error, driving Claude Code's
+/// reactive compact before the context grows past the training budget. PSRL
+/// injects it at session creation (the harness compaction trigger).
+pub const X_SMG_PROMPT_TOO_LONG_LIMIT: &str = "x-smg-prompt-too-long-limit";
+
 /// Expected RL termination: prompt exceeded the worker's max_model_len.
 ///
 /// Distinct from generic 400s / `start_generation_failed`. Downstream (PSRL)

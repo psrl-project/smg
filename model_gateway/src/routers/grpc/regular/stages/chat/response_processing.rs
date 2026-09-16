@@ -256,7 +256,7 @@ fn do_tito_capture_non_streaming(
     let render_context = &tito_ctx.render_context;
 
     let model_id = tito_ctx.request.model.as_str();
-    let adapter = smg_tito::model_adapter::select_adapter(model_id);
+    let adapter = smg_tito::model_adapter::select_adapter_for_tokenizer(model_id, &**tokenizer);
     let max_trim = adapter.max_trim_tokens();
     tracing::debug!(
         session_id = %tito_ctx.session_id,
@@ -282,12 +282,24 @@ fn do_tito_capture_non_streaming(
     // would risk minting fresh tool_call IDs and breaking the prefix-hash round trip.
     let new_assistant_message = build_assistant_chat_message(assistant_message);
 
+    let ends_tool_call = matches!(
+        &new_assistant_message,
+        ChatMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } if !calls.is_empty()
+    );
+
+
     // Reuse the prefix hasher captured in preparation to derive the leaf
     // hash without re-walking request_messages.  Clone is mandatory: the
     // hasher state is owned by the immutable ``TitoRequestContext`` and the
     // adapter's `max_trim_tokens` flow ran above without consuming it.
     let mut leaf_hasher = tito_ctx.running_hasher.clone();
-    smg_tito::hash_message_into(&mut leaf_hasher, &new_assistant_message);
+    // Use the store's harness canonicalizer so the recorded leaf hash agrees
+    // with what find_prefix computes for the same message when the harness
+    // re-sends it in a normalized form (e.g. Claude Code replay).
+    store.hash_message(&mut leaf_hasher, &new_assistant_message);
     let leaf_hash = smg_tito::finalize_hash(&leaf_hasher);
     let parent_hash = tito_ctx.parent_hash;
 
@@ -300,13 +312,14 @@ fn do_tito_capture_non_streaming(
         };
 
         let report = build_mismatch_report(
-            tito_ctx.is_tito_hit,
             &full_ids,
             &all_messages,
             tokenizer,
             render_context,
-            &store,
             model_id,
+            openai_protocol::chat::thinking_from_reasoning_effort(
+                tito_ctx.request.reasoning_effort.as_deref(),
+            ),
         );
 
         debug!(
@@ -344,22 +357,26 @@ fn do_tito_capture_non_streaming(
                 Vec::with_capacity(reusable_prompt_ids.len() + output_ids.len());
             reusable_full_ids.extend_from_slice(reusable_prompt_ids);
             reusable_full_ids.extend_from_slice(output_ids);
-            store.store_with_hashes_and_reusable(
+            store.store_with_hashes_and_reusable_with_marker(
                 &tito_ctx.session_id,
                 leaf_hash,
                 parent_hash,
                 smg_tito::store::StoredTokenSequences::with_reusable(full_ids, reusable_full_ids),
                 turn_record,
                 tito_ctx.trajectory_id,
+                tito_ctx.skip_prefix_validation,
+                ends_tool_call,
             )
         } else {
-            store.store_with_hashes(
+            store.store_with_hashes_and_marker(
                 &tito_ctx.session_id,
                 leaf_hash,
                 parent_hash,
                 full_ids,
                 turn_record,
                 tito_ctx.trajectory_id,
+                tito_ctx.skip_prefix_validation,
+                ends_tool_call,
             )
         };
 
@@ -382,7 +399,19 @@ fn do_tito_capture_non_streaming(
             }
         }
         Err(e) => {
-            warn!(session_id = %tito_ctx.session_id, error = %e, "TITO store failed (non-fatal)");
+            if matches!(e, smg_tito::TitoError::PrefixMismatch(_)) {
+                // A genuine commit-time prefix divergence: the new checkpoint does
+                // not extend the stored trajectory stream. This is a TITO bug (or
+                // an unexpected context rewrite) — surface it loudly and skip the
+                // store so the tree is not polluted with a divergent node.
+                error!(
+                    session_id = %tito_ctx.session_id,
+                    error = %e,
+                    "TITO prefix validation failed; trajectory node not stored"
+                );
+            } else {
+                warn!(session_id = %tito_ctx.session_id, error = %e, "TITO store failed (non-fatal)");
+            }
         }
     };
 
@@ -391,20 +420,17 @@ fn do_tito_capture_non_streaming(
     }
 }
 
+/// Build the mismatch report for a TITO hit.  The caller gates on
+/// `store.is_debug() && is_tito_hit`, so this only runs in debug mode.
 fn build_mismatch_report(
-    is_tito_hit: bool,
     full_ids: &[u32],
     messages: &[ChatMessage],
     tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
     render_context: &RenderContext,
-    store: &TitoStore,
     model_id: &str,
+    thinking: Option<bool>,
 ) -> Vec<smg_tito::MismatchEntry> {
-    if !store.is_debug() || !is_tito_hit {
-        return vec![];
-    }
-
-    let adapter = smg_tito::model_adapter::select_adapter(model_id);
+    let adapter = smg_tito::model_adapter::select_adapter_for_tokenizer(model_id, &**tokenizer);
     let assistant_start_str = adapter.assistant_start_str().map(String::from);
     let trim_trailing_ids: std::collections::HashSet<u32> =
         adapter.trailing_token_ids().iter().copied().collect();
@@ -415,8 +441,9 @@ fn build_mismatch_report(
     );
     // full_ids = prompt_ids + output_ids (complete accumulated sequence).
     // Validate against canonical retokenization with add_generation_prompt=false
-    // since the assistant turn content is already in `messages`.
-    validator.validate(full_ids, messages, false, render_context)
+    // since the assistant turn content is already in `messages`; `thinking` must
+    // mirror the production render path so the reference does not diverge.
+    validator.validate(full_ids, messages, false, thinking, render_context)
 }
 
 /// Build a `TurnRecord` from the selected completed generation.

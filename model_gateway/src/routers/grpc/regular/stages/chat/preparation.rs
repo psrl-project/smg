@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use http::StatusCode;
 use llm_multimodal::Modality;
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -266,6 +267,41 @@ impl ChatPreparationStage {
             }
         }
 
+        // Step 3.5: Enforce the session's prompt-too-long budget. When the
+        // accumulated prompt reaches the training compaction trigger, return an
+        // Anthropic `prompt_too_long` error so Claude Code reactively compacts
+        // instead of growing past the budget (or hitting the engine overflow
+        // with a message Claude Code cannot recognize).
+        if let Some(limit) = ctx
+            .input
+            .headers
+            .as_ref()
+            .and_then(|h| h.get(error::X_SMG_PROMPT_TOO_LONG_LIMIT))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+        {
+            let prompt_len = token_ids.len();
+            if prompt_len >= limit {
+                // This is the expected reactive-compaction signal, not a
+                // gateway failure; keep it at DEBUG so run logs do not drown
+                // in routine prompt_too_long 400s.
+                debug!(
+                    function = "ChatPreparationStage::execute",
+                    prompt_len,
+                    limit,
+                    "Prompt reached compaction budget; returning prompt_too_long for reactive compact"
+                );
+                let message = format!(
+                    "Prompt is too long: {prompt_len} tokens > {limit} tokens (approximately)"
+                );
+                return Err(error::create_error(
+                    StatusCode::BAD_REQUEST,
+                    "prompt_too_long",
+                    message,
+                ));
+            }
+        }
+
         // Step 4: Build tool constraints if needed
         // The tool parser registry handles both structural tag (for native format
         // parsers like Mistral, KimiK2) and generic JSON schema fallback.
@@ -453,6 +489,7 @@ impl ChatPreparationStage {
             reusable_prompt_token_ids: None,
             running_hasher,
             parent_hash,
+            skip_prefix_validation: false,
         });
 
         // The gateway picks `prompt_start` for every turn from the
@@ -472,6 +509,17 @@ impl ChatPreparationStage {
                     total_messages = messages.len(),
                     "TITO HIT — found cached prefix"
                 );
+                if store.is_debug() && pm.has_assistant_in_appended {
+                    debug!(
+                        session_id = %session_id,
+                        matched_messages = pm.matched_message_num,
+                        appended_messages = %smg_tito::messages_structure_summary(
+                            &messages[pm.matched_message_num..]
+                        ),
+                        "TITO compacted-context hit — appended assistant turn(s) will be \
+                         re-tokenized incrementally and treated as prompt (mask 0)"
+                    );
+                }
                 pm
             }
             None => {
@@ -496,6 +544,13 @@ impl ChatPreparationStage {
             return Ok(None);
         }
 
+        // Compacted-context hits (appended slice contains assistant turns)
+        // legitimately diverge from the stored trajectory stream, so the
+        // store's commit-time prefix validation must be skipped for them.
+        if let Some(tc) = ctx.state.tito_context.as_mut() {
+            tc.skip_prefix_validation = prefix_match.has_assistant_in_appended;
+        }
+
         debug!(
             session_id = %session_id,
             matched_message_num = matched_message_num,
@@ -503,17 +558,26 @@ impl ChatPreparationStage {
             "TITO hit — running merge_incremental"
         );
 
-        // Select adapter using model_id
+        // Select adapter using model_id; derive special-token IDs from the
+        // tokenizer so the prefix boundary adjustment matches the checkpoint
+        // vocabulary (family defaults can differ across releases).
         let model_id = ctx.input.model_id.as_str();
-        let adapter = model_adapter::select_adapter(model_id);
+        let adapter = model_adapter::select_adapter_for_tokenizer(model_id, &**tokenizer);
 
         let appended = &messages[matched_message_num..];
+        // Mirror the production render path: project `reasoning_effort` onto the
+        // template's thinking toggle so the incremental render's generation
+        // prompt / thinking-mode wrapping matches what the full render produces.
+        let thinking = openai_protocol::chat::thinking_from_reasoning_effort(
+            request.reasoning_effort.as_deref(),
+        );
         let merged_ids = match TitoEngine::merge_incremental(
             prefix_match,
             appended,
             &**tokenizer,
             &*adapter,
             &render_context,
+            thinking,
         ) {
             Ok(ids) => ids,
             Err(e) => {

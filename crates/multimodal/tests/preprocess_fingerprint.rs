@@ -1,7 +1,7 @@
 //! Bit-identity guard for the full Qwen3-VL preprocess (resize + normalize +
 //! patchify). Pins the EXACT f32 encoder_input bytes. Any perf change to those
-//! stages (parallelization) MUST keep these identical to preserve vLLM/PIL
-//! parity (accuracy).
+//! stages (parallelization) MUST keep these identical to preserve the
+//! Transformers Torchvision backend parity contract (accuracy).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -48,8 +48,9 @@ fn fnv1a_f32(data: &[f32]) -> u64 {
 
 const CASES: &[(u32, u32)] = &[(560, 420), (840, 560), (1280, 960)];
 
-// Captured under serial normalize/patchify; PARALLELIZATION MUST NOT CHANGE THESE.
-const EXPECTED: &[u64] = &[0x391ca5deba1ff255, 0x5bde4728a72eba9d, 0x617d3e39f58f1c45];
+// Captured from the Torchvision-compatible image path; parallelization must not
+// change these bit-exact values.
+const EXPECTED: &[u64] = &[0x776d46f52782791d, 0x12257fb9b357d2d1, 0xcfe5dc6b41292ea5];
 
 fn fingerprint(w: u32, h: u32) -> (u64, usize) {
     let proc = Qwen3VLProcessor::new();

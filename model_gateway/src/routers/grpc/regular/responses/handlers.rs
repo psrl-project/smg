@@ -60,7 +60,7 @@ pub(crate) async fn route_responses(
             response_id: None,
             tenant_request_meta,
         };
-        route_responses_streaming(ctx, request, params).await
+        Box::pin(route_responses_streaming(ctx, request, params)).await
     } else {
         let params = ResponsesCallContext {
             headers,
@@ -83,7 +83,11 @@ async fn route_responses_sync(
     params: ResponsesCallContext,
 ) -> Response {
     match non_streaming::route_responses_internal(ctx, request, params).await {
-        Ok(responses_response) => axum::Json(responses_response).into_response(),
+        Ok((responses_response, headers)) => {
+            let mut response = axum::Json(responses_response).into_response();
+            response.headers_mut().extend(headers);
+            response
+        }
         Err(response) => response, // Already a Response with proper status code
     }
 }

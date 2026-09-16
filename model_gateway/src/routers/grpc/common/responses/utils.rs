@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use openai_protocol::{
     common::Tool,
-    responses::{ResponseTool, ResponsesRequest, ResponsesResponse},
+    responses::{NamespaceTool, ResponseTool, ResponsesRequest, ResponsesResponse},
 };
 use serde_json::to_value;
 use smg_data_connector::{
@@ -25,6 +25,41 @@ use crate::{
     },
     worker::WorkerRegistry,
 };
+
+const NAMESPACE_TOOL_SEPARATOR: &str = "__";
+
+pub(crate) fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
+    format!("{namespace}{NAMESPACE_TOOL_SEPARATOR}{name}")
+}
+
+/// Restore a model-facing flattened function name to its Responses namespace.
+///
+/// Resolution is driven by the original typed tool definitions instead of
+/// splitting arbitrary names, so ordinary function names containing `__`
+/// remain unchanged.
+pub(crate) fn resolve_namespace_tool_name(
+    response_tools: Option<&[ResponseTool]>,
+    flattened_name: &str,
+) -> (String, Option<String>) {
+    let Some(tools) = response_tools else {
+        return (flattened_name.to_string(), None);
+    };
+    for tool in tools {
+        let ResponseTool::Namespace(namespace) = tool else {
+            continue;
+        };
+        for nested in &namespace.tools {
+            let name = match nested {
+                NamespaceTool::Function(function) => function.function.name.as_str(),
+                NamespaceTool::Custom(custom) => custom.name.as_str(),
+            };
+            if flatten_namespace_tool_name(&namespace.name, name) == flattened_name {
+                return (name.to_string(), Some(namespace.name.clone()));
+            }
+        }
+    }
+    (flattened_name.to_string(), None)
+}
 
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
 ///
@@ -132,12 +167,28 @@ pub(crate) fn extract_tools_from_response_tools(
 
     tools
         .iter()
-        .filter_map(|rt| match rt {
-            ResponseTool::Function(ft) => Some(Tool {
+        .flat_map(|rt| match rt {
+            ResponseTool::Function(ft) => vec![Tool {
                 tool_type: "function".to_string(),
                 function: ft.function.clone(),
-            }),
-            _ => None,
+            }],
+            ResponseTool::Namespace(namespace) => namespace
+                .tools
+                .iter()
+                .filter_map(|tool| match tool {
+                    NamespaceTool::Function(function) => {
+                        let mut function = function.function.clone();
+                        function.name =
+                            flatten_namespace_tool_name(&namespace.name, &function.name);
+                        Some(Tool {
+                            tool_type: "function".to_string(),
+                            function,
+                        })
+                    }
+                    NamespaceTool::Custom(_) => None,
+                })
+                .collect(),
+            _ => Vec::new(),
         })
         .collect()
 }

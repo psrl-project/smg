@@ -63,6 +63,11 @@ impl TokenSeqValidator {
 
     /// Compare `tito_token_ids` against a fresh full retokenization of `messages`.
     ///
+    /// `add_generation_prompt` and `thinking` must mirror the values the
+    /// production render path used for the same messages, otherwise the
+    /// reference sequence diverges from the rollout render and the validator
+    /// reports false mismatches.
+    ///
     /// Returns a list of mismatches (empty = perfect match).
     /// Always call this only in debug mode (gate at the call site).
     pub fn validate(
@@ -70,6 +75,7 @@ impl TokenSeqValidator {
         tito_token_ids: &[u32],
         messages: &[ChatMessage],
         add_generation_prompt: bool,
+        thinking: Option<bool>,
         render_context: &RenderContext,
     ) -> Vec<MismatchEntry> {
         // Build canonical token IDs via chat-template rendering + encoding.
@@ -84,6 +90,7 @@ impl TokenSeqValidator {
 
         let params = ChatTemplateParams {
             add_generation_prompt,
+            thinking,
             tools: render_context.tools_ref(),
             template_kwargs: render_context.template_kwargs_ref(),
             ..Default::default()
@@ -345,6 +352,7 @@ fn describe_structure(segments: &[Segment], tokenizer: &dyn Tokenizer) -> String
         .join(" ")
 }
 
+#[cfg(test)]
 pub(crate) fn messages_to_template_values(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
@@ -368,6 +376,15 @@ pub(crate) fn messages_to_template_values_with_context(
         .map(|message| {
             let mut value = serde_json::to_value(message)?;
             if let Some(obj) = value.as_object_mut() {
+                // Mirror the production render path: assistant messages without
+                // a content key get an empty-string content so chat templates
+                // can test `message['content'] is none` / `is string`
+                // consistently between the rollout render and the validator.
+                if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                    && !obj.contains_key("content")
+                {
+                    obj.insert("content".to_string(), Value::String(String::new()));
+                }
                 if let Some(content_value) = obj.get_mut("content") {
                     transform_content_field(content_value, content_format, render_context);
                 }
@@ -390,27 +407,41 @@ fn transform_content_field(
 
     match content_format {
         ChatTemplateContentFormat::String => {
-            let text_parts: Vec<String> = content_array
-                .iter()
-                .filter_map(|part| {
-                    let obj = part.as_object()?;
-                    let type_str = obj.get("type")?.as_str()?;
-                    match type_str {
-                        "text" => obj.get("text")?.as_str().map(String::from),
-                        // Inject the model-specific placeholder (e.g. "<|image|>") when
-                        // available; otherwise silently drop the image part (pre-existing
-                        // behavior, only reached in non-multimodal or legacy contexts).
-                        "image_url" | "image" | "input_image" | "video_url" | "video"
-                        | "audio_url" | "audio" | "input_audio" => render_context
-                            .placeholder_for_part_type(type_str)
-                            .map(String::from),
-                        _ => None,
+            // Mirror the production render path exactly (chat_utils.rs
+            // `transform_content_field`): media placeholders are emitted BEFORE
+            // text and all parts are joined with "\n".  A divergent join/order
+            // here would make the validator re-render differ from the rollout
+            // render for the same messages, producing false mismatches.
+            let mut media_parts: Vec<String> = Vec::new();
+            let mut text_parts: Vec<String> = Vec::new();
+            for part in content_array {
+                let Some(obj) = part.as_object() else {
+                    continue;
+                };
+                let type_str = obj.get("type").and_then(|t| t.as_str());
+                match type_str {
+                    Some("text") => {
+                        if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                            text_parts.push(t.to_string());
+                        }
                     }
-                })
-                .collect();
+                    Some(
+                        "image_url" | "image" | "input_image" | "video_url" | "video" | "audio_url"
+                        | "audio" | "input_audio",
+                    ) => {
+                        if let Some(placeholder) =
+                            type_str.and_then(|t| render_context.placeholder_for_part_type(t))
+                        {
+                            media_parts.push(placeholder.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
-            if !text_parts.is_empty() {
-                *content_value = Value::String(text_parts.join(" "));
+            if !media_parts.is_empty() || !text_parts.is_empty() {
+                let ordered: Vec<String> = media_parts.into_iter().chain(text_parts).collect();
+                *content_value = Value::String(ordered.join("\n"));
             }
         }
         ChatTemplateContentFormat::OpenAI => {
@@ -456,7 +487,13 @@ fn process_tool_call_arguments(messages: &mut [Value]) {
                 continue;
             };
             if let Ok(parsed) = serde_json::from_str::<Value>(args_str) {
-                *args = parsed;
+                // Canonicalize (sort keys) so the rendered tool-call block is
+                // order-independent, matching the order-insensitive prefix hash
+                // (`sort_json_keys` in normalizer.rs).  The model may emit
+                // arguments with one key order while Claude Code re-serializes
+                // the parsed `input` object with a different order; both must
+                // render — and hash — identically for the prefix to HIT.
+                *args = crate::normalizer::sort_json_keys(&parsed);
             }
         }
     }
@@ -622,7 +659,8 @@ mod tests {
             .unwrap_or("");
         assert_eq!(content_no_ph, "describe this");
 
-        // With placeholder: image part is replaced by the placeholder token.
+        // With placeholder: the image part is hoisted to the front and parts are
+        // joined with "\n", mirroring the production render path.
         let values_with_placeholder = messages_to_template_values(
             &messages,
             llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
@@ -633,7 +671,7 @@ mod tests {
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        assert_eq!(content_with_ph, "describe this <|image|>");
+        assert_eq!(content_with_ph, "<|image|>\ndescribe this");
     }
 
     #[test]
@@ -674,7 +712,7 @@ mod tests {
             &context,
         )
         .unwrap();
-        assert_eq!(values[0]["content"], "<image> <video> <audio>");
+        assert_eq!(values[0]["content"], "<image>\n<video>\n<audio>");
     }
 
     #[test]
@@ -702,5 +740,50 @@ mod tests {
         let ids = [5u32, 5, 5];
         let to_remove: HashSet<u32> = [5u32].into();
         assert_eq!(trim_trailing(&ids, &to_remove), &[] as &[u32]);
+    }
+
+    #[test]
+    fn process_tool_call_arguments_canonicalizes_key_order() {
+        use openai_protocol::{
+            chat::ChatMessage,
+            common::{FunctionCallResponse, ToolCall},
+        };
+
+        // Same logical arguments, different JSON key order (as the model emits
+        // vs. what Claude Code re-serializes).  `process_tool_call_arguments`
+        // must canonicalize so both render to the same tool-call block, matching
+        // the order-insensitive prefix hash.
+        let mk_asst = |args: &str| ChatMessage::Assistant {
+            content: None,
+            name: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCallResponse {
+                    name: "Edit".to_string(),
+                    arguments: Some(args.to_string()),
+                },
+            }]),
+        };
+
+        let render_args = |args: &str| -> Value {
+            let messages = vec![mk_asst(args)];
+            let values = messages_to_template_values(
+                &messages,
+                llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+                None,
+            )
+            .unwrap();
+            values[0]["tool_calls"][0]["function"]["arguments"].clone()
+        };
+
+        let a = render_args(r#"{"file_path":"a.py","old_string":{"z":1,"a":2},"new_string":"b"}"#);
+        let b = render_args(r#"{"new_string":"b","file_path":"a.py","old_string":{"a":2,"z":1}}"#);
+        assert_eq!(a, b, "tool-call arguments must render canonically");
+        assert_eq!(
+            a,
+            serde_json::json!({"file_path":"a.py","old_string":{"a":2,"z":1},"new_string":"b"})
+        );
     }
 }

@@ -58,6 +58,7 @@ use crate::{
             common::responses::{
                 build_sse_response, persist_response_if_needed,
                 streaming::{attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter},
+                utils::resolve_namespace_tool_name,
                 ResponsesContext,
             },
             utils,
@@ -313,6 +314,7 @@ impl StreamingResponseAccumulator {
                             id: None,
                             call_id: String::new(),
                             name: String::new(),
+                            namespace: None,
                             arguments: String::new(),
                             output: None,
                             status: "in_progress".to_string(),
@@ -386,8 +388,21 @@ impl StreamingResponseAccumulator {
             ));
         }
 
-        // Add tool calls
-        output.extend(self.tool_calls);
+        // Add tool calls, restoring Responses namespace metadata from the
+        // original typed tool definitions.
+        let mut tool_calls = self.tool_calls;
+        for item in &mut tool_calls {
+            if let ResponseOutputItem::FunctionToolCall {
+                name, namespace, ..
+            } = item
+            {
+                let (restored_name, restored_namespace) =
+                    resolve_namespace_tool_name(self.original_request.tools.as_deref(), name);
+                *name = restored_name;
+                *namespace = restored_namespace;
+            }
+        }
+        output.extend(tool_calls);
 
         // Determine final status
         let status = match self.finish_reason.as_deref() {
@@ -451,14 +466,14 @@ pub(super) fn execute_tool_loop_streaming(
         reason = "streaming task is fire-and-forget; client disconnect terminates it"
     )]
     tokio::spawn(async move {
-        let result = execute_tool_loop_streaming_internal(
+        let result = Box::pin(execute_tool_loop_streaming_internal(
             &ctx_clone,
             current_request,
             &original_request_clone,
             params,
             mcp_servers,
             tx.clone(),
-        )
+        ))
         .await;
 
         if let Err(e) = result {

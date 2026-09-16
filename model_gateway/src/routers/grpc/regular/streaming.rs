@@ -2710,6 +2710,11 @@ impl StreamingProcessor {
                         }
                     };
 
+                    let routed_experts = complete
+                        .routed_experts()
+                        .map_err(|error| error.to_string())?
+                        .as_ref()
+                        .and_then(utils::encode_routed_experts_for_response);
                     let final_chunk = CompletionStreamResponse {
                         id: request_id.clone(),
                         object: "text_completion".to_string(),
@@ -2719,10 +2724,7 @@ impl StreamingProcessor {
                             index,
                             logprobs: None,
                             finish_reason,
-                            routed_experts: complete
-                                .routed_experts()
-                                .as_ref()
-                                .and_then(utils::encode_routed_experts_for_response),
+                            routed_experts,
                         }],
                         model: model.clone(),
                         system_fingerprint: system_fingerprint.map(String::from),

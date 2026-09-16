@@ -10,12 +10,11 @@ use std::{
 };
 
 use axum::{
-    http::HeaderValue,
+    http::{HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
 use metrics::{counter, gauge, histogram};
-use openai_protocol::chat::ChatCompletionResponse;
 use serde::Serialize;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, Notify},
@@ -40,7 +39,7 @@ use crate::{
                 ExecutionResult, FinalResponse, LoadGuards, RequestContext, WorkerSelection,
             },
             harmony::ResponsesIterationResult,
-            pipeline::RequestPipeline,
+            pipeline::{ChatPipelineResponse, RequestPipeline},
         },
     },
     worker::{Worker, WorkerRegistry},
@@ -57,7 +56,7 @@ pub(crate) struct RoutingQueueEntry {
 
 pub(crate) enum RoutingLoopCompletion {
     Http(oneshot::Sender<Response>),
-    ChatForResponses(oneshot::Sender<Result<ChatCompletionResponse, Response>>),
+    ChatForResponses(oneshot::Sender<Result<ChatPipelineResponse, Response>>),
     HarmonyResponses(oneshot::Sender<Result<ResponsesIterationResult, Response>>),
     HarmonyResponsesStreaming(
         oneshot::Sender<Result<(ExecutionResult, Option<LoadGuards>), Response>>,
@@ -529,7 +528,7 @@ pub(crate) async fn run_routing_loop(
             runtime_for_task.task_started();
             dispatch_tasks.spawn(async move {
                 let dispatch_start = std::time::Instant::now();
-                dispatch_entry(Arc::clone(&runtime_for_task), entry).await;
+                Box::pin(dispatch_entry(Arc::clone(&runtime_for_task), entry)).await;
                 histogram!("smg_routing_loop_dispatch_duration_seconds")
                     .record(dispatch_start.elapsed().as_secs_f64());
                 runtime_for_task.task_finished();
@@ -683,7 +682,10 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueu
                     .await
                 {
                     Ok(_) => match entry.ctx.state.response.final_response.take() {
-                        Some(FinalResponse::Chat(r)) => Ok(r),
+                        Some(FinalResponse::Chat(response)) => Ok(ChatPipelineResponse {
+                            response,
+                            headers: HeaderMap::new(),
+                        }),
                         Some(_) => Err(router_error::internal_error(
                             "wrong_response_type",
                             "Wrong response type for ChatForResponses",
@@ -776,19 +778,66 @@ fn extract_final_response(ctx: &mut RequestContext) -> Response {
     }
 }
 
-/// Send the final `Response` through the appropriate completion channel.
-fn send_http_completion(completion: RoutingLoopCompletion, response: Response) {
+/// Complete a partial-rollout request without erasing the caller's typed
+/// response contract.
+///
+/// Native protocol adapters use `ChatForResponses` so they can render their
+/// own JSON shape after the canonical training pipeline completes. The old
+/// implementation only handled `Http` and dropped the typed channel.
+fn send_partial_completion(
+    completion: RoutingLoopCompletion,
+    ctx: &mut RequestContext,
+    stage_result: Result<Option<Response>, Response>,
+    headers: HeaderMap,
+) {
     match completion {
         RoutingLoopCompletion::Http(tx) => {
+            let mut response = match stage_result {
+                Ok(Some(response)) => response,
+                Ok(None) => extract_final_response(ctx),
+                Err(response) => response,
+            };
+            response.headers_mut().extend(headers);
             let _ = tx.send(response);
         }
-        // PSRL dispatch only uses Http completion; other variants are not
-        // reachable here, but we log an error rather than panic.
-        other => {
-            error!(
-                "dispatch_entry_with_partial_rollout: unexpected completion type; dropping response"
-            );
-            drop(other);
+        RoutingLoopCompletion::ChatForResponses(tx) => {
+            let result = match stage_result {
+                Ok(None) => match ctx.state.response.final_response.take() {
+                    Some(FinalResponse::Chat(response)) => {
+                        Ok(ChatPipelineResponse { response, headers })
+                    }
+                    Some(_) => Err(router_error::internal_error(
+                        "wrong_response_type",
+                        "Wrong response type for ChatForResponses",
+                    )),
+                    None => Err(router_error::internal_error(
+                        "no_response_produced",
+                        "No response produced",
+                    )),
+                },
+                Ok(Some(response)) | Err(response) => Err(response),
+            };
+            let _ = tx.send(result);
+        }
+        RoutingLoopCompletion::HarmonyResponses(tx) => {
+            let response = match stage_result {
+                Ok(Some(response)) | Err(response) => response,
+                Ok(None) => router_error::internal_error(
+                    "partial_rollout_unsupported_completion",
+                    "Partial rollout does not support Harmony Responses completion",
+                ),
+            };
+            let _ = tx.send(Err(response));
+        }
+        RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
+            let response = match stage_result {
+                Ok(Some(response)) | Err(response) => response,
+                Ok(None) => router_error::internal_error(
+                    "partial_rollout_unsupported_completion",
+                    "Partial rollout does not support Harmony streaming completion",
+                ),
+            };
+            let _ = tx.send(Err(response));
         }
     }
 }
@@ -919,7 +968,7 @@ async fn dispatch_entry_with_partial_rollout(
     };
     if let Err(response) = pipeline.commit_worker_selection(&mut ctx).await {
         drop(handoff_permit);
-        send_http_completion(completion, response);
+        send_completion_error(completion, response);
         runtime.cleanup_tracking(request_id, prompt_id);
         return;
     }
@@ -932,7 +981,7 @@ async fn dispatch_entry_with_partial_rollout(
     }
     if let Err(response) = pipeline.execute_post_selection_execution(&mut ctx).await {
         drop(handoff_permit);
-        send_http_completion(completion, response);
+        send_completion_error(completion, response);
         runtime.cleanup_tracking(request_id, prompt_id);
         return;
     }
@@ -946,12 +995,8 @@ async fn dispatch_entry_with_partial_rollout(
             // Non-generate result (embedding, etc.) — put it back and run
             // post-execution stages normally (no loopback needed).
             ctx.state.response.execution_result = other;
-            let response = match pipeline.execute_remaining_stages(&mut ctx).await {
-                Ok(Some(r)) => r,
-                Ok(None) => extract_final_response(&mut ctx),
-                Err(r) => r,
-            };
-            send_http_completion(completion, response);
+            let stage_result = pipeline.execute_remaining_stages(&mut ctx).await;
+            send_partial_completion(completion, &mut ctx, stage_result, HeaderMap::new());
             runtime.cleanup_tracking(request_id, prompt_id);
             return;
         }
@@ -970,7 +1015,7 @@ async fn dispatch_entry_with_partial_rollout(
                 "Partial rollout stream drain failed"
             );
             let response = router_error::internal_error("stream_drain_failed", msg.as_str());
-            send_http_completion(completion, response);
+            send_completion_error(completion, response);
             runtime.cleanup_tracking(request_id, prompt_id);
             return;
         }
@@ -983,7 +1028,7 @@ async fn dispatch_entry_with_partial_rollout(
             if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
                 let response =
                     router_error::internal_error(re_err.error_code(), re_err.to_string().as_str());
-                send_http_completion(completion, response);
+                send_completion_error(completion, response);
                 runtime.cleanup_tracking(request_id, prompt_id);
                 return;
             }
@@ -1039,7 +1084,7 @@ async fn dispatch_entry_with_partial_rollout(
                         re_err.error_code(),
                         re_err.to_string().as_str(),
                     );
-                    send_http_completion(completion, response);
+                    send_completion_error(completion, response);
                     runtime.cleanup_tracking(request_id, prompt_id);
                     return;
                 }
@@ -1064,25 +1109,20 @@ async fn dispatch_entry_with_partial_rollout(
                 })
                 .map(|worker| runtime.instance_id_for_worker(&worker));
 
-            let mut response = match pipeline.execute_remaining_stages(&mut ctx).await {
-                Ok(Some(r)) => r,
-                Ok(None) => extract_final_response(&mut ctx),
-                Err(r) => r,
-            };
+            let mut response_headers = HeaderMap::new();
             if let Some((base_id, dp_rank)) = served_instance {
-                let headers = response.headers_mut();
                 if let Ok(v) = HeaderValue::from_str(&base_id) {
-                    headers.insert("x-base-worker-id", v);
+                    response_headers.insert("x-base-worker-id", v);
                 }
                 if let Ok(v) = HeaderValue::from_str(&dp_rank.to_string()) {
-                    headers.insert("x-target-dp-rank", v);
+                    response_headers.insert("x-target-dp-rank", v);
                 }
                 // Echo the pinned version so the SessionRouter can carry it into
                 // the next turn of the trajectory (keeping the request on an
                 // instance at least as fresh as the pinned version).
                 if let Some(version_tag) = routing_meta.as_ref().map(|m| m.version_tag) {
                     if let Ok(v) = HeaderValue::from_str(&version_tag.to_string()) {
-                        headers.insert("x-version-tag", v);
+                        response_headers.insert("x-version-tag", v);
                     }
                 }
                 debug!(
@@ -1092,7 +1132,8 @@ async fn dispatch_entry_with_partial_rollout(
                     "PSRL trajectory sticky: echoed served instance to response headers"
                 );
             }
-            send_http_completion(completion, response);
+            let stage_result = pipeline.execute_remaining_stages(&mut ctx).await;
+            send_partial_completion(completion, &mut ctx, stage_result, response_headers);
             runtime.cleanup_tracking(request_id, prompt_id);
         }
         "abort" => {
@@ -1100,7 +1141,7 @@ async fn dispatch_entry_with_partial_rollout(
             if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
                 let response =
                     router_error::internal_error(re_err.error_code(), re_err.to_string().as_str());
-                send_http_completion(completion, response);
+                send_completion_error(completion, response);
                 runtime.cleanup_tracking(request_id, prompt_id);
                 return;
             }
@@ -1115,7 +1156,7 @@ async fn dispatch_entry_with_partial_rollout(
                 None => {
                     let response =
                         router_error::internal_error("loopback_no_instance", "no worker selected");
-                    send_http_completion(completion, response);
+                    send_completion_error(completion, response);
                     runtime.cleanup_tracking(request_id, prompt_id);
                     return;
                 }
@@ -1186,7 +1227,7 @@ async fn dispatch_entry_with_partial_rollout(
                 "unexpected finish_reason in partial rollout; terminating"
             );
             let response = router_error::internal_error("unexpected_finish_reason", other);
-            send_http_completion(completion, response);
+            send_completion_error(completion, response);
             runtime.cleanup_tracking(request_id, prompt_id);
         }
     }

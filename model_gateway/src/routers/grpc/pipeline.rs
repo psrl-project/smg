@@ -5,7 +5,10 @@
 
 use std::{sync::Arc, time::Instant};
 
-use axum::response::{IntoResponse, Response};
+use axum::{
+    http::{self, HeaderMap as ResponseHeaders},
+    response::{IntoResponse, Response},
+};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
@@ -63,6 +66,25 @@ use crate::{
     worker::WorkerRegistry,
 };
 
+/// Log a pipeline stage failure, downgrading expected client-driven outcomes.
+///
+/// A stage returning a `prompt_too_long` error is **not** a gateway failure: it
+/// is the reactive-context-compaction signal (the accumulated prompt reached the
+/// session's compaction budget, so the harness is expected to compact and
+/// retry). Log it at DEBUG (instead of WARN/ERROR) so the run log does not
+/// drown in expected 400s; genuine stage failures keep ERROR.
+fn log_stage_failure(stage_name: &str, response: &Response) {
+    if error::extract_error_code_from_response(response) == "prompt_too_long" {
+        debug!(
+            stage = stage_name,
+            status = %response.status(),
+            "Chat context reached compaction budget; returned prompt_too_long for reactive compact"
+        );
+    } else {
+        error!("Stage {} failed with status {}", stage_name, response.status());
+    }
+}
+
 /// Generic request pipeline for all request types
 ///
 /// Orchestrates all stages from request preparation to response delivery.
@@ -73,6 +95,17 @@ pub(crate) struct RequestPipeline {
     /// Backend type for metrics labeling
     backend_type: &'static str,
     routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
+}
+
+/// Completed canonical Chat response used by protocol adapters.
+///
+/// The native Responses and Messages endpoints render their own wire format,
+/// but PSRL still needs the sticky routing headers selected by the routing
+/// loop. Keeping both values together prevents typed completion paths from
+/// silently dropping worker/version affinity metadata.
+pub(crate) struct ChatPipelineResponse {
+    pub(crate) response: ChatCompletionResponse,
+    pub(crate) headers: ResponseHeaders,
 }
 
 impl RequestPipeline {
@@ -127,11 +160,7 @@ impl RequestPipeline {
                 Ok(Some(response)) => return Err(response),
                 Ok(None) => continue,
                 Err(response) => {
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return Err(response);
                 }
             }
@@ -996,11 +1025,7 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_CHAT,
                         error_type_from_status(response.status()),
                     );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return response;
                 }
             }
@@ -1093,11 +1118,7 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_GENERATE,
                         error_type_from_status(response.status()),
                     );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return response;
                 }
             }
@@ -1190,11 +1211,7 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_COMPLETIONS,
                         error_type_from_status(response.status()),
                     );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return response;
                 }
             }
@@ -1514,11 +1531,7 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_MESSAGES,
                         error_type_from_status(response.status()),
                     );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
+                    log_stage_failure(stage.name(), &response);
                     return response;
                 }
             }
@@ -1570,7 +1583,7 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
-    ) -> Result<ChatCompletionResponse, Response> {
+    ) -> Result<ChatPipelineResponse, Response> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
 
@@ -1630,7 +1643,10 @@ impl RequestPipeline {
         }
 
         match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => Ok(response),
+            Some(FinalResponse::Chat(response)) => Ok(ChatPipelineResponse {
+                response,
+                headers: ResponseHeaders::new(),
+            }),
             Some(FinalResponse::Generate(_))
             | Some(FinalResponse::Completion(_))
             | Some(FinalResponse::Embedding(_))

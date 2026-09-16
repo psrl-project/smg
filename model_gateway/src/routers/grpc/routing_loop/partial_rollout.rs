@@ -219,7 +219,9 @@ pub(crate) async fn drain_stream_for_partial_rollout(
                     new_token_ids = complete.output_ids().to_vec();
                 }
                 let finish_reason = complete.finish_reason().to_owned();
-                let new_routed_experts = complete.routed_experts();
+                let new_routed_experts = complete
+                    .routed_experts()
+                    .map_err(|error| error.to_string())?;
                 return Ok(DrainedStreamResult {
                     new_token_ids,
                     new_logprobs,

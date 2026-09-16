@@ -518,6 +518,11 @@ struct Router {
     multimodal_tensor_transport: Option<String>,
     multimodal_shm_min_bytes: Option<usize>,
     trajectory_id_strategy: String,
+    // Harness-specific tool-input canonicalizer for TITO prefix hashing
+    // (appended at the very end; see the positional-argument note above).
+    tito_tool_normalization: String,
+    tito_workdir: String,
+    tito_drop_dead_leaves: bool,
 }
 
 impl Router {
@@ -1103,6 +1108,9 @@ impl Router {
         multimodal_tensor_transport = None,
         multimodal_shm_min_bytes = None,
         trajectory_id_strategy = String::from("manual"),
+        tito_tool_normalization = String::from("none"),
+        tito_workdir = String::from("/testbed"),
+        tito_drop_dead_leaves = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1256,6 +1264,9 @@ impl Router {
         multimodal_tensor_transport: Option<String>,
         multimodal_shm_min_bytes: Option<usize>,
         trajectory_id_strategy: String,
+        tito_tool_normalization: String,
+        tito_workdir: String,
+        tito_drop_dead_leaves: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1432,6 +1443,9 @@ impl Router {
             multimodal_tensor_transport,
             multimodal_shm_min_bytes,
             trajectory_id_strategy,
+            tito_tool_normalization,
+            tito_workdir,
+            tito_drop_dead_leaves,
         })
     }
 
@@ -1563,6 +1577,9 @@ impl Router {
                         "Invalid trajectory_id_strategy: {reason}"
                     ))
                 })?,
+                tito_tool_normalization: self.tito_tool_normalization.clone(),
+                tito_workdir: self.tito_workdir.clone(),
+                tito_drop_dead_leaves: self.tito_drop_dead_leaves,
                 webrtc_bind_addr: None,
                 webrtc_stun_server: None,
                 health_check_port: None,

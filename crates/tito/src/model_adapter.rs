@@ -35,6 +35,19 @@ pub trait ModelAdapter: Send + Sync {
         &[]
     }
 
+    /// Whether the chat template renders assistant turns **position-dependently**.
+    ///
+    /// Qwen3.5, for example, wraps an assistant turn in `<think>...</think>` only
+    /// when it appears after the last real user query (`ns.last_query_index`).
+    /// For such templates, per-message dummy-base incremental tokenization is
+    /// unsound: the dummy context would decide the wrap state differently from
+    /// the production context.  The engine must then use the whole-appended-slice
+    /// single-pass path (whose fixed dummy prefix keeps the wrap decision
+    /// translation-invariant) instead of per-segment tokenization.
+    fn rendering_is_position_dependent(&self) -> bool {
+        false
+    }
+
     /// Build a synthetic assistant message that mirrors tool_call_ids from tool messages in appended.
     fn build_dummy_assistant(&self, appended: &[ChatMessage]) -> ChatMessage {
         // Extract tool_call_ids from tool messages in appended
@@ -89,7 +102,7 @@ impl ModelAdapter for DefaultAdapter {
 pub struct Qwen3Adapter {
     pub im_end_id: u32,
     pub newline_id: u32,
-    trailing_ids: [u32; 1],
+    trailing_ids: [u32; 2],
 }
 
 impl Qwen3Adapter {
@@ -97,7 +110,14 @@ impl Qwen3Adapter {
         Self {
             im_end_id,
             newline_id,
-            trailing_ids: [newline_id],
+            // Also trim a trailing `<|im_end|>` (plus the template's following
+            // newline) from both compared sequences. A truncated/aborted final
+            // assistant turn legitimately ends without the closing stop token in
+            // the recorded token stream, while the chat-template reference
+            // always appends one; without this the validator's structural
+            // pre-check reports a spurious `special_token_count` mismatch on the
+            // last turn. Tail-only, so mid-sequence differences are still caught.
+            trailing_ids: [im_end_id, newline_id],
         }
     }
 }
@@ -130,7 +150,7 @@ impl ModelAdapter for Qwen3Adapter {
 pub struct Qwen35Adapter {
     pub im_end_id: u32,
     pub newline_id: u32,
-    trailing_ids: [u32; 1],
+    trailing_ids: [u32; 2],
 }
 
 impl Qwen35Adapter {
@@ -138,7 +158,8 @@ impl Qwen35Adapter {
         Self {
             im_end_id,
             newline_id,
-            trailing_ids: [newline_id],
+            // See Qwen3Adapter::new — trim a trailing <|im_end|> plus newline.
+            trailing_ids: [im_end_id, newline_id],
         }
     }
 }
@@ -163,6 +184,10 @@ impl ModelAdapter for Qwen35Adapter {
     fn trailing_token_ids(&self) -> &[u32] {
         &self.trailing_ids
     }
+
+    fn rendering_is_position_dependent(&self) -> bool {
+        true
+    }
 }
 
 /// QwenNext family (future Qwen releases beyond 3.5): same boundary behaviour as
@@ -170,7 +195,7 @@ impl ModelAdapter for Qwen35Adapter {
 pub struct QwenNextAdapter {
     pub im_end_id: u32,
     pub newline_id: u32,
-    trailing_ids: [u32; 1],
+    trailing_ids: [u32; 2],
 }
 
 impl QwenNextAdapter {
@@ -178,7 +203,8 @@ impl QwenNextAdapter {
         Self {
             im_end_id,
             newline_id,
-            trailing_ids: [newline_id],
+            // See Qwen3Adapter::new — trim a trailing <|im_end|> plus newline.
+            trailing_ids: [im_end_id, newline_id],
         }
     }
 }
@@ -249,12 +275,48 @@ impl ModelAdapter for Glm47Adapter {
 /// The `model_identifier` may be either an exact `hf_model_type` value (e.g. `"qwen3"`,
 /// `"chatglm"`) or a full model-id string (e.g. `"Qwen3.5-7B-Instruct"`).  Matching is
 /// case-insensitive substring search so both forms work correctly.
+///
+/// Uses family-default special-token IDs; prefer
+/// [`select_adapter_for_tokenizer`] in production so the boundary adjustment
+/// matches the actual checkpoint vocabulary.
 pub fn select_adapter(model_identifier: &str) -> Box<dyn ModelAdapter> {
+    select_adapter_with_ids(model_identifier, None, None)
+}
+
+/// Select an adapter at runtime, deriving the model-specific special-token IDs
+/// from the tokenizer's actual vocabulary.
+///
+/// Checkpoints of the same family can use different added-token IDs (e.g.
+/// Qwen3-4B-Instruct-2507 has `<|im_end|>` = 151645 while Qwen3.5-4B uses
+/// 248046); the hardcoded family defaults would mis-adjust the prefix boundary.
+/// Falls back to the family defaults when the tokenizer cannot resolve a token.
+pub fn select_adapter_for_tokenizer(
+    model_identifier: &str,
+    tokenizer: &dyn llm_tokenizer::traits::Tokenizer,
+) -> Box<dyn ModelAdapter> {
+    let im_end = tokenizer.token_to_id("<|im_end|>").unwrap_or(151645);
+    let newline = tokenizer.token_to_id("\n").unwrap_or(198);
+    let observation = tokenizer.token_to_id("<|observation|>").unwrap_or(64795);
+    let user = tokenizer.token_to_id("<|user|>").unwrap_or(64796);
+    select_adapter_with_ids(
+        model_identifier,
+        Some((im_end, newline)),
+        Some((observation, user)),
+    )
+}
+
+fn select_adapter_with_ids(
+    model_identifier: &str,
+    qwen_ids: Option<(u32, u32)>,
+    glm_ids: Option<(u32, u32)>,
+) -> Box<dyn ModelAdapter> {
     let lower = model_identifier.to_ascii_lowercase();
+    let (im_end, newline) = qwen_ids.unwrap_or((151645, 198));
+    let (observation, user) = glm_ids.unwrap_or((64795, 64796));
 
     // GLM family — check before "qwen" to avoid any future overlap.
     if lower.contains("glm") || lower.contains("chatglm") {
-        return Box::new(Glm47Adapter::new(64795, 64796));
+        return Box::new(Glm47Adapter::new(observation, user));
     }
 
     // Qwen family — most-specific variants first so generic "qwen3" substring
@@ -264,14 +326,14 @@ pub fn select_adapter(model_identifier: &str) -> Box<dyn ModelAdapter> {
     // we normalise dots/dashes/underscores to a single form for reliable matching.
     let normalised = lower.replace(['.', '-', '_'], "");
     if normalised.contains("qwen35") || normalised.contains("qwen3point5") {
-        return Box::new(Qwen35Adapter::new(151645, 198));
+        return Box::new(Qwen35Adapter::new(im_end, newline));
     }
     if normalised.contains("qwen3") {
-        return Box::new(Qwen3Adapter::new(151645, 198));
+        return Box::new(Qwen3Adapter::new(im_end, newline));
     }
     // Generic "qwen" catch-all for future / unknown Qwen variants.
     if lower.contains("qwen") {
-        return Box::new(QwenNextAdapter::new(151645, 198));
+        return Box::new(QwenNextAdapter::new(im_end, newline));
     }
 
     Box::new(DefaultAdapter)
@@ -336,7 +398,15 @@ mod tests {
     fn adapter_trailing_token_ids() {
         assert_eq!(
             Qwen3Adapter::new(151645, 198).trailing_token_ids(),
-            &[198u32]
+            &[151645u32, 198]
+        );
+        assert_eq!(
+            Qwen35Adapter::new(151645, 198).trailing_token_ids(),
+            &[151645u32, 198]
+        );
+        assert_eq!(
+            QwenNextAdapter::new(151645, 198).trailing_token_ids(),
+            &[151645u32, 198]
         );
         assert_eq!(
             Glm47Adapter::new(64795, 64796).trailing_token_ids(),
