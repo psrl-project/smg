@@ -143,6 +143,14 @@ class RouterArgs:
     tito_debug: bool = False
     tito_gc_threshold: int | None = None
     trajectory_id_strategy: str = "manual"  # manual | auto
+    # Harness-specific tool-input canonicalizer for TITO prefix hashing.
+    # "none" disables; "claude_code" mirrors Claude Code's normalizeToolInput
+    # (drop redundant `cd <workdir> && `, materialize the Edit replace_all
+    # default) so replayed histories keep matching stored prefixes.
+    tito_tool_normalization: str = "none"
+    tito_workdir: str = "/testbed"
+    # Drop "dead" (rollback) leaves from TITO session snapshots.
+    tito_drop_dead_leaves: bool = False
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -954,6 +962,28 @@ class RouterArgs:
                 "Select TITO trajectory ID assignment: read the request header "
                 "(manual) or derive IDs from prefix-tree leaves (auto)"
             ),
+        )
+        tito_group.add_argument(
+            f"--{prefix}tito-tool-normalization",
+            type=str,
+            choices=["none", "claude_code"],
+            default=RouterArgs.tito_tool_normalization,
+            help=(
+                "Harness-specific tool-input canonicalizer for TITO prefix "
+                "hashing (none|claude_code)"
+            ),
+        )
+        tito_group.add_argument(
+            f"--{prefix}tito-workdir",
+            type=str,
+            default=RouterArgs.tito_workdir,
+            help="Working directory assumed by the TITO tool-input canonicalizer",
+        )
+        tito_group.add_argument(
+            f"--{prefix}tito-drop-dead-leaves",
+            action="store_true",
+            default=RouterArgs.tito_drop_dead_leaves,
+            help="Drop dead (rollback) leaves from TITO session snapshots",
         )
 
         # Retry configuration

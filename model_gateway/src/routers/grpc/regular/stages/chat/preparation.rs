@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use http::StatusCode;
 use llm_multimodal::Modality;
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -267,20 +268,37 @@ impl ChatPreparationStage {
         }
 
         // Step 3.5: Enforce the session's prompt-too-long budget. When the
-        // accumulated prompt exceeds the training compaction limit, return an
+        // accumulated prompt reaches the training compaction trigger, return an
         // Anthropic `prompt_too_long` error so Claude Code reactively compacts
         // instead of growing past the budget (or hitting the engine overflow
         // with a message Claude Code cannot recognize).
-        if let Some(limit) = error::prompt_too_long_limit(ctx.input.headers.as_ref())? {
+        if let Some(limit) = ctx
+            .input
+            .headers
+            .as_ref()
+            .and_then(|h| h.get(error::X_SMG_PROMPT_TOO_LONG_LIMIT))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+        {
             let prompt_len = token_ids.len();
-            if error::prompt_exceeds_limit(prompt_len, limit) {
+            if prompt_len >= limit {
+                // This is the expected reactive-compaction signal, not a
+                // gateway failure; keep it at DEBUG so run logs do not drown
+                // in routine prompt_too_long 400s.
                 debug!(
                     function = "ChatPreparationStage::execute",
                     prompt_len,
                     limit,
-                    "Prompt exceeded compaction budget; returning prompt_too_long for reactive compact"
+                    "Prompt reached compaction budget; returning prompt_too_long for reactive compact"
                 );
-                return Err(error::prompt_too_long(prompt_len, limit));
+                let message = format!(
+                    "Prompt is too long: {prompt_len} tokens > {limit} tokens (approximately)"
+                );
+                return Err(error::create_error(
+                    StatusCode::BAD_REQUEST,
+                    "prompt_too_long",
+                    message,
+                ));
             }
         }
 
@@ -421,22 +439,6 @@ impl ChatPreparationStage {
             error::bad_request("tito_render_context_failed", e)
         })?;
 
-        // Select once from exact server-side metadata. The same immutable
-        // adapter is shared by preparation and capture, avoiding a second
-        // special-token lookup/newline encode on every request.
-        let adapter: Arc<dyn model_adapter::ModelAdapter> =
-            model_adapter::select_adapter_for_tokenizer(&**tokenizer)
-                .map(Into::into)
-                .map_err(|e| {
-                    error!(
-                        function = "ChatPreparationStage::try_tito",
-                        session_id = %session_id,
-                        error = %e,
-                        "Failed to select TITO model adapter from tokenizer metadata"
-                    );
-                    error::bad_request("tito_model_adapter_error", e.to_string())
-                })?;
-
         debug!(
             session_id = %session_id,
             total_messages = messages.len(),
@@ -460,18 +462,7 @@ impl ChatPreparationStage {
         // so the response stage can derive the leaf hash by extending this
         // hasher with the new assistant message.
         let running_hasher = lookup.running_hasher.clone();
-        let is_compaction = lookup
-            .matched
-            .as_ref()
-            .is_some_and(|prefix| prefix.has_assistant_in_appended);
-        // Compacted prompts are verified as a complete new prompt and become a
-        // new root/branch. They must never retain a parent edge to a trajectory
-        // whose token stream they rewrote.
-        let parent_hash = if lookup.matched.is_some() && !is_compaction {
-            lookup.parent_hash
-        } else {
-            None
-        };
+        let parent_hash = lookup.parent_hash;
 
         let resolved_trajectory = store
             .resolve_trajectory_id(&session_id, manual_trajectory_id, parent_hash)
@@ -490,7 +481,6 @@ impl ChatPreparationStage {
             session_id: session_id.clone(),
             request: request_arc,
             render_context: render_context.clone(),
-            model_adapter: Arc::clone(&adapter),
             is_tito_hit: false,
             matched_message_num: 0,
             trajectory_id,
@@ -499,6 +489,7 @@ impl ChatPreparationStage {
             reusable_prompt_token_ids: None,
             running_hasher,
             parent_hash,
+            skip_prefix_validation: false,
         });
 
         // The gateway picks `prompt_start` for every turn from the
@@ -550,8 +541,14 @@ impl ChatPreparationStage {
                 prefix_token_len = prefix_token_len,
                 "TITO pseudo-hit without reusable prefix tokens — falling through to full retokenize"
             );
-            ctx.state.tito_context.take();
             return Ok(None);
+        }
+
+        // Compacted-context hits (appended slice contains assistant turns)
+        // legitimately diverge from the stored trajectory stream, so the
+        // store's commit-time prefix validation must be skipped for them.
+        if let Some(tc) = ctx.state.tito_context.as_mut() {
+            tc.skip_prefix_validation = prefix_match.has_assistant_in_appended;
         }
 
         debug!(
@@ -560,6 +557,12 @@ impl ChatPreparationStage {
             prefix_token_len = prefix_token_len,
             "TITO hit — running merge_incremental"
         );
+
+        // Select adapter using model_id; derive special-token IDs from the
+        // tokenizer so the prefix boundary adjustment matches the checkpoint
+        // vocabulary (family defaults can differ across releases).
+        let model_id = ctx.input.model_id.as_str();
+        let adapter = model_adapter::select_adapter_for_tokenizer(model_id, &**tokenizer);
 
         let appended = &messages[matched_message_num..];
         // Mirror the production render path: project `reasoning_effort` onto the
@@ -579,38 +582,9 @@ impl ChatPreparationStage {
             Ok(ids) => ids,
             Err(e) => {
                 warn!(session_id = %session_id, error = %e, "TITO merge_incremental failed — falling through");
-                // A failed token-prefix proof is a genuine TITO miss. Do not
-                // let response processing store a node derived from this hit.
-                ctx.state.tito_context.take();
                 return Ok(None);
             }
         };
-
-        if is_compaction {
-            let canonical_ids = match TitoEngine::tokenize_full_prompt(
-                messages,
-                &**tokenizer,
-                &render_context,
-                thinking,
-            ) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!(session_id = %session_id, error = %e, "TITO compaction verification failed — falling through");
-                    ctx.state.tito_context.take();
-                    return Ok(None);
-                }
-            };
-            if merged_ids != canonical_ids {
-                warn!(
-                    session_id = %session_id,
-                    merged_tokens = merged_ids.len(),
-                    canonical_tokens = canonical_ids.len(),
-                    "TITO compacted prompt differs from canonical tokenization — falling through"
-                );
-                ctx.state.tito_context.take();
-                return Ok(None);
-            }
-        }
 
         if let Some(ref mut tc) = ctx.state.tito_context {
             tc.is_tito_hit = true;

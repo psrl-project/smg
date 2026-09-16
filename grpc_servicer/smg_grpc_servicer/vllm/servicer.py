@@ -21,6 +21,8 @@ import torch
 import zmq
 import zmq.asyncio
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+from smg_grpc_servicer.vllm.kv_event_replay import KvEventReplayHub
+from smg_grpc_servicer.vllm.preemption import drain_preemption_queue
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
@@ -29,8 +31,8 @@ from vllm.distributed.kv_events import (
     BlockRemoved,
     BlockStored,
     KVEventBatch,
-    ZmqEventPublisher,
 )
+from vllm.distributed.kv_events import ZmqEventPublisher
 from vllm.engine.protocol import EngineClient
 from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
 from vllm.inputs.engine import mm_input, tokens_input
@@ -46,8 +48,6 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
-from smg_grpc_servicer.vllm.kv_event_replay import KvEventReplayHub
-from smg_grpc_servicer.vllm.preemption import drain_preemption_queue
 
 logger = init_logger(__name__)
 SAMPLING_DEFAULT_KEYS = (
@@ -134,10 +134,6 @@ class PromptOverflowError(ValueError):
     """Prompt exceeds the engine max_model_len (expected RL truncation)."""
 
 
-class RoutedExpertsPayloadError(ValueError):
-    """The engine produced a malformed routed-experts tensor."""
-
-
 async def _abort_invalid_argument(
     context: grpc.aio.ServicerContext,
     exc: BaseException,
@@ -164,16 +160,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - SubscribePreemptionEvents: Stream scheduler-preempted request IDs to SMG
     """
 
-    def __init__(
-        self,
-        async_llm: EngineClient,
-        start_time: float,
-        preemption_queue: asyncio.Queue | None = None,
-        kv_cache_manager=None,
-        kv_transfer_stats_log_interval_s: float = 30.0,
-        enable_kv_event_replay: bool = False,
-        default_request_seed: int | None = None,
-    ):
+    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None, kv_cache_manager=None, kv_transfer_stats_log_interval_s: float = 30.0, enable_kv_event_replay: bool = False,):
         """
         Initialize the servicer.
 
@@ -191,10 +178,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 gateway gap-replay can recover missed sequences. When False
                 (default), fall back to the original per-subscription inline ZMQ
                 loop with no buffering — the known-good baseline.
-            default_request_seed: Seed used when a request does not provide one.
         """
         self.enable_kv_event_replay = enable_kv_event_replay
-        self.default_request_seed = default_request_seed
         self.engine = async_llm
         self.start_time = start_time
         self.preemption_queue: asyncio.Queue[list[str]] = (
@@ -203,7 +188,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self.kv_cache_manager = kv_cache_manager
         self.generate_admission_open = True
         self.active_generate_admissions = 0
-        self.active_requests_by_data_parallel_rank: dict[int, int] = {}
         self.generate_admissions_drained = asyncio.Event()
         self.generate_admissions_drained.set()
         # Cleared while paused for a weight sync; new Generate calls park on it.
@@ -286,8 +270,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             "[KVTransfer] instance=%s stats: ok=%d returned_false=%d exc=%d "
             "empty=%d (total=%d, success_rate=%.1f%%)",
             getattr(self.kv_cache_manager.config, "lmcache_instance_id", "?")
-            if self.kv_cache_manager is not None
-            else "?",
+            if self.kv_cache_manager is not None else "?",
             s["succeeded"],
             s["returned_false"],
             s["exception"],
@@ -341,9 +324,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if self.active_generate_admissions == 0:
             self.generate_admissions_drained.set()
 
-    def get_active_request_count(self, data_parallel_rank: int) -> int:
-        return self.active_requests_by_data_parallel_rank.get(data_parallel_rank, 0)
-
     @staticmethod
     def abort_response() -> vllm_engine_pb2.GenerateResponse:
         return vllm_engine_pb2.GenerateResponse(
@@ -390,7 +370,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         output_collector = None
         registration_pending = False
-        active_data_parallel_rank: int | None = None
         try:
             arrival_time = time.time()
 
@@ -420,10 +399,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                         f"The prompt (length {prompt_len}) is longer than the "
                         f"maximum model length of {max_model_len}."
                     )
-                if (
-                    prompt_len == max_model_len
-                    and self.engine.model_config.runner_type == "generate"
-                ):
+                if prompt_len == max_model_len and self.engine.model_config.runner_type == "generate":
                     raise PromptOverflowError(
                         f"The prompt (length {prompt_len}) plus the number of "
                         f"requested output tokens (at least 1) is longer than the "
@@ -455,7 +431,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 if _has_kv_connector and request.HasField("kv_transfer_params")
                 else None,
                 model_version_tag=_version_tag,
-                default_seed=self.default_request_seed,
             )
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
 
@@ -501,19 +476,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 return
             registration_pending = True
 
-            add_request_kwargs = {
-                "request_id": request_id,
-                "prompt": prompt,
-                "params": sampling_params,
-                "tokenization_kwargs": tokenization_kwargs,
-                "data_parallel_rank": request.data_parallel_rank,
-            }
-            if request.HasField("priority"):
-                add_request_kwargs["priority"] = request.priority
-            output_collector = await self.engine.add_request(**add_request_kwargs)
-            active_data_parallel_rank = request.data_parallel_rank
-            self.active_requests_by_data_parallel_rank[active_data_parallel_rank] = (
-                self.get_active_request_count(active_data_parallel_rank) + 1
+            output_collector = await self.engine.add_request(
+                request_id=request_id,
+                prompt=prompt,
+                params=sampling_params,
+                tokenization_kwargs=tokenization_kwargs,
             )
             registration_pending = False
             self.finish_generate_admission()
@@ -563,9 +530,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             if output_collector is not None:
                 await self.engine.abort(output_collector.request_id, internal=True)
             raise
-        except RoutedExpertsPayloadError as e:
-            logger.exception("Malformed routed_experts for request %s", request_id)
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
         except ValueError as e:
             # Invalid request error (equiv to 400). PromptOverflowError attaches
             # x-smg-error-code=prompt_overflow so the gateway can demote logs.
@@ -576,14 +540,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         finally:
             if registration_pending:
                 self.finish_generate_admission()
-            if active_data_parallel_rank is not None:
-                active_count = self.get_active_request_count(active_data_parallel_rank) - 1
-                if active_count > 0:
-                    self.active_requests_by_data_parallel_rank[active_data_parallel_rank] = (
-                        active_count
-                    )
-                else:
-                    self.active_requests_by_data_parallel_rank.pop(active_data_parallel_rank, None)
             if output_collector is not None:
                 output_collector.close()
 
@@ -1062,6 +1018,65 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if isinstance(event, BlockStored):
             cache_level = 0 if (event.medium is None or event.medium == "GPU") else 1
 
+            # region agent log
+            try:
+                _dbg_a = globals().setdefault(
+                    "_DBG_KVEVENT_AGG",
+                    {
+                        "stored_level0": 0,
+                        "stored_level1": 0,
+                        "mediums": {},
+                        "lmc_parent_none": 0,
+                        "lmc_parent_zero_sentinel": 0,
+                        "lmc_parent_real": 0,
+                    },
+                )
+                _dbg_a["stored_level0" if cache_level == 0 else "stored_level1"] += 1
+                _dbg_mk = f"{type(event.medium).__name__}:{event.medium!r}"
+                _dbg_a["mediums"][_dbg_mk] = _dbg_a["mediums"].get(_dbg_mk, 0) + 1
+                if cache_level == 1:
+                    if event.parent_block_hash is None:
+                        _dbg_a["lmc_parent_none"] += 1
+                    elif event.parent_block_hash == 0:
+                        _dbg_a["lmc_parent_zero_sentinel"] += 1
+                    else:
+                        _dbg_a["lmc_parent_real"] += 1
+                _dbg_tot = _dbg_a["stored_level0"] + _dbg_a["stored_level1"]
+                if _dbg_tot % 2000 == 0 or (
+                    cache_level == 1 and _dbg_a["stored_level1"] <= 3
+                ):
+                    import json as _dbg_json
+                    import os as _dbg_os
+                    import time as _dbg_time
+
+                    with open(
+                        "/apdcephfs_zwfy10/share_303541817/lhy/.cursor/debug-48f20e.log",
+                        "a",
+                    ) as _dbg_f:
+                        _dbg_f.write(
+                            _dbg_json.dumps(
+                                {
+                                    "sessionId": "48f20e",
+                                    "runId": "run1",
+                                    "hypothesisId": "H1+H5",
+                                    "location": "smg_grpc_servicer/vllm/servicer.py:905",
+                                    "message": "KV BlockStored events bridged to router, by cache_level",
+                                    "data": dict(
+                                        _dbg_a,
+                                        pid=_dbg_os.getpid(),
+                                        last_block_size=int(event.block_size),
+                                        last_n_hashes=len(event.block_hashes),
+                                        last_n_token_ids=len(event.token_ids or []),
+                                    ),
+                                    "timestamp": int(_dbg_time.time() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+            except Exception:
+                pass
+            # endregion
+
             blocks = []
             for i, bh in enumerate(event.block_hashes):
                 start = i * event.block_size
@@ -1090,7 +1105,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             return common_pb2.KvCacheEvent(event_id=event_id, removed=removed)
 
         elif isinstance(event, AllBlocksCleared):
-            return common_pb2.KvCacheEvent(event_id=event_id, cleared=common_pb2.KvCacheCleared())
+            return common_pb2.KvCacheEvent(
+                event_id=event_id, cleared=common_pb2.KvCacheCleared()
+            )
 
         return None
 
@@ -1134,10 +1151,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # the instance is absent (never clobbering a fuller broadcast list) and log
         # loudly, because hitting this path for an existing instance indicates the
         # broadcast did not run / did not reach this replica and should be fixed.
-        if (
-            request.dst_peer_url
-            and request.dst_instance_id not in self.kv_cache_manager.peer_registry
-        ):
+        if request.dst_peer_url and request.dst_instance_id not in self.kv_cache_manager.peer_registry:
             logger.error(
                 "TransferKv seeding peer registry for %s from request dst_peer_url: "
                 "this should not normally trigger (broadcast registry is the source "
@@ -1167,7 +1181,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         except Exception as e:  # noqa: BLE001
             self._record_kv_transfer("exception")
             logger.warning("TransferKv failed: %s", e)
-            return vllm_engine_pb2.TransferKvResponse(success=False, num_tokens=0, error=str(e))
+            return vllm_engine_pb2.TransferKvResponse(
+                success=False, num_tokens=0, error=str(e)
+            )
 
         if ok:
             self._record_kv_transfer("succeeded")
@@ -1335,7 +1351,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         stream: bool = True,
         kv_transfer_params: vllm_engine_pb2.KvTransferParams | None = None,
         model_version_tag: str | None = None,
-        default_seed: int | None = None,
     ) -> SamplingParams:
         """
         Convert protobuf SamplingParams to vLLM SamplingParams.
@@ -1347,7 +1362,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             model_version_tag: LMCache model-version tag to inject into
                 ``extra_args["kv_transfer_params"]`` when multi-version KV is
                 enabled (e.g. ``"3"`` for version 3).  ``None`` = no injection.
-            default_seed: Seed used when the protobuf request leaves ``seed`` unset.
 
         Returns:
             vLLM SamplingParams with detokenize=False and structured_outputs
@@ -1423,7 +1437,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             n=params.n if params.n > 0 else 1,
             logprobs=params.logprobs if params.HasField("logprobs") else None,
             prompt_logprobs=params.prompt_logprobs if params.HasField("prompt_logprobs") else None,
-            seed=params.seed if params.HasField("seed") else default_seed,
+            seed=params.seed if params.HasField("seed") else None,
             include_stop_str_in_output=params.include_stop_str_in_output,
             logit_bias=dict(params.logit_bias) if params.logit_bias else None,
             structured_outputs=structured_outputs,
@@ -1463,34 +1477,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         We pass the raw bytes through a single ``.tobytes()`` call so the
         proto carries the layout exactly as the GPU produced it; the SMG
         gateway and downstream trainers reuse the same ``np.frombuffer``/
-        ``np.load`` decoders without reshaping. Returns ``None`` only for
+        ``np.load`` decoders without reshaping.  Returns ``None`` for
         engines started without ``--enable-return-routed-experts`` (the
-        attribute is absent or ``None``); malformed present arrays are errors.
+        attribute is absent or ``None``) and for empty arrays.
         """
         if routed_experts is None:
             return None
-        if not isinstance(routed_experts, np.ndarray):
-            raise RoutedExpertsPayloadError(
-                f"routed_experts must be a numpy array, got {type(routed_experts).__name__}."
-            )
+        # Defensive: the engine should never hand us a 0-row array, but
+        # guard anyway so the gateway sees a missing field rather than an
+        # empty-but-present payload.
+        if getattr(routed_experts, "size", 0) == 0:
+            return None
         if routed_experts.ndim != 3:
-            raise RoutedExpertsPayloadError(
-                f"routed_experts must be 3D, got shape {routed_experts.shape!r}."
+            logger.warning(
+                "routed_experts has unexpected ndim=%d; dropping",
+                routed_experts.ndim,
             )
-        if any(dimension <= 0 for dimension in routed_experts.shape):
-            raise RoutedExpertsPayloadError(
-                f"routed_experts dimensions must be positive, got shape {routed_experts.shape!r}."
-            )
-        if routed_experts.dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
-            raise RoutedExpertsPayloadError(
-                "routed_experts must use uint8 or uint16 on the wire, "
-                f"got dtype {routed_experts.dtype!r}."
-            )
-        _, num_layers, top_k = routed_experts.shape
+            return None
         if not routed_experts.flags["C_CONTIGUOUS"]:
-            raise RoutedExpertsPayloadError(
-                f"routed_experts must be C-contiguous, got strides {routed_experts.strides!r}."
-            )
+            routed_experts = np.ascontiguousarray(routed_experts)
+        _, num_layers, top_k = routed_experts.shape
         return vllm_engine_pb2.RoutedExpertsTensor(
             data=routed_experts.tobytes(),
             num_layers=int(num_layers),

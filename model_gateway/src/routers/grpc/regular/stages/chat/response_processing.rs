@@ -109,10 +109,6 @@ impl ChatResponseProcessingStage {
         })?;
 
         if is_streaming {
-            // TITO deliberately does not capture streaming generations. Taking
-            // and dropping the context releases any auto-trajectory reservation
-            // before returning the SSE response.
-            drop(tito_ctx);
             // Read derived skip_special_tokens set during preparation.
             let skip_special_tokens = ctx
                 .state
@@ -144,12 +140,8 @@ impl ChatResponseProcessingStage {
         let chat_request = ctx.chat_request_arc();
 
         // Single drain — both TITO and response formatting share this Vec.
-        let mut all_completes =
+        let all_completes =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
-        // Backend completion frames may arrive out of order for n>1. Keep the
-        // public choices and TITO's "first choice" capture anchored to the
-        // protocol sequence index rather than arrival order.
-        all_completes.sort_unstable_by_key(ProtoGenerateComplete::index);
 
         // Parse choices once. The same `ChatCompletionMessage` then feeds both TITO
         // storage and the final response: re-parsing here would mint fresh tool-call
@@ -264,13 +256,13 @@ fn do_tito_capture_non_streaming(
     let render_context = &tito_ctx.render_context;
 
     let model_id = tito_ctx.request.model.as_str();
-    let adapter = &*tito_ctx.model_adapter;
+    let adapter = smg_tito::model_adapter::select_adapter_for_tokenizer(model_id, &**tokenizer);
     let max_trim = adapter.max_trim_tokens();
     tracing::debug!(
         session_id = %tito_ctx.session_id,
         model_id = %model_id,
         is_tito_hit = tito_ctx.is_tito_hit,
-        adapter_type = std::any::type_name_of_val(adapter),
+        adapter_type = std::any::type_name_of_val(&*adapter),
         max_trim_tokens = max_trim,
         "do_tito_capture_non_streaming: processing final response with adapter"
     );
@@ -290,12 +282,24 @@ fn do_tito_capture_non_streaming(
     // would risk minting fresh tool_call IDs and breaking the prefix-hash round trip.
     let new_assistant_message = build_assistant_chat_message(assistant_message);
 
+    let ends_tool_call = matches!(
+        &new_assistant_message,
+        ChatMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } if !calls.is_empty()
+    );
+
+
     // Reuse the prefix hasher captured in preparation to derive the leaf
     // hash without re-walking request_messages.  Clone is mandatory: the
     // hasher state is owned by the immutable ``TitoRequestContext`` and the
     // adapter's `max_trim_tokens` flow ran above without consuming it.
     let mut leaf_hasher = tito_ctx.running_hasher.clone();
-    smg_tito::hash_message_into(&mut leaf_hasher, &new_assistant_message);
+    // Use the store's harness canonicalizer so the recorded leaf hash agrees
+    // with what find_prefix computes for the same message when the harness
+    // re-sends it in a normalized form (e.g. Claude Code replay).
+    store.hash_message(&mut leaf_hasher, &new_assistant_message);
     let leaf_hash = smg_tito::finalize_hash(&leaf_hasher);
     let parent_hash = tito_ctx.parent_hash;
 
@@ -312,7 +316,7 @@ fn do_tito_capture_non_streaming(
             &all_messages,
             tokenizer,
             render_context,
-            adapter,
+            model_id,
             openai_protocol::chat::thinking_from_reasoning_effort(
                 tito_ctx.request.reasoning_effort.as_deref(),
             ),
@@ -339,64 +343,42 @@ fn do_tito_capture_non_streaming(
         mismatch_count = mismatch_report.len(),
         "do_tito_capture_non_streaming: storing tokens"
     );
-    let turn_record = match extract_turn_record(
+    let turn_record = extract_turn_record(
         first_complete,
-        // Every token already present in the request is prompt-masked. For a
-        // verified compaction root this includes all re-injected assistant
-        // turns; only `output_ids` from this generation are trainable.
         prompt_ids.len(),
         dispatched_prompt_start,
         weight_version,
         mismatch_report,
-    ) {
-        Ok(record) => record,
-        Err(e) => {
-            error!(
-                function = "ChatResponseProcessingStage::do_tito_capture_non_streaming",
-                session_id = %tito_ctx.session_id,
-                error = %e,
-                "Invalid routed-experts payload; generation will not be captured"
-            );
-            if let Some(reservation) = tito_ctx.trajectory_id_reservation.as_ref() {
-                reservation.release();
-            }
-            return;
-        }
-    };
+    );
 
-    let store_result = if tito_ctx.reusable_prompt_token_ids.is_some() || max_trim > 0 {
-        let reusable_full_ids =
-            if let Some(reusable_prompt_ids) = tito_ctx.reusable_prompt_token_ids.as_ref() {
-                let mut reusable_full_ids =
-                    Vec::with_capacity(reusable_prompt_ids.len() + output_ids.len());
-                reusable_full_ids.extend_from_slice(reusable_prompt_ids);
-                reusable_full_ids.extend_from_slice(output_ids);
-                reusable_full_ids
-            } else {
-                full_ids.clone()
-            };
-        // Persist the exact boundary-adjusted sequence used by the next hit.
-        // Store validation can then remain a strict starts_with check even for
-        // adapters such as GLM that remove a trailing delimiter.
-        let reusable_full_ids = adapter.adjust_prefix_boundary(&reusable_full_ids);
-        store.store_with_hashes_and_reusable(
-            &tito_ctx.session_id,
-            leaf_hash,
-            parent_hash,
-            smg_tito::store::StoredTokenSequences::with_reusable(full_ids, reusable_full_ids),
-            turn_record,
-            tito_ctx.trajectory_id,
-        )
-    } else {
-        store.store_with_hashes(
-            &tito_ctx.session_id,
-            leaf_hash,
-            parent_hash,
-            full_ids,
-            turn_record,
-            tito_ctx.trajectory_id,
-        )
-    };
+    let store_result =
+        if let Some(reusable_prompt_ids) = tito_ctx.reusable_prompt_token_ids.as_ref() {
+            let mut reusable_full_ids =
+                Vec::with_capacity(reusable_prompt_ids.len() + output_ids.len());
+            reusable_full_ids.extend_from_slice(reusable_prompt_ids);
+            reusable_full_ids.extend_from_slice(output_ids);
+            store.store_with_hashes_and_reusable_with_marker(
+                &tito_ctx.session_id,
+                leaf_hash,
+                parent_hash,
+                smg_tito::store::StoredTokenSequences::with_reusable(full_ids, reusable_full_ids),
+                turn_record,
+                tito_ctx.trajectory_id,
+                tito_ctx.skip_prefix_validation,
+                ends_tool_call,
+            )
+        } else {
+            store.store_with_hashes_and_marker(
+                &tito_ctx.session_id,
+                leaf_hash,
+                parent_hash,
+                full_ids,
+                turn_record,
+                tito_ctx.trajectory_id,
+                tito_ctx.skip_prefix_validation,
+                ends_tool_call,
+            )
+        };
 
     match store_result {
         Ok(()) => {
@@ -445,9 +427,10 @@ fn build_mismatch_report(
     messages: &[ChatMessage],
     tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
     render_context: &RenderContext,
-    adapter: &dyn smg_tito::model_adapter::ModelAdapter,
+    model_id: &str,
     thinking: Option<bool>,
 ) -> Vec<smg_tito::MismatchEntry> {
+    let adapter = smg_tito::model_adapter::select_adapter_for_tokenizer(model_id, &**tokenizer);
     let assistant_start_str = adapter.assistant_start_str().map(String::from);
     let trim_trailing_ids: std::collections::HashSet<u32> =
         adapter.trailing_token_ids().iter().copied().collect();
@@ -477,7 +460,7 @@ fn extract_turn_record(
     dispatched_prompt_start: u32,
     weight_version: Option<String>,
     mismatch_report: Vec<smg_tito::MismatchEntry>,
-) -> Result<smg_tito::TurnRecord, crate::routers::grpc::proto_wrapper::RoutedExpertsError> {
+) -> smg_tito::TurnRecord {
     let output_logprobs: Vec<(f32, u32)> = complete
         .output_logprobs()
         .map(|lp| {
@@ -489,7 +472,7 @@ fn extract_turn_record(
         })
         .unwrap_or_default();
     let finish_reason = complete.finish_reason().to_string();
-    let routed_experts = complete.routed_experts()?.map(|re| {
+    let routed_experts = complete.routed_experts().map(|re| {
         let dtype = match re.dtype {
             crate::routers::grpc::proto_wrapper::RoutedExpertsDtype::U8 => {
                 smg_tito::TurnRoutedExpertsDtype::U8
@@ -506,15 +489,18 @@ fn extract_turn_record(
             prompt_start: dispatched_prompt_start,
         }
     });
-    Ok(smg_tito::TurnRecord {
+    smg_tito::TurnRecord {
         prompt_token_count,
-        // Preserve an explicit empty array when the backend omitted logprobs.
-        output_logprobs: Some(output_logprobs),
+        output_logprobs: if output_logprobs.is_empty() {
+            None
+        } else {
+            Some(output_logprobs)
+        },
         finish_reason,
         mismatch_report,
         routed_experts,
         weight_version,
-    })
+    }
 }
 
 /// Build the [`ChatMessage::Assistant`] view of a server-parsed

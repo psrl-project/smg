@@ -493,7 +493,7 @@ fn process_tool_call_arguments(messages: &mut [Value]) {
                 // arguments with one key order while Claude Code re-serializes
                 // the parsed `input` object with a different order; both must
                 // render — and hash — identically for the prefix to HIT.
-                *args = crate::normalizer::sort_json_keys(parsed);
+                *args = crate::normalizer::sort_json_keys(&parsed);
             }
         }
     }

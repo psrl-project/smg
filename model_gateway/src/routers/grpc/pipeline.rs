@@ -81,11 +81,7 @@ fn log_stage_failure(stage_name: &str, response: &Response) {
             "Chat context reached compaction budget; returned prompt_too_long for reactive compact"
         );
     } else {
-        error!(
-            "Stage {} failed with status {}",
-            stage_name,
-            response.status()
-        );
+        error!("Stage {} failed with status {}", stage_name, response.status());
     }
 }
 

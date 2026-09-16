@@ -184,7 +184,13 @@ impl PipelineStage for RequestExecutionStage {
         // compaction trigger). When present, engine prompt-overflow is translated
         // into an Anthropic `prompt_too_long` error so Claude Code reactively
         // compacts instead of receiving an unrecognized generic 400.
-        let prompt_too_long_limit = error::prompt_too_long_limit(ctx.input.headers.as_ref())?;
+        let prompt_too_long_limit: Option<usize> = ctx
+            .input
+            .headers
+            .as_ref()
+            .and_then(|h| h.get(error::X_SMG_PROMPT_TOO_LONG_LIMIT))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse().ok());
 
         // Create OTEL span for gRPC request execution
         let span = info_span!(
@@ -208,8 +214,7 @@ impl PipelineStage for RequestExecutionStage {
                     }
                 },
                 ExecutionPlan::PrefillDecode(req) => {
-                    self.execute_pd_dispatch(req, clients, workers, model, prompt_too_long_limit)
-                        .await
+                    self.execute_pd_dispatch(req, clients, workers, model).await
                 }
                 ExecutionPlan::EncodePrefillDecode {
                     request,
@@ -218,15 +223,8 @@ impl PipelineStage for RequestExecutionStage {
                     // Request building already injected the encode bootstrap info
                     // into the prefill request. Dispatch the matching encode
                     // jobs here, with the prefill+decode leg.
-                    self.execute_epd_dispatch(
-                        request,
-                        clients,
-                        workers,
-                        model,
-                        encode_dispatch,
-                        prompt_too_long_limit,
-                    )
-                    .await
+                    self.execute_epd_dispatch(request, clients, workers, model, encode_dispatch)
+                        .await
                 }
             }
         }
@@ -261,7 +259,6 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
-        prompt_too_long_limit: Option<usize>,
     ) -> Result<ExecutionResult, Response> {
         // Dispatch based on runtime type:
         // - SGLang: parallel prefill/decode dispatch with bootstrap metadata
@@ -269,19 +266,13 @@ impl RequestExecutionStage {
         let runtime_type = workers.disaggregated_runtime_type();
         match runtime_type {
             Some(RuntimeType::Vllm) => {
-                self.execute_sequential_pd(
-                    proto_request,
-                    clients,
-                    workers,
-                    model,
-                    prompt_too_long_limit,
-                )
-                .await
+                self.execute_sequential_pd(proto_request, clients, workers, model)
+                    .await
             }
             Some(RuntimeType::Sglang) | Some(RuntimeType::TokenSpeed) => {
                 // These runtimes carry bootstrap rendezvous in the request
                 // and use parallel prefill/decode dispatch.
-                self.execute_parallel_pd(proto_request, clients, workers, prompt_too_long_limit)
+                self.execute_parallel_pd(proto_request, clients, workers)
                     .await
             }
             Some(RuntimeType::Trtllm)
@@ -318,20 +309,13 @@ impl RequestExecutionStage {
         workers: &WorkerSelection,
         model: &str,
         encode_dispatch: Option<EncodeDispatchPlan>,
-        prompt_too_long_limit: Option<usize>,
     ) -> Result<ExecutionResult, Response> {
         if let Some(encode_dispatch) = encode_dispatch {
             Self::spawn_encode_dispatch(encode_dispatch);
         }
         proto_request.clear_mm_pixel_values();
-        self.execute_pd_dispatch(
-            proto_request,
-            clients,
-            workers,
-            model,
-            prompt_too_long_limit,
-        )
-        .await
+        self.execute_pd_dispatch(proto_request, clients, workers, model)
+            .await
     }
 
     #[expect(
@@ -404,12 +388,39 @@ impl RequestExecutionStage {
         workers.record_outcome(result.cb_status_code());
 
         let stream = result.map_err(|e| {
-            generation_error_response(
-                e,
-                "execute_single",
+            // Prompt overflow is an expected RL termination (truncate & train),
+            // not a gateway failure. Emit a dedicated error code and log at
+            // debug so default RUST_LOG=warn stays quiet; real failures remain ERROR.
+            if is_prompt_overflow_status(&e) {
+                // When a session carries the prompt-too-long budget, translate
+                // the engine overflow into the Anthropic message Claude Code
+                // recognizes, so its reactive compact fires instead of surfacing
+                // an unrecognized generic 400. Fall back to the legacy
+                // `prompt_overflow` code (PSRL truncates & trains) otherwise.
+                if let Some(limit) = prompt_too_long_limit {
+                    let actual = vllm_overflow_prompt_len(&e.message()).unwrap_or(limit);
+                    debug!(
+                        function = "execute_single",
+                        actual_prompt_len = actual,
+                        limit,
+                        "Translating engine prompt overflow to prompt_too_long for reactive compact"
+                    );
+                    let message = format!(
+                        "Prompt is too long: {actual} tokens > {limit} tokens (approximately)"
+                    );
+                    return e.to_http_error("prompt_too_long", message);
+                }
+                debug!(
+                    function = "execute_single",
+                    error = %e,
+                    "Prompt exceeds max_model_len; returning prompt_overflow"
+                );
+                return e.to_http_error(error::PROMPT_OVERFLOW_ERROR_CODE, e.message().to_string());
+            }
+            error!(function = "execute_single", error = %e, "Failed to start generation");
+            e.to_http_error(
                 "start_generation_failed",
-                "Failed to start generation",
-                prompt_too_long_limit,
+                format!("Failed to start generation: {}", e.message()),
             )
         })?;
 
@@ -452,7 +463,6 @@ impl RequestExecutionStage {
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
-        prompt_too_long_limit: Option<usize>,
     ) -> Result<ExecutionResult, Response> {
         let runtime = workers
             .disaggregated_runtime_type()
@@ -506,12 +516,10 @@ impl RequestExecutionStage {
                 metrics_labels::CONNECTION_GRPC,
                 metrics_labels::ERROR_BACKEND,
             );
-            generation_error_response(
-                e,
-                "execute_parallel_pd",
+            error!(function = "execute_parallel_pd", error = %e, "Prefill worker failed to start");
+            e.to_http_error(
                 "prefill_worker_failed_to_start",
-                "Prefill worker failed to start",
-                prompt_too_long_limit,
+                format!("Prefill worker failed to start: {}", e.message()),
             )
         })?;
 
@@ -522,12 +530,10 @@ impl RequestExecutionStage {
                 metrics_labels::CONNECTION_GRPC,
                 metrics_labels::ERROR_BACKEND,
             );
-            generation_error_response(
-                e,
-                "execute_parallel_pd",
+            error!(function = "execute_parallel_pd", error = %e, "Decode worker failed to start");
+            e.to_http_error(
                 "decode_worker_failed_to_start",
-                "Decode worker failed to start",
-                prompt_too_long_limit,
+                format!("Decode worker failed to start: {}", e.message()),
             )
         })?;
 
@@ -553,7 +559,6 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
-        prompt_too_long_limit: Option<usize>,
     ) -> Result<ExecutionResult, Response> {
         let runtime = workers
             .disaggregated_runtime_type()
@@ -674,13 +679,8 @@ impl RequestExecutionStage {
                     metrics_labels::CONNECTION_GRPC,
                     metrics_labels::ERROR_BACKEND,
                 );
-                generation_error_response(
-                    e,
-                    "execute_sequential_pd",
-                    "prefill_worker_failed_to_start",
-                    "Prefill worker failed to start",
-                    prompt_too_long_limit,
-                )
+                error!(function = "execute_sequential_pd", error = %e, "Prefill worker failed to start");
+                e.to_http_error("prefill_worker_failed_to_start", format!("Prefill worker failed to start: {}", e.message()))
             })?;
 
         // Drain prefill response, harvesting connector params from the Complete frame
@@ -701,12 +701,10 @@ impl RequestExecutionStage {
                         metrics_labels::CONNECTION_GRPC,
                         metrics_labels::ERROR_BACKEND,
                     );
-                    return Err(generation_error_response(
-                        e,
-                        "execute_sequential_pd",
+                    error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
+                    return Err(e.to_http_error(
                         "prefill_stream_error",
-                        "Prefill stream error",
-                        prompt_too_long_limit,
+                        format!("Prefill stream error: {}", e.message()),
                     ));
                 }
             }
@@ -794,12 +792,10 @@ impl RequestExecutionStage {
                 metrics_labels::CONNECTION_GRPC,
                 metrics_labels::ERROR_BACKEND,
             );
-            generation_error_response(
-                e,
-                "execute_sequential_pd",
+            error!(function = "execute_sequential_pd", error = %e, "Decode worker failed to start");
+            e.to_http_error(
                 "decode_worker_failed_to_start",
-                "Decode worker failed to start",
-                prompt_too_long_limit,
+                format!("Decode worker failed to start: {}", e.message()),
             )
         })?;
 
@@ -825,57 +821,15 @@ impl RequestExecutionStage {
     }
 }
 
-fn generation_error_response(
-    status: tonic::Status,
-    function: &'static str,
-    fallback_code: &'static str,
-    fallback_context: &'static str,
-    prompt_too_long_limit: Option<usize>,
-) -> Response {
-    if is_prompt_overflow_status(&status) {
-        if let Some(limit) = prompt_too_long_limit {
-            // If a backend omits the concrete length, keep the response's
-            // boundary statement truthful by choosing the first rejected size.
-            let actual = vllm_overflow_prompt_len(status.message())
-                .filter(|actual| error::prompt_exceeds_limit(*actual, limit))
-                .unwrap_or_else(|| limit.saturating_add(1));
-            debug!(
-                function,
-                actual_prompt_len = actual,
-                limit,
-                "Translating engine prompt overflow to prompt_too_long for reactive compact"
-            );
-            return error::prompt_too_long(actual, limit);
-        }
-        debug!(
-            function,
-            error = %status,
-            "Prompt exceeds max_model_len; returning prompt_overflow"
-        );
-        return status.to_http_error(
-            error::PROMPT_OVERFLOW_ERROR_CODE,
-            status.message().to_string(),
-        );
-    }
-
-    error!(function, error = %status, "{fallback_context}");
-    status.to_http_error(
-        fallback_code,
-        format!("{fallback_context}: {}", status.message()),
-    )
-}
-
 /// Extract the actual prompt length from a vLLM overflow message, e.g.
 /// "The decoder prompt (length 32000) is longer than the maximum model length
 /// of 32768."  Used to seed Claude Code's reactive-compact token gap; falls back
 /// to `None` when the message shape is unexpected.
 fn vllm_overflow_prompt_len(message: &str) -> Option<usize> {
-    const MARKER: &str = "(length ";
-    let digits = message.get(message.find(MARKER)? + MARKER.len()..)?;
-    let end = digits
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(digits.len());
-    (end > 0).then(|| digits[..end].parse().ok()).flatten()
+    let re = regex::Regex::new(r"\(length (\d+)\)").ok()?;
+    re.captures(message)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse().ok())
 }
 
 #[cfg(test)]

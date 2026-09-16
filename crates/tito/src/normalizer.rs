@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use openai_protocol::chat::ChatMessage;
 use serde_json::Value;
 
+use crate::harness::ToolInputCanonicalizer;
+
 /// Hash type for content-addressed prefix tree nodes
 pub type PrefixHash = [u8; 32];
 
@@ -81,10 +83,25 @@ impl RenderContext {
 
 /// Hash a slice of messages and the rendering context using Blake3.
 pub fn hash_messages_with_context(messages: &[ChatMessage], context: &RenderContext) -> PrefixHash {
+    hash_messages_with_context_with(messages, context, None)
+}
+
+/// [`hash_messages_with_context`] with an optional harness-specific tool-input
+/// canonicalizer applied to assistant tool calls before hashing.
+///
+/// This is the hashing entry point the TITO store uses for *both* the request
+/// side (prefix lookup) and the generation side (stored boundary), so a message
+/// spelled one way by the model and another (normalized) way by the harness on
+/// replay maps to the same hash.
+pub fn hash_messages_with_context_with(
+    messages: &[ChatMessage],
+    context: &RenderContext,
+    canonicalizer: Option<&dyn ToolInputCanonicalizer>,
+) -> PrefixHash {
     let mut hasher = blake3::Hasher::new();
     hash_render_context_into(&mut hasher, context);
     for msg in messages {
-        hash_message_into(&mut hasher, msg);
+        hash_message_into_with(&mut hasher, msg, canonicalizer);
     }
     *hasher.finalize().as_bytes()
 }
@@ -108,19 +125,74 @@ pub fn finalize_hash(hasher: &PrefixHasher) -> PrefixHash {
 /// object with a different order on the next turn.  Key order is irrelevant to
 /// the semantics, so the hash must not depend on it, otherwise the TITO prefix
 /// lookup misses and a new trajectory forks in a purely append-only session.
-pub(crate) fn sort_json_keys(value: Value) -> Value {
+///
+/// This function is also used by the *render* path (validator.rs) so tool-call
+/// blocks are re-emitted with a stable key order.  Keep it free of value
+/// normalization: the rendered bytes must stay faithful to the argument
+/// values so they can match raw model tokens.
+pub(crate) fn sort_json_keys(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut sorted: Vec<(String, Value)> = map
-                .into_iter()
-                .map(|(key, value)| (key, sort_json_keys(value)))
+                .iter()
+                .map(|(k, v)| (k.clone(), sort_json_keys(v)))
                 .collect();
             sorted.sort_by(|a, b| a.0.cmp(&b.0));
             Value::Object(sorted.into_iter().collect())
         }
-        Value::Array(items) => Value::Array(items.into_iter().map(sort_json_keys).collect()),
-        other => other,
+        Value::Array(items) => Value::Array(items.iter().map(sort_json_keys).collect()),
+        other => other.clone(),
     }
+}
+
+/// Canonical JSON for the *prefix hash only*: recursively sort object keys and
+/// strip trailing whitespace from every line of each string scalar.
+///
+/// This is hash-side whitespace tolerance, deliberately kept apart from
+/// [`sort_json_keys`] (which the render path uses and which must preserve
+/// values byte-for-byte).  Two spellings of the same tool input that differ
+/// only in line-trailing whitespace — the model emits a blank line as
+/// `"    "`, Claude Code re-serializes the parsed `input` object as `""` —
+/// otherwise produce different hashes, so the prefix lookup misses at that
+/// assistant boundary and the replay is re-tokenized into a forked leaf even
+/// though nothing semantic changed.  Stripping *trailing* per-line whitespace
+/// is safe for this purpose: interior whitespace and leading indentation are
+/// preserved, so whitespace-sensitive values (e.g. Python source in a Write
+/// payload) are unaffected, and only byte-equal-after-normalization messages
+/// map to the same node.
+pub(crate) fn canonical_json_for_hash(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted: Vec<(String, Value)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonical_json_for_hash(v)))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json_for_hash).collect()),
+        Value::String(s) => Value::String(strip_line_trailing_whitespace(s)),
+        other => other.clone(),
+    }
+}
+
+/// Remove trailing ASCII spaces/tabs (and CR) from every line, keeping line
+/// breaks and all leading/interior whitespace intact.
+fn strip_line_trailing_whitespace(s: &str) -> String {
+    fn trim_line(line: &str) -> &str {
+        line.trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\r'))
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut line_start = 0;
+    for (i, ch) in s.char_indices() {
+        if ch == '\n' {
+            out.push_str(trim_line(&s[line_start..i]));
+            out.push('\n');
+            line_start = i + 1;
+        }
+    }
+    out.push_str(trim_line(&s[line_start..]));
+    out
 }
 
 fn hash_render_context_into(hasher: &mut blake3::Hasher, context: &RenderContext) {
@@ -184,7 +256,8 @@ fn hash_render_context_into(hasher: &mut blake3::Hasher, context: &RenderContext
 }
 
 /// Hash a slice of messages using Blake3.
-/// Normalizes: content None → "", tool_calls None → [], tool_call.function.arguments JSON sorted keys.
+/// Normalizes: content None → "", tool_calls None → [], tool_call.function.arguments JSON sorted keys
+/// and per-line trailing whitespace stripped from string values.
 pub fn hash_messages(messages: &[ChatMessage]) -> PrefixHash {
     let mut hasher = blake3::Hasher::new();
     for msg in messages {
@@ -194,6 +267,21 @@ pub fn hash_messages(messages: &[ChatMessage]) -> PrefixHash {
 }
 
 pub fn hash_message_into(hasher: &mut blake3::Hasher, msg: &ChatMessage) {
+    hash_message_into_with(hasher, msg, None);
+}
+
+/// [`hash_message_into`] with an optional harness-specific tool-input
+/// canonicalizer.
+///
+/// The canonicalizer runs *after* the tool-call arguments are parsed into JSON
+/// and *before* the generic hash canonicalization (key sorting + per-line
+/// trailing whitespace tolerance), so harness value rules such as dropping a
+/// redundant `cd <cwd> && ` prefix compose with the format tolerance.
+pub fn hash_message_into_with(
+    hasher: &mut blake3::Hasher,
+    msg: &ChatMessage,
+    canonicalizer: Option<&dyn ToolInputCanonicalizer>,
+) {
     match msg {
         ChatMessage::System { content, .. } => {
             hasher.update(b"system\x00");
@@ -227,29 +315,7 @@ pub fn hash_message_into(hasher: &mut blake3::Hasher, msg: &ChatMessage) {
             // tool_calls
             let tool_calls_slice = tool_calls.as_deref().unwrap_or(&[]);
             for tc in tool_calls_slice {
-                hasher.update(tc.id.as_bytes());
-                hasher.update(b"\x00");
-                hasher.update(tc.tool_type.as_bytes());
-                hasher.update(b"\x00");
-                hasher.update(tc.function.name.as_bytes());
-                hasher.update(b"\x00");
-                // Tool-call arguments: hash a *canonical* form so semantically
-                // identical arguments match regardless of the JSON key order the
-                // model emitted vs. what the client re-serialized on the next
-                // turn.  Claude Code re-sends tool `input` as a fresh object with
-                // its own key order; an order-sensitive hash makes the prefix
-                // lookup miss and forks a new trajectory even in a purely
-                // append-only session.  Key order is semantically irrelevant, so
-                // sort recursively before serializing.
-                let args = tc.function.arguments.as_deref().unwrap_or("{}");
-                let serialized = serde_json::from_str::<Value>(args)
-                    .map(|v| {
-                        serde_json::to_string(&sort_json_keys(v))
-                            .unwrap_or_else(|_| args.to_string())
-                    })
-                    .unwrap_or_else(|_| args.to_string());
-                hasher.update(serialized.as_bytes());
-                hasher.update(b"\x00");
+                hash_tool_call_into(hasher, tc, canonicalizer);
             }
         }
         ChatMessage::Tool {
@@ -276,6 +342,44 @@ pub fn hash_message_into(hasher: &mut blake3::Hasher, msg: &ChatMessage) {
         }
     }
     hasher.update(b"\x01"); // message separator
+}
+
+fn hash_tool_call_into(
+    hasher: &mut blake3::Hasher,
+    tc: &openai_protocol::common::ToolCall,
+    canonicalizer: Option<&dyn ToolInputCanonicalizer>,
+) {
+    hasher.update(tc.id.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(tc.tool_type.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(tc.function.name.as_bytes());
+    hasher.update(b"\x00");
+    // Tool-call arguments: hash a *canonical* form so semantically
+    // identical arguments match regardless of the JSON key order the
+    // model emitted vs. what the client re-serialized on the next
+    // turn, and regardless of line-trailing whitespace drift in
+    // string values (blank lines spelled `"    "` vs `""`).  Claude
+    // Code re-sends tool `input` as a fresh object with its own key
+    // order and whitespace; an order- or whitespace-sensitive hash
+    // makes the prefix lookup miss and forks a new trajectory even
+    // in a purely append-only session.  Key order is semantically
+    // irrelevant, and trailing per-line whitespace is treated as
+    // inert, so canonicalize (sort keys + strip trailing whitespace)
+    // before serializing.
+    let args = tc.function.arguments.as_deref().unwrap_or("{}");
+    let serialized = serde_json::from_str::<Value>(args)
+        .map(|mut v| {
+            // Harness-specific value rules run first (e.g. Claude Code's
+            // redundant `cd <cwd> && ` removal and `replace_all` default).
+            if let Some(canon) = canonicalizer {
+                v = canon.canonicalize(&tc.function.name, v);
+            }
+            serde_json::to_string(&canonical_json_for_hash(&v)).unwrap_or_else(|_| args.to_string())
+        })
+        .unwrap_or_else(|_| args.to_string());
+    hasher.update(serialized.as_bytes());
+    hasher.update(b"\x00");
 }
 
 fn hash_message_content(
@@ -529,6 +633,71 @@ mod tests {
         let m5 = vec![mk_tool_msg(r#"{"a":2,"b":1}"#)];
         let m6 = vec![mk_tool_msg(r#"{"a":2,"b":2}"#)];
         assert_ne!(hash_messages(&m5), hash_messages(&m6));
+    }
+
+    #[test]
+    fn tool_call_arg_string_trailing_whitespace_does_not_change_hash() {
+        // Line-trailing whitespace inside a string value is inert: the model
+        // may emit a code payload whose blank lines carry four spaces while
+        // Claude Code re-serializes the parsed `input` object with empty blank
+        // lines.  The prefix hash must ignore that drift so the replay HITs the
+        // stored node instead of forking a leaf.
+        use openai_protocol::common::{FunctionCallResponse, ToolCall};
+        let mk = |content: &str| {
+            vec![ChatMessage::Assistant {
+                content: None,
+                name: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCallResponse {
+                        name: "Write".to_string(),
+                        arguments: Some(
+                            serde_json::json!({
+                                "file_path": "/tmp/test_decimal_issue.py",
+                                "content": content,
+                            })
+                            .to_string(),
+                        ),
+                    },
+                }]),
+            }]
+        };
+        // Blank lines spelled with four trailing spaces vs. empty.
+        let spaced = "import boto3\n    \n    # Create a table\nclient.put_item(\n)\n";
+        let empty = "import boto3\n\n    # Create a table\nclient.put_item(\n)\n";
+        assert_eq!(hash_messages(&mk(spaced)), hash_messages(&mk(empty)));
+        // Key order swapped on top of the whitespace drift still matches.
+        let reordered = serde_json::json!({
+            "content": empty,
+            "file_path": "/tmp/test_decimal_issue.py",
+        })
+        .to_string();
+        let reordered_msg = vec![ChatMessage::Assistant {
+            content: None,
+            name: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCallResponse {
+                    name: "Write".to_string(),
+                    arguments: Some(reordered),
+                },
+            }]),
+        }];
+        assert_eq!(hash_messages(&mk(spaced)), hash_messages(&reordered_msg));
+        // Interior whitespace still matters: "a b" vs "ab" must differ.
+        assert_ne!(
+            hash_messages(&mk("def f():\n    return 1\n")),
+            hash_messages(&mk("def f():\nreturn 1\n"))
+        );
+        // Leading indentation is preserved, not trimmed.
+        assert_ne!(
+            hash_messages(&mk("import x\n    pass\n")),
+            hash_messages(&mk("import x\npass\n"))
+        );
     }
 
     #[test]

@@ -65,26 +65,14 @@ fn split_into_segments(appended: &[ChatMessage]) -> Vec<(SegmentKind, &[ChatMess
 }
 
 impl TitoEngine {
-    /// Canonically render and tokenize a complete generation prompt.
-    pub fn tokenize_full_prompt(
-        messages: &[ChatMessage],
-        tokenizer: &dyn Tokenizer,
-        render_context: &RenderContext,
-        thinking: Option<bool>,
-    ) -> Result<Vec<u32>, TitoError> {
-        let text = render_append_only(messages, true, tokenizer, render_context, thinking)?;
-        encode_ids(tokenizer, &text)
-    }
-
     /// Merge a pretokenized prefix with the incremental token IDs for `appended_messages`.
     ///
     /// `thinking` must mirror the value the production render path used
     /// (`thinking_from_reasoning_effort(request.reasoning_effort)`), otherwise
     /// the generation prompt / thinking-mode wrapping diverges.
     ///
-    /// For position-independent templates
-    /// (`Tokenizer::chat_template_is_position_dependent()` == false),
-    /// `appended_messages` is split into typed segments (tool runs
+    /// For position-independent templates (`rendering_is_position_dependent()`
+    /// == false), `appended_messages` is split into typed segments (tool runs
     /// vs. user-like/assistant messages) and each segment is tokenized with the
     /// appropriate dummy base context.  For position-dependent templates (e.g.
     /// Qwen3.5) the whole appended slice is rendered in one pass behind a fixed
@@ -101,8 +89,7 @@ impl TitoEngine {
             return Ok(adapter.adjust_prefix_boundary(&prefix_match.pretokenized_ids));
         }
 
-        let position_dependent = tokenizer.chat_template_is_position_dependent();
-        let all_incremental = if position_dependent {
+        let all_incremental = if adapter.rendering_is_position_dependent() {
             merge_whole_slice(appended_messages, tokenizer, render_context, thinking)?
         } else {
             let segments = split_into_segments(appended_messages);
@@ -169,7 +156,7 @@ impl TitoEngine {
             adjusted_prefix_len = adjusted_prefix_len,
             incremental_len = all_incremental.len(),
             result_len = result.len(),
-            position_dependent,
+            position_dependent = adapter.rendering_is_position_dependent(),
             matched_messages = prefix_match.matched_message_num,
             adapter_type = std::any::type_name_of_val(adapter),
             "merge_incremental: merge complete"
@@ -218,28 +205,30 @@ fn merge_whole_slice(
     full_msgs.extend_from_slice(appended_messages);
     let full_text = render_append_only(&full_msgs, true, tokenizer, render_context, thinking)?;
 
+    // Append-only invariant: the chat template must not rewrite the base bytes.
+    if !full_text.starts_with(&base_text) {
+        tracing::warn!(
+            base_len = base_text.len(),
+            full_len = full_text.len(),
+            "merge_whole_slice: chat template violated append-only invariant",
+        );
+        return Err(TitoError::EngineFailed(
+            "chat template violated append-only invariant".to_string(),
+        ));
+    }
+
     let full_ids = encode_ids(tokenizer, &full_text)?;
     let base_ids = encode_ids(tokenizer, &base_text)?;
-
-    if !full_ids.starts_with(&base_ids) {
-        tracing::warn!(
-            base_tokens = base_ids.len(),
-            full_tokens = full_ids.len(),
-            "merge_whole_slice: token-prefix invariant failed",
-        );
-        return Err(TitoError::TokenPrefixMismatch {
-            path: "whole-slice",
-        });
-    }
 
     Ok(full_ids[base_ids.len()..].to_vec())
 }
 
 /// A rendered dummy base context: the base messages themselves (prepended to a
-/// segment for the full render) and their token IDs (token-prefix validation
-/// and incremental slice offset).
+/// segment for the full render), the base-only rendered text (append-only
+/// invariant check), and its token IDs (incremental slice offset).
 struct SegmentBase {
     messages: Vec<ChatMessage>,
+    text: String,
     ids: Vec<u32>,
 }
 
@@ -262,6 +251,7 @@ fn render_segment_base(
     let ids = encode_ids(tokenizer, &text)?;
     Ok(SegmentBase {
         messages: base_messages,
+        text,
         ids,
     })
 }
@@ -308,9 +298,9 @@ fn encode_ids(tokenizer: &dyn Tokenizer, text: &str) -> Result<Vec<u32>, TitoErr
 /// Tokenize one appended segment against a precomputed dummy base and return
 /// only the incremental token IDs.
 ///
-/// Validates the token-prefix invariant: the fully rendered token sequence
-/// must start with the base token sequence. If violated, the template is not
-/// safely incremental for this segment.
+/// Validates the append-only invariant: the fully-rendered text must start
+/// with the base-only rendered text.  If violated, the chat template is not
+/// truly incremental and TITO token IDs would be incorrect.
 fn tokenize_segment_incremental(
     segment: &[ChatMessage],
     add_generation_prompt: bool,
@@ -329,25 +319,28 @@ fn tokenize_segment_incremental(
         thinking,
     )?;
 
-    let full_ids = encode_ids(tokenizer, &full_text)?;
-    if !full_ids.starts_with(&base.ids) {
+    // Append-only invariant: the chat template must not rewrite the base bytes.
+    if !full_text.starts_with(&base.text) {
         tracing::warn!(
-            base_tokens = base.ids.len(),
-            full_tokens = full_ids.len(),
-            "merge_incremental: segment token-prefix invariant failed",
+            base_len = base.text.len(),
+            full_len = full_text.len(),
+            "merge_incremental: chat template violated append-only invariant",
         );
-        return Err(TitoError::TokenPrefixMismatch { path: "segment" });
+        return Err(TitoError::EngineFailed(
+            "chat template violated append-only invariant".to_string(),
+        ));
     }
+
+    let full_ids = encode_ids(tokenizer, &full_text)?;
     Ok(full_ids[base.ids.len()..].to_vec())
 }
 
 #[cfg(test)]
 mod tests {
-    use llm_tokenizer::chat_template::ChatTemplateProcessor;
-    use openai_protocol::chat::MessageContent;
-
     use super::*;
     use crate::model_adapter::DefaultAdapter;
+    use llm_tokenizer::chat_template::ChatTemplateProcessor;
+    use openai_protocol::chat::MessageContent;
 
     fn user_msg(content: &str) -> ChatMessage {
         ChatMessage::User {

@@ -479,9 +479,6 @@ pub(crate) struct TitoRequestContext {
     pub session_id: String,
     pub request: Arc<ChatCompletionRequest>,
     pub render_context: smg_tito::RenderContext,
-    /// Model adapter selected once from server-loaded tokenizer metadata and
-    /// reused by merge, validation, and capture.
-    pub model_adapter: Arc<dyn smg_tito::model_adapter::ModelAdapter>,
     pub is_tito_hit: bool,
     /// Number of messages matched by TITO prefix (if is_tito_hit is true).
     /// Used for rollback detection: if new request matches fewer messages, we truncate turn_records.
@@ -506,6 +503,10 @@ pub(crate) struct TitoRequestContext {
     /// Hash at the last assistant boundary in the request messages (i.e. the
     /// parent hash of the node about to be stored).
     pub parent_hash: Option<smg_tito::PrefixHash>,
+    /// Skip the store's commit-time prefix validation. Set when the request is a
+    /// compacted-context hit (the appended slice contains assistant turns), where
+    /// the new prompt legitimately diverges from the stored trajectory stream.
+    pub skip_prefix_validation: bool,
 }
 
 /// Response processing state (Step 6)

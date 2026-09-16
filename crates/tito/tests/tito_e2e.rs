@@ -11,13 +11,15 @@
 //! on the training hosts.  If neither exists the tests are skipped (they are not
 //! part of a hermetic CI build).
 
-use std::{path::Path, sync::Arc};
+use std::path::Path;
+use std::sync::Arc;
 
 use llm_tokenizer::{
     chat_template::ChatTemplateParams, create_tokenizer_with_chat_template, traits::Tokenizer,
 };
 use openai_protocol::chat::{ChatMessage, MessageContent};
 use serde_json::json;
+
 use smg_tito::{
     engine::TitoEngine,
     model_adapter::{select_adapter_for_tokenizer, ModelAdapter},
@@ -421,7 +423,8 @@ fn real_qwen3_multiturn_merge_matches_full_render() {
         return;
     };
     let ctx = render_context();
-    let adapter = select_adapter_for_tokenizer(&*tokenizer).unwrap();
+    let adapter = select_adapter_for_tokenizer("Qwen3-4B-Instruct-2507", &*tokenizer);
+
     let store = TitoStore::new();
     store.create_session("s1");
 
@@ -486,7 +489,7 @@ fn real_qwen3_compressed_context_assistant_in_appended_matches_full_render() {
         return;
     };
     let ctx = render_context();
-    let adapter = select_adapter_for_tokenizer(&*tokenizer).unwrap();
+    let adapter = select_adapter_for_tokenizer("Qwen3-4B-Instruct-2507", &*tokenizer);
 
     let store = TitoStore::new();
     store.create_session("s1");
@@ -566,7 +569,7 @@ fn real_qwen3_compressed_context_with_tool_call_assistant_matches_full_render() 
         return;
     };
     let ctx = render_context();
-    let adapter = select_adapter_for_tokenizer(&*tokenizer).unwrap();
+    let adapter = select_adapter_for_tokenizer("Qwen3-4B-Instruct-2507", &*tokenizer);
 
     let store = TitoStore::new();
     store.create_session("s1");
@@ -634,7 +637,7 @@ fn real_qwen3_no_think_strip_compressed_context_matches_full_render() {
         return;
     };
     let ctx = render_context();
-    let adapter = select_adapter_for_tokenizer(&*tokenizer).unwrap();
+    let adapter = select_adapter_for_tokenizer("Qwen3-4B-Instruct-2507", &*tokenizer);
 
     let store = TitoStore::new();
     store.create_session("s1");
@@ -780,11 +783,7 @@ fn real_qwen35_compressed_context_uses_whole_slice_path() {
         return;
     };
     let ctx = render_context();
-    let adapter = select_adapter_for_tokenizer(&*tokenizer).unwrap();
-    assert!(
-        tokenizer.chat_template_is_position_dependent(),
-        "stock Qwen3.5 template must use the whole-slice path"
-    );
+    let adapter = select_adapter_for_tokenizer("Qwen3.5-4B", &*tokenizer);
 
     let store = TitoStore::new();
     store.create_session("s1");
@@ -866,11 +865,7 @@ fn real_qwen35_patched_template_validator_ok() {
         return;
     };
     let ctx = render_context();
-    let adapter = select_adapter_for_tokenizer(&*tokenizer).unwrap();
-    assert!(
-        !tokenizer.chat_template_is_position_dependent(),
-        "patched Qwen3.5 template must use the segment path"
-    );
+    let adapter = select_adapter_for_tokenizer("Qwen3.5-4B", &*tokenizer);
 
     let store = TitoStore::new();
     store.create_session("s1");

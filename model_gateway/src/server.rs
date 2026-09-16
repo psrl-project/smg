@@ -830,6 +830,13 @@ pub struct ServerConfig {
     pub tito_gc_threshold: Option<usize>,
     /// Controls whether TITO reads trajectory IDs from headers or assigns them.
     pub trajectory_id_strategy: smg_tito::TrajectoryIdStrategy,
+    /// Harness-specific tool-input canonicalizer for TITO prefix hashing.
+    /// `none` disables; `claude_code` mirrors Claude Code's normalizeToolInput.
+    pub tito_tool_normalization: String,
+    /// Working directory assumed by the selected tool canonicalizer.
+    pub tito_workdir: String,
+    /// Drop dead (rollback) leaves from TITO session snapshots.
+    pub tito_drop_dead_leaves: bool,
     /// Bind address for WebRTC UDP sockets.
     /// `None` means use the default (0.0.0.0, auto-detect candidate IP).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -1246,20 +1253,28 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     if config.enable_tito {
-        let tito_store = Arc::new(smg_tito::TitoStore::with_trajectory_id_strategy(
-            config.trajectory_id_strategy,
-        ));
+        let tool_canonicalizer = smg_tito::build_tool_canonicalizer(
+            Some(&config.tito_tool_normalization),
+            Some(&config.tito_workdir),
+        );
+        let tito_store = Arc::new(
+            smg_tito::TitoStore::with_trajectory_id_strategy(config.trajectory_id_strategy)
+                .with_tool_canonicalizer(tool_canonicalizer),
+        );
         tito_store.set_debug(config.tito_debug);
+        tito_store.set_drop_dead_leaves(config.tito_drop_dead_leaves);
         if let Some(threshold) = config.tito_gc_threshold {
             tito_store.set_gc_threshold(threshold);
         }
         if let Some(ctx_mut) = Arc::get_mut(&mut app_context) {
             ctx_mut.tito_store = Some(tito_store);
             info!(
-                "TITO session store initialized (debug={}, gc_threshold={:?}, trajectory_id_strategy={})",
+                "TITO session store initialized (debug={}, gc_threshold={:?}, trajectory_id_strategy={}, tool_normalization={}, workdir={})",
                 config.tito_debug,
                 config.tito_gc_threshold,
-                config.trajectory_id_strategy
+                config.trajectory_id_strategy,
+                config.tito_tool_normalization,
+                config.tito_workdir
             );
         } else {
             error!("Failed to set tito_store: Arc::get_mut failed");

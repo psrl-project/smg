@@ -800,10 +800,7 @@ mod tests {
         assert_eq!(keys, vec!["path", "pattern"]);
         assert_eq!(
             v1["required"].as_array().unwrap(),
-            &serde_json::json!(["path", "pattern"])
-                .as_array()
-                .unwrap()
-                .clone()
+            &serde_json::json!(["path", "pattern"]).as_array().unwrap().clone()
         );
     }
 }

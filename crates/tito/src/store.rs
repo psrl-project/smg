@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::TitoError,
+    harness::ToolInputCanonicalizer,
     normalizer::{
         finalize_hash, hash_message_into, hash_messages_with_context, initialize_context_hasher,
         PrefixHash, PrefixHasher, RenderContext,
@@ -65,6 +66,11 @@ pub struct PrefixEntry {
     pub parent_hash: Option<PrefixHash>,
     /// Metadata for the assistant turn that produced this node.
     pub turn_record: TurnRecord,
+    /// Monotonic creation order within the session (larger == stored later).
+    pub seq: u64,
+    /// True when this assistant turn ends with a tool call (no stored
+    /// observation after it inside this node).
+    pub ends_tool_call: bool,
 }
 
 /// Token representations stored for one TITO node.
@@ -118,6 +124,8 @@ pub(crate) struct SessionState {
     /// Minimum number of entries that must be present in the session before GC is
     /// triggered. `0` means "always run GC".
     pub gc_threshold: usize,
+    /// Monotonic commit sequence used to order nodes within this session.
+    pub next_seq: u64,
 }
 
 impl SessionState {
@@ -130,6 +138,7 @@ impl SessionState {
             inflight_auto_trajectory_ids: HashSet::new(),
             max_trim_tokens: 0,
             gc_threshold: 0,
+            next_seq: 0,
         }
     }
 }
@@ -257,6 +266,55 @@ pub struct Trajectory {
     pub turn_records: Vec<TurnRecord>,
 }
 
+/// One node of the TITO prefix tree (one assistant boundary).
+///
+/// ``id`` is a local, deterministic index assigned in root→leaf path order
+/// (parents always sort before children).  ``hash`` is the blake3 hex of the
+/// message prefix ending at this assistant boundary and lets downstream tooling
+/// join a node across snapshots of the same session.
+///
+/// ``stored == false`` marks a **phantom boundary**: an assistant boundary that
+/// appears in a request (typically a compaction / history-rewrite re-injection)
+/// but that this session never stored as a generated node.  Such a boundary has
+/// no token stream of its own (``num_tokens == 0``, ``finish_reason`` empty)
+/// and its upstream is unknown (``parent == None``); it is the *cut point*
+/// where a new trajectory begins after a context rewrite.
+#[derive(Clone, Debug, Serialize)]
+pub struct TitoNodeMeta {
+    pub id: u64,
+    pub hash: String,
+    pub stored: bool,
+    pub parent: Option<u64>,
+    pub finish_reason: String,
+    pub truncated: bool,
+    pub num_tokens: usize,
+    /// Trajectory ids whose root→leaf path passes through this node.
+    pub trajectory_ids: Vec<u64>,
+}
+
+/// One live trajectory leaf (root→leaf view) in the session tree.
+#[derive(Clone, Debug, Serialize)]
+pub struct TitoLeafMeta {
+    pub trajectory_id: u64,
+    pub node_id: u64,
+    pub parent: Option<u64>,
+    /// Root→leaf node ids (in [`TitoTreeMeta::nodes`] id space).
+    pub path_node_ids: Vec<u64>,
+}
+
+/// Prefix-tree structure of one session snapshot.
+///
+/// Node ids are local to a snapshot; use ``hash`` for cross-snapshot joins.
+/// This is the structural layer that lets analysis tooling answer "is leaf B a
+/// sibling of leaf A", "which node is the shared parent", and "is a leaf the
+/// truncated tail of a path that a later sibling superseded" — without
+/// re-deriving parentage from token content.
+#[derive(Clone, Debug, Serialize)]
+pub struct TitoTreeMeta {
+    pub nodes: Vec<TitoNodeMeta>,
+    pub leaves: Vec<TitoLeafMeta>,
+}
+
 /// Consistent training-data snapshot returned for every TITO session.
 #[derive(Debug, Serialize)]
 pub struct TitoSessionData {
@@ -265,6 +323,8 @@ pub struct TitoSessionData {
     /// Always an array: empty, single-trajectory, and multi-trajectory sessions
     /// share the same wire format.
     pub trajectories: Vec<Trajectory>,
+    /// Prefix-tree structural metadata for the same snapshot.
+    pub tree: TitoTreeMeta,
 }
 
 /// Top-level store: session_id → Arc<Mutex<SessionState>>.
@@ -273,6 +333,11 @@ pub struct TitoStore {
     debug: AtomicBool,
     gc_threshold: std::sync::atomic::AtomicUsize,
     trajectory_id_strategy: TrajectoryIdStrategy,
+    tool_canonicalizer: Arc<dyn ToolInputCanonicalizer>,
+    /// When enabled, snapshots exclude "rollback" leaves (dead branches that
+    /// forked from a state the session later continued past) so they are never
+    /// down-streamed to the agent loop as training data.
+    drop_dead_leaves: AtomicBool,
 }
 
 /// Result of resolving a request's trajectory identity.
@@ -356,7 +421,51 @@ impl TitoStore {
             debug: AtomicBool::new(false),
             gc_threshold: std::sync::atomic::AtomicUsize::new(0),
             trajectory_id_strategy: strategy,
+            tool_canonicalizer: crate::harness::build_tool_canonicalizer(None, None),
+            drop_dead_leaves: AtomicBool::new(false),
         }
+    }
+
+    /// Enable/disable dropping dead (rollback) leaves from session snapshots.
+    pub fn set_drop_dead_leaves(&self, enabled: bool) {
+        self.drop_dead_leaves.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether dead (rollback) leaves are excluded from session snapshots.
+    pub fn drop_dead_leaves_enabled(&self) -> bool {
+        self.drop_dead_leaves.load(Ordering::Relaxed)
+    }
+
+    /// Attach a harness-specific tool-input canonicalizer used by every prefix
+    /// hash the store computes (lookup and stored boundaries alike).
+    pub fn with_tool_canonicalizer(
+        mut self,
+        canonicalizer: Arc<dyn ToolInputCanonicalizer>,
+    ) -> Self {
+        self.tool_canonicalizer = canonicalizer;
+        self
+    }
+
+    /// Hash one message using the store's harness canonicalizer.
+    pub fn hash_message(&self, hasher: &mut PrefixHasher, msg: &ChatMessage) {
+        crate::normalizer::hash_message_into_with(
+            hasher,
+            msg,
+            Some(self.tool_canonicalizer.as_ref()),
+        );
+    }
+
+    /// Hash a full message slice using the store's harness canonicalizer.
+    pub fn hash_messages_with_context(
+        &self,
+        messages: &[ChatMessage],
+        context: &RenderContext,
+    ) -> PrefixHash {
+        crate::normalizer::hash_messages_with_context_with(
+            messages,
+            context,
+            Some(self.tool_canonicalizer.as_ref()),
+        )
     }
 
     pub const fn trajectory_id_strategy(&self) -> TrajectoryIdStrategy {
@@ -557,7 +666,7 @@ impl TitoStore {
         let mut parent_hash: Option<PrefixHash> = None;
 
         for (i, msg) in messages.iter().enumerate() {
-            hash_message_into(&mut hasher, msg);
+            self.hash_message(&mut hasher, msg);
             let k = i + 1;
             if is_assistant_role(msg) {
                 let h = finalize_hash(&hasher);
@@ -648,19 +757,13 @@ impl TitoStore {
                     prefix_tokens = entry.token_ids.len(),
                     "find_prefix_with_lookup: HIT"
                 );
-                let reusable_prefix_token_ids = Arc::clone(
-                    entry
-                        .reusable_prefix_token_ids
-                        .as_ref()
-                        .unwrap_or(&entry.token_ids),
-                );
-                // Copying a long token prefix is O(context length). Release the
-                // per-session mutex first so concurrent branches in the same
-                // session are not serialized behind that memory copy.
-                drop(state);
+                let reusable_prefix_token_ids = entry
+                    .reusable_prefix_token_ids
+                    .as_deref()
+                    .unwrap_or(entry.token_ids.as_ref());
                 return Ok(PrefixLookup {
                     matched: Some(PrefixMatch {
-                        pretokenized_ids: reusable_prefix_token_ids.as_ref().clone(),
+                        pretokenized_ids: reusable_prefix_token_ids.clone(),
                         matched_message_num: *k,
                         has_assistant_in_appended,
                     }),
@@ -687,8 +790,8 @@ impl TitoStore {
         render_context: &RenderContext,
         trajectory_id: u64,
     ) -> Result<(), TitoError> {
-        let leaf_hash = hash_messages_with_context(messages, render_context);
-        let parent_hash = compute_parent_hash(messages, render_context);
+        let leaf_hash = self.hash_messages_with_context(messages, render_context);
+        let parent_hash = self.compute_parent_hash_canonical(messages, render_context);
         self.store_with_hashes(
             session_id,
             leaf_hash,
@@ -696,7 +799,24 @@ impl TitoStore {
             token_ids,
             turn_record,
             trajectory_id,
+            false,
         )
+    }
+
+    /// Hash of the message list ending at the second-to-last assistant turn,
+    /// using the store's harness canonicalizer (mirrors the free
+    /// [`compute_parent_hash`] helper for canonical-aware hashing).
+    fn compute_parent_hash_canonical(
+        &self,
+        messages: &[ChatMessage],
+        render_context: &RenderContext,
+    ) -> Option<PrefixHash> {
+        let last_asst = messages.iter().rposition(is_assistant_role)?;
+        let second_last_asst = messages[..last_asst].iter().rposition(is_assistant_role)?;
+        Some(self.hash_messages_with_context(
+            &messages[..=second_last_asst],
+            render_context,
+        ))
     }
 
     /// Store token IDs for a completed generation using caller-supplied hashes.
@@ -717,6 +837,7 @@ impl TitoStore {
         token_ids: Vec<u32>,
         turn_record: TurnRecord,
         trajectory_id: u64,
+        skip_prefix_validation: bool,
     ) -> Result<(), TitoError> {
         self.store_token_sequences(
             session_id,
@@ -725,6 +846,36 @@ impl TitoStore {
             StoredTokenSequences::shared(token_ids),
             turn_record,
             trajectory_id,
+            skip_prefix_validation,
+            false,
+        )
+    }
+
+    /// [`Self::store_with_hashes`] with an explicit tool-call-end marker.
+    ///
+    /// `ends_tool_call` should be true when this turn's assistant message ends
+    /// with a tool call (no observation inside this node) — used for dead-leaf
+    /// (rollback) detection at snapshot time.
+    pub fn store_with_hashes_and_marker(
+        &self,
+        session_id: &str,
+        leaf_hash: PrefixHash,
+        parent_hash: Option<PrefixHash>,
+        token_ids: Vec<u32>,
+        turn_record: TurnRecord,
+        trajectory_id: u64,
+        skip_prefix_validation: bool,
+        ends_tool_call: bool,
+    ) -> Result<(), TitoError> {
+        self.store_token_sequences(
+            session_id,
+            leaf_hash,
+            parent_hash,
+            StoredTokenSequences::shared(token_ids),
+            turn_record,
+            trajectory_id,
+            skip_prefix_validation,
+            ends_tool_call,
         )
     }
 
@@ -738,6 +889,32 @@ impl TitoStore {
         token_ids: StoredTokenSequences,
         turn_record: TurnRecord,
         trajectory_id: u64,
+        skip_prefix_validation: bool,
+    ) -> Result<(), TitoError> {
+        self.store_with_hashes_and_reusable_with_marker(
+            session_id,
+            leaf_hash,
+            parent_hash,
+            token_ids,
+            turn_record,
+            trajectory_id,
+            skip_prefix_validation,
+            false,
+        )
+    }
+
+    /// [`Self::store_with_hashes_and_reusable`] with an explicit tool-call-end
+    /// marker (see [`Self::store_with_hashes_and_marker`]).
+    pub fn store_with_hashes_and_reusable_with_marker(
+        &self,
+        session_id: &str,
+        leaf_hash: PrefixHash,
+        parent_hash: Option<PrefixHash>,
+        token_ids: StoredTokenSequences,
+        turn_record: TurnRecord,
+        trajectory_id: u64,
+        skip_prefix_validation: bool,
+        ends_tool_call: bool,
     ) -> Result<(), TitoError> {
         self.store_token_sequences(
             session_id,
@@ -746,6 +923,8 @@ impl TitoStore {
             token_ids,
             turn_record,
             trajectory_id,
+            skip_prefix_validation,
+            ends_tool_call,
         )
     }
 
@@ -757,33 +936,44 @@ impl TitoStore {
         token_ids: StoredTokenSequences,
         turn_record: TurnRecord,
         trajectory_id: u64,
+        skip_prefix_validation: bool,
+        ends_tool_call: bool,
     ) -> Result<(), TitoError> {
         let arc = self.get_or_create_session_arc(session_id);
         let mut state = arc.lock();
 
-        // A child checkpoint must contain the complete parent token sequence.
-        // This exact check rejects both divergence and the old short-sequence
-        // loophole; boundary trimming is only an export concern.
-        if let Some(ph) = parent_hash {
-            if let Some(parent) = state.entries.get(&ph) {
-                let prev: &[u32] = parent
-                    .reusable_prefix_token_ids
-                    .as_deref()
-                    .unwrap_or(&parent.token_ids);
-                let new_ids: &[u32] = token_ids.reusable.as_deref().unwrap_or(&token_ids.expanded);
-                if !new_ids.starts_with(prev) {
-                    let first = prev
-                        .iter()
-                        .zip(new_ids)
-                        .position(|(a, b)| a != b)
-                        .unwrap_or_else(|| prev.len().min(new_ids.len()));
-                    return Err(TitoError::PrefixMismatch(format!(
-                        "stored prefix {} tokens does not prefix new checkpoint {} tokens \
-                         (first mismatch at {})",
-                        prev.len(),
-                        new_ids.len(),
-                        first
-                    )));
+        // miles-style commit-time prefix validation. For a clean append-only
+        // extension the new checkpoint (prompt + completion) must begin with
+        // the stored trajectory stream, tolerating up to `max_trim_tokens`
+        // boundary differences (e.g. a truncated turn whose closing `<|im_end|>`
+        // the template re-emits). This is the correctness gate that catches
+        // genuine TITO prefix bugs without false-positiving on truncation.
+        // Skipped for compacted-context hits where the prompt legitimately
+        // diverges, and for nodes without a parent.
+        if !skip_prefix_validation {
+            if let Some(ph) = parent_hash {
+                if let Some(parent) = state.entries.get(&ph) {
+                    let prev: &[u32] = parent
+                        .reusable_prefix_token_ids
+                        .as_deref()
+                        .unwrap_or(&parent.token_ids);
+                    let new_ids: &[u32] = token_ids.reusable.as_deref().unwrap_or(&token_ids.expanded);
+                    let max_trim = state.max_trim_tokens;
+                    let check_len = prev.len().saturating_sub(max_trim);
+                    if check_len > 0 && new_ids.len() >= check_len && &new_ids[..check_len] != &prev[..check_len] {
+                        let first = prev[..check_len]
+                            .iter()
+                            .zip(&new_ids[..check_len])
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(check_len);
+                        return Err(TitoError::PrefixMismatch(format!(
+                            "stored prefix {} tokens diverges from new checkpoint (first mismatch at {}, \
+                             max_trim_tokens={})",
+                            prev.len(),
+                            first,
+                            max_trim
+                        )));
+                    }
                 }
             }
         }
@@ -794,6 +984,8 @@ impl TitoStore {
         }
         state.leaf_hashes.insert(leaf_hash);
 
+        let seq = state.next_seq;
+        state.next_seq = state.next_seq.wrapping_add(1);
         state.entries.insert(
             leaf_hash,
             PrefixEntry {
@@ -801,6 +993,8 @@ impl TitoStore {
                 reusable_prefix_token_ids: token_ids.reusable.map(Arc::new),
                 parent_hash,
                 turn_record,
+                seq,
+                ends_tool_call,
             },
         );
 
@@ -829,7 +1023,8 @@ impl TitoStore {
         };
         let state = arc.lock();
 
-        collect_trajectories(&state)
+        let excluded = self.dead_leaf_exclusions(&state);
+        collect_trajectories(&state, &excluded)
     }
 
     /// Return an atomic session snapshot with a stable multi-trajectory shape.
@@ -840,11 +1035,24 @@ impl TitoStore {
         let arc = self.get_session_arc(session_id)?;
         let state = arc.lock();
 
+        let excluded = self.dead_leaf_exclusions(&state);
         Some(TitoSessionData {
             session_id: session_id.to_string(),
             max_trim_tokens: state.max_trim_tokens,
-            trajectories: collect_trajectories(&state),
+            trajectories: collect_trajectories(&state, &excluded),
+            tree: collect_tree_meta(&state, &excluded),
         })
+    }
+
+    /// Dead-leaf exclusion set for snapshot collection.
+    ///
+    /// Empty when dead-leaf dropping is disabled (fast path: no tree walk) so
+    /// the hot path is byte-identical to the previous behavior.
+    fn dead_leaf_exclusions(&self, state: &SessionState) -> HashSet<PrefixHash> {
+        if !self.drop_dead_leaves_enabled() {
+            return HashSet::new();
+        }
+        compute_dead_leaf_hashes(state)
     }
 
     /// Look up the next-turn dispatch's `routed_experts_prompt_start` for
@@ -978,10 +1186,242 @@ fn collect_records_for_leaf(state: &SessionState, leaf_hash: PrefixHash) -> Vec<
         .collect()
 }
 
-fn collect_trajectories(state: &SessionState) -> Vec<Trajectory> {
+fn hash_hex(hash: &PrefixHash) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
+
+/// Collect the prefix-tree structure of every node reachable from the live
+/// trajectory pointers, plus a root→leaf view of each trajectory.
+///
+/// Walking each trajectory from its leaf toward the root stops at the first
+/// **phantom boundary** — a parent hash that has no stored entry.  Phantom
+/// boundaries arise when a request replays context the session never generated
+/// (Claude Code auto-compact / history rewrite): the request attaches to a
+/// re-injected assistant boundary that is not a stored node.  Such boundaries
+/// are exported with ``stored=false`` (no token stream, unknown upstream) and
+/// act as the *cut point* where a new trajectory begins.
+///
+/// Node ids are assigned by sorting hashes by their earliest root→leaf path
+/// position, then by hash: parents always precede their children.  Every node
+/// carries its blake3 ``hash`` so tooling can join it across snapshots.
+fn compute_dead_leaf_hashes(state: &SessionState) -> HashSet<PrefixHash> {
+    // 1. Root->leaf chains for every live trajectory (phantom head included;
+    //    only stored nodes carry seq/ends_tool_call metadata).
+    struct LeafInfo {
+        path: Vec<PrefixHash>,
+        ends_tool_call: bool,
+    }
+    let mut leaves_info: Vec<LeafInfo> = Vec::with_capacity(state.trajectory_leaves.len());
+    for leaf_hash in state.trajectory_leaves.values() {
+        let mut chain_rev: Vec<PrefixHash> = Vec::new();
+        let mut current = Some(*leaf_hash);
+        while let Some(hash) = current {
+            chain_rev.push(hash);
+            match state.entries.get(&hash) {
+                Some(entry) => current = entry.parent_hash,
+                None => current = None,
+            }
+        }
+        chain_rev.reverse();
+        let leaf_entry = state.entries.get(leaf_hash);
+        leaves_info.push(LeafInfo {
+            path: chain_rev,
+            ends_tool_call: leaf_entry.map(|e| e.ends_tool_call).unwrap_or(false),
+        });
+    }
+
+    // 2. Dead = dangling tool-call leaf (its own last stored node ends with a
+    //    tool call and nothing follows on this chain) AND another leaf shares a
+    //    real prefix with it and diverges (or extends) with nodes created
+    //    strictly later.  The "later" comparison happens at the divergence
+    //    point only: the sibling's first node after the shared prefix must have
+    //    been stored after this leaf's own node at the same divergence.
+    let mut dead: HashSet<PrefixHash> = HashSet::new();
+    for (i, leaf) in leaves_info.iter().enumerate() {
+        if !leaf.ends_tool_call {
+            continue;
+        }
+        let mut is_dead = false;
+        for (j, other) in leaves_info.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let len_a = leaf.path.len();
+            let len_b = other.path.len();
+            let shared = leaf
+                .path
+                .iter()
+                .zip(other.path.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if shared == 0 {
+                continue; // different (phantom) worlds: no real shared prefix
+            }
+            if shared == len_a {
+                // `other` strictly extends this leaf (or is identical).
+                //
+                // Note: with the "leaf has no children" invariant this branch
+                // is unreachable for a *true* leaf.  It exists because
+                // `trajectory_leaves` can transiently point at an internal node
+                // that another trajectory later extended underneath it (a
+                // superseded/stale trajectory pointer).  Such a stale pointer
+                // *is* a rollback artifact and must be dropped; this branch
+                // catches exactly that case.
+                if len_b > len_a {
+                    // Any node stored beyond this leaf is necessarily later
+                    // (monotonic seq), so the dangling leaf was superseded.
+                    if let (Some(a), Some(b)) = (
+                        state.entries.get(&leaf.path[len_a - 1]),
+                        state.entries.get(&other.path[len_a]),
+                    ) {
+                        if b.seq > a.seq {
+                            is_dead = true;
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if shared >= len_b {
+                continue; // `other` is a strict prefix of this leaf
+            }
+            // True divergence at index `shared`: sibling child vs this leaf's
+            // child.  Only mark dead when the sibling side was stored later.
+            let child_a = state.entries.get(&leaf.path[shared]);
+            let child_b = state.entries.get(&other.path[shared]);
+            if let (Some(a), Some(b)) = (child_a, child_b) {
+                if b.seq > a.seq {
+                    is_dead = true;
+                    break;
+                }
+            }
+        }
+        if is_dead {
+            if let Some(leaf_hash) = leaf.path.last() {
+                dead.insert(*leaf_hash);
+            }
+        }
+    }
+    dead
+}
+
+fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> TitoTreeMeta {
+    // 1. Root→leaf hash paths for every live trajectory.  Climb from the leaf
+    //    through stored entries; a parent without a stored entry is a phantom
+    //    boundary and terminates the climb (its own upstream is unknown).
     let mut pairs: Vec<(u64, PrefixHash)> = state
         .trajectory_leaves
         .iter()
+        .filter(|(_, leaf_hash)| !excluded.contains(*leaf_hash))
+        .map(|(&trajectory_id, &leaf_hash)| (trajectory_id, leaf_hash))
+        .collect();
+    pairs.sort_unstable_by_key(|(trajectory_id, _)| *trajectory_id);
+
+    let mut paths: Vec<(u64, Vec<PrefixHash>)> = Vec::new();
+    for (trajectory_id, leaf_hash) in pairs {
+        let mut chain_rev: Vec<PrefixHash> = Vec::new();
+        let mut current = Some(leaf_hash);
+        while let Some(hash) = current {
+            chain_rev.push(hash);
+            match state.entries.get(&hash) {
+                Some(entry) => current = entry.parent_hash,
+                // Phantom boundary: referenced as a parent but never stored;
+                // it has no entry, so we cannot climb above it.
+                None => current = None,
+            }
+        }
+        chain_rev.reverse();
+        paths.push((trajectory_id, chain_rev));
+    }
+
+    // 2. Earliest path position per hash -> deterministic parent-before-child
+    //    ordering (parents strictly precede children inside every path).
+    let mut min_pos: HashMap<PrefixHash, usize> = HashMap::new();
+    for (_, path) in &paths {
+        for (pos, hash) in path.iter().enumerate() {
+            let entry = min_pos.entry(*hash).or_insert(pos);
+            if pos < *entry {
+                *entry = pos;
+            }
+        }
+    }
+    let mut ordered: Vec<PrefixHash> = min_pos.keys().copied().collect();
+    ordered.sort_unstable_by(|a, b| min_pos[a].cmp(&min_pos[b]).then_with(|| a.cmp(b)));
+    let id_of: HashMap<PrefixHash, u64> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (*h, i as u64))
+        .collect();
+
+    // 3. Per-node metadata.  Stored nodes carry entry data; phantom nodes are
+    //    marked stored=false with an empty finish_reason and no token stream.
+    let mut nodes: Vec<TitoNodeMeta> = ordered
+        .iter()
+        .map(|hash| {
+            let entry = state.entries.get(hash);
+            let id = id_of[hash];
+            match entry {
+                Some(entry) => TitoNodeMeta {
+                    id,
+                    hash: hash_hex(hash),
+                    stored: true,
+                    parent: entry.parent_hash.and_then(|ph| id_of.get(&ph).copied()),
+                    finish_reason: entry.turn_record.finish_reason.clone(),
+                    truncated: entry.turn_record.finish_reason == "length",
+                    num_tokens: entry.token_ids.len(),
+                    trajectory_ids: Vec::new(),
+                },
+                None => TitoNodeMeta {
+                    id,
+                    hash: hash_hex(hash),
+                    stored: false,
+                    parent: None,
+                    finish_reason: String::new(),
+                    truncated: false,
+                    num_tokens: 0,
+                    trajectory_ids: Vec::new(),
+                },
+            }
+        })
+        .collect();
+
+    // 4. Trajectory leaves: root→leaf node id paths; tag each path node with
+    //    the trajectory id so consumers can see which trajectories share nodes.
+    let mut leaves: Vec<TitoLeafMeta> = Vec::new();
+    for (trajectory_id, path) in &paths {
+        let path_node_ids: Vec<u64> = path
+            .iter()
+            .filter_map(|hash| id_of.get(hash).copied())
+            .collect();
+        let Some(leaf_id) = path_node_ids.last().copied() else {
+            continue;
+        };
+        for node_id in &path_node_ids {
+            if let Some(node) = nodes.iter_mut().find(|n| n.id == *node_id) {
+                node.trajectory_ids.push(*trajectory_id);
+            }
+        }
+        leaves.push(TitoLeafMeta {
+            trajectory_id: *trajectory_id,
+            node_id: leaf_id,
+            parent: nodes.iter().find(|n| n.id == leaf_id).and_then(|n| n.parent),
+            path_node_ids,
+        });
+    }
+
+    TitoTreeMeta { nodes, leaves }
+}
+
+fn collect_trajectories(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Vec<Trajectory> {
+    let mut pairs: Vec<(u64, PrefixHash)> = state
+        .trajectory_leaves
+        .iter()
+        .filter(|(_, leaf_hash)| !excluded.contains(*leaf_hash))
         .map(|(&trajectory_id, &leaf_hash)| (trajectory_id, leaf_hash))
         .collect();
     pairs.sort_unstable_by_key(|(trajectory_id, _)| *trajectory_id);
@@ -1029,6 +1469,45 @@ mod tests {
         ChatMessage::Tool {
             content: MessageContent::Text(content.to_string()),
             tool_call_id: call_id.to_string(),
+        }
+    }
+
+    /// Build a `Write` assistant turn.  `spaced_blank_lines` reproduces the
+    /// model-emitted spelling (blank lines carry four trailing spaces, key
+    /// `file_path` first); the replay spelling used in the tests puts
+    /// `content` first and spells blank lines empty.
+    fn write_assistant_msg(spaced_blank_lines: bool, file_path_first: bool) -> ChatMessage {
+        use openai_protocol::common::{FunctionCallResponse, ToolCall};
+
+        let blank = if spaced_blank_lines { "    \n" } else { "\n" };
+        let content = format!("import boto3\n{blank}    # Create a table\nclient.put_item(\n)\n");
+        let file_path = "/tmp/test_decimal_issue.py";
+        let mut args = serde_json::Map::new();
+        if file_path_first {
+            args.insert(
+                "file_path".to_string(),
+                serde_json::Value::String(file_path.to_string()),
+            );
+            args.insert("content".to_string(), serde_json::Value::String(content));
+        } else {
+            args.insert("content".to_string(), serde_json::Value::String(content));
+            args.insert(
+                "file_path".to_string(),
+                serde_json::Value::String(file_path.to_string()),
+            );
+        }
+        ChatMessage::Assistant {
+            content: None,
+            name: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_w".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCallResponse {
+                    name: "Write".to_string(),
+                    arguments: Some(serde_json::Value::Object(args).to_string()),
+                },
+            }]),
         }
     }
 
@@ -1338,6 +1817,71 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_only_arg_drift_still_prefix_hits_and_reuses_stored_tokens() {
+        // Regression: a Write tool call whose `content` value differs only in
+        // line-trailing whitespace (model emits blank lines as `"    "`, the
+        // client re-serializes them as `""`) plus a swapped key order must
+        // still HIT the stored assistant boundary and reuse the stored tokens,
+        // instead of missing and landing the assistant turn in the appended
+        // slice (which forks a new leaf via re-tokenization).
+        let store = make_store();
+        store.create_session("s1");
+        let ctx = render_context();
+
+        let stored_turn = vec![user_msg("fix the bug"), write_assistant_msg(true, true)];
+        store_turn(
+            &store,
+            "s1",
+            &stored_turn,
+            vec![10, 20],
+            record(2, "stop"),
+            &ctx,
+        );
+
+        let replay = vec![
+            user_msg("fix the bug"),
+            write_assistant_msg(false, false),
+            user_msg("<tool_response>file written</tool_response>"),
+        ];
+        let hit = store.find_prefix("s1", &replay, &ctx).unwrap().unwrap();
+        assert_eq!(hit.matched_message_num, 2, "assistant boundary must match");
+        assert!(!hit.has_assistant_in_appended);
+        assert_eq!(hit.pretokenized_ids, vec![10, 20], "stored tokens reused");
+    }
+
+    #[test]
+    fn genuine_content_drift_still_misses() {
+        // Safety: the whitespace tolerance must NOT bridge a real content
+        // change — a different non-whitespace character still misses.
+        let store = make_store();
+        store.create_session("s1");
+        let ctx = render_context();
+
+        let stored_turn = vec![user_msg("fix the bug"), write_assistant_msg(true, true)];
+        store_turn(
+            &store,
+            "s1",
+            &stored_turn,
+            vec![10, 20],
+            record(2, "stop"),
+            &ctx,
+        );
+
+        let mut changed = write_assistant_msg(false, false);
+        if let ChatMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } = &mut changed
+        {
+            if let Some(args) = calls[0].function.arguments.as_mut() {
+                *args = args.replace("import boto3", "import os");
+            }
+        }
+        let replay = vec![user_msg("fix the bug"), changed, user_msg("next")];
+        assert!(store.find_prefix("s1", &replay, &ctx).unwrap().is_none());
+    }
+
+    #[test]
     fn get_all_trajectories_returns_leaf_tokens_and_parent_records() {
         let store = make_store();
         store.create_session("s1");
@@ -1382,6 +1926,7 @@ mod tests {
                 "session_id": "empty",
                 "max_trim_tokens": 0,
                 "trajectories": [],
+                "tree": {"nodes": [], "leaves": []},
             })
         );
         assert!(empty_store.get_session_data("missing").is_none());
@@ -1407,6 +1952,9 @@ mod tests {
         assert_eq!(single["trajectories"][0]["trajectory_id"], 0);
         assert!(single["trajectories"][0].get("records").is_some());
         assert!(single["trajectories"][0].get("turn_records").is_none());
+        assert_eq!(single["tree"]["leaves"].as_array().unwrap().len(), 1);
+        assert_eq!(single["tree"]["nodes"][0]["stored"], true);
+        assert_eq!(single["tree"]["leaves"][0]["path_node_ids"].as_array().unwrap().len(), 1);
 
         let multi_store = make_store();
         multi_store.create_session("multi");
@@ -1434,6 +1982,12 @@ mod tests {
         assert_eq!(multi["trajectories"].as_array().unwrap().len(), 2);
         assert_eq!(multi["trajectories"][0]["trajectory_id"], 0);
         assert_eq!(multi["trajectories"][1]["trajectory_id"], 1);
+        let multi_leaves = multi["tree"]["leaves"].as_array().unwrap();
+        assert_eq!(multi_leaves.len(), 2);
+        // Two independent roots: distinct leaf nodes, both parent-free.
+        assert_ne!(multi_leaves[0]["node_id"], multi_leaves[1]["node_id"]);
+        assert!(multi_leaves[0]["parent"].is_null());
+        assert!(multi_leaves[1]["parent"].is_null());
     }
 
     #[test]
@@ -1952,6 +2506,7 @@ mod tests {
                 vec![1, 2, 3],
                 record(3, "stop"),
                 42,
+                false,
             )
             .unwrap();
 
@@ -1998,25 +2553,21 @@ mod tests {
     }
 
     #[test]
-    fn prefix_validation_is_exact_and_rejects_short_or_divergent_children() {
+    fn prefix_validation_tolerates_boundary_but_rejects_divergence() {
         let store = make_store();
         store.create_session("s");
-        // Boundary trim configuration must not weaken trajectory integrity.
+        // Qwen3-like ceiling: tolerate 1 trailing boundary token per turn.
         store.set_session_max_trim_tokens("s", 1);
 
         let parent_hash: PrefixHash = [1u8; 32];
         store
-            .store_with_hashes(
-                "s",
-                parent_hash,
-                None,
-                vec![10, 20, 30],
-                record(3, "stop"),
-                0,
-            )
+            .store_with_hashes("s", parent_hash, None, vec![10, 20, 30], record(3, "stop"), 0, false)
             .unwrap();
 
-        // Clean extension preserves every parent token.
+        // Clean extension: the new checkpoint re-emits the truncated turn's
+        // closing `<|im_end|>` + newline after the stored content. The last
+        // stored token (30) falls inside the max_trim=1 tolerance window, so
+        // the shared prefix (first two tokens) still matches.
         store
             .store_with_hashes(
                 "s",
@@ -2025,20 +2576,9 @@ mod tests {
                 vec![10, 20, 30, 151645, 198],
                 record(5, "stop"),
                 0,
+                false,
             )
             .unwrap();
-
-        let short_err = store
-            .store_with_hashes(
-                "s",
-                [4u8; 32],
-                Some(parent_hash),
-                vec![10, 20],
-                record(2, "stop"),
-                1,
-            )
-            .unwrap_err();
-        assert!(matches!(short_err, TitoError::PrefixMismatch(_)));
 
         // Genuine divergence inside the shared prefix must be rejected.
         let err = store
@@ -2049,6 +2589,7 @@ mod tests {
                 vec![99, 20, 30, 40],
                 record(4, "stop"),
                 0,
+                false,
             )
             .unwrap_err();
         assert!(
@@ -2060,45 +2601,7 @@ mod tests {
         // points at the clean-extension leaf, not the divergent node.
         let trajectories = store.get_all_trajectories("s");
         assert_eq!(trajectories.len(), 1);
-        assert_eq!(
-            trajectories[0].accumulated_token_ids,
-            vec![10, 20, 30, 151645, 198]
-        );
-    }
-
-    #[test]
-    fn prefix_validation_uses_persisted_boundary_adjusted_sequence() {
-        let store = make_store();
-        store.create_session("s");
-        let parent_hash: PrefixHash = [7u8; 32];
-
-        // The expanded training sequence retains the generated delimiter, while
-        // the reusable sequence is the adapter-adjusted boundary used by the
-        // next request (GLM removes such a delimiter; Qwen may append one).
-        store
-            .store_with_hashes_and_reusable(
-                "s",
-                parent_hash,
-                None,
-                StoredTokenSequences::with_reusable(vec![10, 99], vec![10]),
-                record(1, "stop"),
-                0,
-            )
-            .unwrap();
-
-        store
-            .store_with_hashes_and_reusable(
-                "s",
-                [8u8; 32],
-                Some(parent_hash),
-                StoredTokenSequences::with_reusable(vec![10, 20, 99], vec![10, 20]),
-                record(2, "stop"),
-                0,
-            )
-            .unwrap();
-
-        let trajectories = store.get_all_trajectories("s");
-        assert_eq!(trajectories[0].accumulated_token_ids, vec![10, 20, 99]);
+        assert_eq!(trajectories[0].accumulated_token_ids, vec![10, 20, 30, 151645, 198]);
     }
 
     #[test]
@@ -2118,6 +2621,7 @@ mod tests {
                 ),
                 record(5, "stop"),
                 0,
+                false,
             )
             .unwrap();
 
@@ -2229,5 +2733,94 @@ mod tests {
         };
         let value = serde_json::to_value(&record).unwrap();
         assert!(value.get("routed_experts").is_none());
+    }
+}
+
+#[cfg(test)]
+mod dead_leaf_tests {
+    use super::*;
+
+    fn hash_from(label: &str) -> PrefixHash {
+        *blake3::hash(label.as_bytes()).as_bytes()
+    }
+
+    fn entry(parent: Option<PrefixHash>, seq: u64, ends_tool_call: bool) -> PrefixEntry {
+        PrefixEntry {
+            token_ids: Arc::new(vec![]),
+            reusable_prefix_token_ids: None,
+            parent_hash: parent,
+            turn_record: TurnRecord {
+                prompt_token_count: 0,
+                output_logprobs: None,
+                finish_reason: "stop".to_string(),
+                mismatch_report: vec![],
+                routed_experts: None,
+                weight_version: None,
+            },
+            seq,
+            ends_tool_call,
+        }
+    }
+
+    #[test]
+    fn dangling_rollback_with_later_diverging_sibling_is_dead() {
+        let root = hash_from("root");
+        let div = hash_from("div");
+        let x = hash_from("x");
+        let y = hash_from("y");
+        let y2 = hash_from("y2");
+        let mut state = SessionState::new();
+        state.entries.insert(root, entry(None, 0, false));
+        state.entries.insert(div, entry(Some(root), 1, false));
+        state.entries.insert(x, entry(Some(div), 2, true));
+        state.entries.insert(y, entry(Some(div), 3, false));
+        state.entries.insert(y2, entry(Some(y), 4, false));
+        state.trajectory_leaves.insert(0, y2);
+        state.trajectory_leaves.insert(1, x);
+
+        let dead = compute_dead_leaf_hashes(&state);
+        assert!(dead.contains(&x), "dangling rollback leaf x should be dead");
+        assert!(!dead.contains(&y2), "continued leaf y2 must be kept");
+    }
+
+    #[test]
+    fn dangling_leaf_without_later_sibling_is_kept() {
+        let root = hash_from("root2");
+        let child = hash_from("child");
+        let mut state = SessionState::new();
+        state.entries.insert(root, entry(None, 0, false));
+        state.entries.insert(child, entry(Some(root), 1, true));
+        state.trajectory_leaves.insert(0, child);
+        assert!(compute_dead_leaf_hashes(&state).is_empty());
+    }
+
+    #[test]
+    fn non_dangling_shorter_leaf_is_kept() {
+        let root = hash_from("root3");
+        let div = hash_from("div3");
+        let short = hash_from("short");
+        let deep = hash_from("deep");
+        let mut state = SessionState::new();
+        state.entries.insert(root, entry(None, 0, false));
+        state.entries.insert(div, entry(Some(root), 1, false));
+        state.entries.insert(short, entry(Some(div), 2, false));
+        state.entries.insert(deep, entry(Some(div), 3, false));
+        state.trajectory_leaves.insert(0, short);
+        state.trajectory_leaves.insert(1, deep);
+        assert!(compute_dead_leaf_hashes(&state).is_empty());
+    }
+
+    #[test]
+    fn same_depth_compaction_siblings_are_kept() {
+        let p = hash_from("comp-p");
+        let a = hash_from("comp-a");
+        let b = hash_from("comp-b");
+        let mut state = SessionState::new();
+        state.entries.insert(p, entry(None, 0, false));
+        state.entries.insert(a, entry(Some(p), 1, false));
+        state.entries.insert(b, entry(Some(p), 2, false));
+        state.trajectory_leaves.insert(0, a);
+        state.trajectory_leaves.insert(1, b);
+        assert!(compute_dead_leaf_hashes(&state).is_empty());
     }
 }
