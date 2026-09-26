@@ -2556,7 +2556,7 @@ mod tests {
     fn prefix_validation_tolerates_boundary_but_rejects_divergence() {
         let store = make_store();
         store.create_session("s");
-        // Qwen3-like ceiling: tolerate 1 trailing boundary token per turn.
+        // Explicit tolerance of 1, so the last stored token falls inside the window.
         store.set_session_max_trim_tokens("s", 1);
 
         let parent_hash: PrefixHash = [1u8; 32];
