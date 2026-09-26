@@ -138,6 +138,9 @@ class RouterArgs:
     psrl_kv_transfer_enable: bool = False
     psrl_kv_transfer_mode: str = "async"  # async | sync | pin_sync
     psrl_kv_transfer_timeout_ms: int = 30000
+    # LMCache multiprocess coordinator base URL (for example
+    # http://10.0.0.1:9300). Empty disables the off-GPU cache-event source.
+    psrl_lmcache_coordinator_addr: str = ""
     # TITO configuration
     enable_tito: bool = False
     tito_debug: bool = False
@@ -932,6 +935,12 @@ class RouterArgs:
             action="store_true",
             default=RouterArgs.psrl_enable_group_sticky,
             help="Keep requests with the same prompt group pinned to one worker instance",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}psrl-lmcache-coordinator-addr",
+            type=str,
+            default=RouterArgs.psrl_lmcache_coordinator_addr,
+            help="LMCache multiprocess coordinator base URL used to follow the off-GPU cache tier",
         )
 
         # TITO configuration

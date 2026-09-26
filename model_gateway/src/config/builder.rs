@@ -353,6 +353,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn psrl_lmcache_coordinator_addr(mut self, addr: impl Into<String>) -> Self {
+        self.config.psrl.lmcache_coordinator_addr = addr.into();
+        self
+    }
+
     pub fn psrl_candidate_sort_key(mut self, v: CandidateSortKey) -> Self {
         self.config.psrl.candidate_sort_key = v;
         self

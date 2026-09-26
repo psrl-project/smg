@@ -1018,65 +1018,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if isinstance(event, BlockStored):
             cache_level = 0 if (event.medium is None or event.medium == "GPU") else 1
 
-            # region agent log
-            try:
-                _dbg_a = globals().setdefault(
-                    "_DBG_KVEVENT_AGG",
-                    {
-                        "stored_level0": 0,
-                        "stored_level1": 0,
-                        "mediums": {},
-                        "lmc_parent_none": 0,
-                        "lmc_parent_zero_sentinel": 0,
-                        "lmc_parent_real": 0,
-                    },
-                )
-                _dbg_a["stored_level0" if cache_level == 0 else "stored_level1"] += 1
-                _dbg_mk = f"{type(event.medium).__name__}:{event.medium!r}"
-                _dbg_a["mediums"][_dbg_mk] = _dbg_a["mediums"].get(_dbg_mk, 0) + 1
-                if cache_level == 1:
-                    if event.parent_block_hash is None:
-                        _dbg_a["lmc_parent_none"] += 1
-                    elif event.parent_block_hash == 0:
-                        _dbg_a["lmc_parent_zero_sentinel"] += 1
-                    else:
-                        _dbg_a["lmc_parent_real"] += 1
-                _dbg_tot = _dbg_a["stored_level0"] + _dbg_a["stored_level1"]
-                if _dbg_tot % 2000 == 0 or (
-                    cache_level == 1 and _dbg_a["stored_level1"] <= 3
-                ):
-                    import json as _dbg_json
-                    import os as _dbg_os
-                    import time as _dbg_time
-
-                    with open(
-                        "/apdcephfs_zwfy10/share_303541817/lhy/.cursor/debug-48f20e.log",
-                        "a",
-                    ) as _dbg_f:
-                        _dbg_f.write(
-                            _dbg_json.dumps(
-                                {
-                                    "sessionId": "48f20e",
-                                    "runId": "run1",
-                                    "hypothesisId": "H1+H5",
-                                    "location": "smg_grpc_servicer/vllm/servicer.py:905",
-                                    "message": "KV BlockStored events bridged to router, by cache_level",
-                                    "data": dict(
-                                        _dbg_a,
-                                        pid=_dbg_os.getpid(),
-                                        last_block_size=int(event.block_size),
-                                        last_n_hashes=len(event.block_hashes),
-                                        last_n_token_ids=len(event.token_ids or []),
-                                    ),
-                                    "timestamp": int(_dbg_time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-            except Exception:
-                pass
-            # endregion
-
             blocks = []
             for i, bh in enumerate(event.block_hashes):
                 start = i * event.block_size
