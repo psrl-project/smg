@@ -2997,6 +2997,13 @@ pub struct ResponsesRequest {
     #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: i32,
 
+    /// Capture the sampler's top-k head for score centering.
+    ///
+    /// Responses training requests lower to the canonical chat IR, so this mirrors
+    /// `ChatCompletionRequest.sampler_top_logprobs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampler_top_logprobs: Option<u32>,
+
     /// Min-p sampling parameter (SGLang extension)
     #[serde(default)]
     #[validate(range(min = 0.0, max = 1.0))]
@@ -3054,6 +3061,7 @@ impl Default for ResponsesRequest {
             top_k: default_top_k(),
             min_p: 0.0,
             repetition_penalty: default_repetition_penalty(),
+            sampler_top_logprobs: None,
         }
     }
 }
@@ -3334,6 +3342,13 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
 
 /// Schema-level validation for cross-field dependencies
 fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(), ValidationError> {
+    // TITO sampler capture is served one completed non-streaming turn at a time.
+    if request.sampler_top_logprobs.unwrap_or(0) > 0 && request.stream.unwrap_or(false) {
+        let mut e = ValidationError::new("invalid_sampler_capture_mode");
+        e.message = Some("Sampler capture requires one non-streaming completion".into());
+        return Err(e);
+    }
+
     // 1. Validate tool_choice requires tools (enhanced)
     validate_tool_choice_with_tools(request)?;
 

@@ -49,7 +49,7 @@ use crate::routers::grpc::{
     context::RequestContext,
     proto_wrapper::{
         ProtoGenerateComplete, ProtoResponseVariant, ProtoRoutedExperts, ProtoRoutedExpertsShape,
-        ProtoStream, RoutedExpertsDtype, RoutedExpertsError,
+        ProtoStream, ProtoTopLogProbs, RoutedExpertsDtype, RoutedExpertsError,
     },
 };
 
@@ -135,6 +135,7 @@ pub(crate) struct PartialRolloutState {
     /// Per-token log-probabilities, parallel to `token_ids`.
     /// `None` if any iteration did not return log-prob data.
     pub logprobs: Option<Vec<f32>>,
+    pub top_logprobs: Option<Vec<ProtoTopLogProbs>>,
     /// Routed-experts accumulator.  `None` when the request did not opt in,
     /// or before the first iteration that produces a non-empty RE segment.
     pub routed_experts: Option<RoutedExpertsAccumulator>,
@@ -166,6 +167,7 @@ impl Default for PartialRolloutState {
         Self {
             token_ids: Vec::new(),
             logprobs: None,
+            top_logprobs: None,
             routed_experts: None,
             iteration_count: 0,
             prompt_len: 0,
@@ -194,6 +196,7 @@ pub(crate) struct DrainedStreamResult {
     /// frame.  When present, the vector is position-parallel with
     /// `new_token_ids`.
     pub new_logprobs: Option<Vec<f32>>,
+    pub new_top_logprobs: Option<Vec<ProtoTopLogProbs>>,
     /// Routed-experts segment from this iteration's `Complete` frame.
     pub new_routed_experts: Option<ProtoRoutedExperts>,
     /// The finish reason from the `Complete` frame.
@@ -219,7 +222,7 @@ fn complete_segment_logprobs(
     complete: &ProtoGenerateComplete,
     segment_token_ids: &[u32],
 ) -> Option<Vec<f32>> {
-    let logprobs = complete.output_logprobs()?;
+    let logprobs = complete.output_logprobs(false)?;
     (logprobs.token_ids.as_slice() == segment_token_ids).then_some(logprobs.token_logprobs)
 }
 
@@ -230,6 +233,7 @@ pub(crate) async fn drain_stream_for_partial_rollout(
 ) -> Result<DrainedStreamResult, String> {
     let mut new_token_ids: Vec<u32> = Vec::new();
     let mut new_logprobs: Option<Vec<f32>> = None;
+    let mut new_top_logprobs = Some(Vec::new());
 
     loop {
         let Some(response_result) = stream.next().await else {
@@ -243,16 +247,39 @@ pub(crate) async fn drain_stream_for_partial_rollout(
 
         match response.into_response() {
             ProtoResponseVariant::Chunk(chunk) => {
-                new_token_ids.extend_from_slice(chunk.token_ids());
-
-                if let Some(lp) = chunk.output_logprobs() {
+                let chunk_ids = chunk.token_ids();
+                let logprobs = chunk.output_logprobs(true);
+                if let Some(lp) = logprobs {
                     new_logprobs
                         .get_or_insert_with(Vec::new)
-                        .extend_from_slice(&lp.token_logprobs);
+                        .extend(lp.token_logprobs);
+                    if !chunk_ids.is_empty() {
+                        match new_top_logprobs.as_mut() {
+                            Some(rows)
+                                if lp.token_ids == chunk_ids
+                                    && lp.top_logprobs.len() == chunk_ids.len() =>
+                            {
+                                rows.extend(lp.top_logprobs);
+                            }
+                            _ => new_top_logprobs = None,
+                        }
+                    }
+                } else if !chunk_ids.is_empty() {
+                    new_top_logprobs = None;
                 }
+                new_token_ids.extend_from_slice(chunk_ids);
             }
             ProtoResponseVariant::Complete(complete) => {
                 if new_token_ids.is_empty() {
+                    new_top_logprobs = complete.output_logprobs(true).and_then(|lp| {
+                        if lp.token_ids != complete.output_ids() {
+                            return None;
+                        }
+                        if new_logprobs.is_none() {
+                            new_logprobs = Some(lp.token_logprobs);
+                        }
+                        (lp.top_logprobs.len() == lp.token_ids.len()).then_some(lp.top_logprobs)
+                    });
                     new_token_ids = complete.output_ids().to_vec();
                 }
                 // Delta workers accumulate log-probs from the chunks above; a
@@ -261,10 +288,13 @@ pub(crate) async fn drain_stream_for_partial_rollout(
                     new_logprobs = complete_segment_logprobs(&complete, &new_token_ids);
                 }
                 let finish_reason = complete.finish_reason().to_owned();
-                let new_routed_experts = complete.routed_experts();
+                let new_routed_experts = complete
+                    .routed_experts()
+                    .map_err(|error| error.to_string())?;
                 return Ok(DrainedStreamResult {
                     new_token_ids,
                     new_logprobs,
+                    new_top_logprobs,
                     new_routed_experts,
                     finish_reason,
                     complete,
@@ -280,7 +310,7 @@ pub(crate) async fn drain_stream_for_partial_rollout(
 /// Append the tokens from `drained` into `state`.
 pub(crate) fn merge_into_partial_state(
     state: &mut PartialRolloutState,
-    drained: &DrainedStreamResult,
+    drained: &mut DrainedStreamResult,
 ) -> Result<(), RoutedExpertsError> {
     let prior_completion = state.token_ids.len();
     state.token_ids.extend_from_slice(&drained.new_token_ids);
@@ -311,6 +341,19 @@ pub(crate) fn merge_into_partial_state(
              dropping logprobs"
         );
         state.logprobs = None;
+    }
+
+    if segment_token_count > 0 {
+        state.top_logprobs = match (state.top_logprobs.take(), drained.new_top_logprobs.take()) {
+            (Some(mut rows), Some(new)) if new.len() == segment_token_count => {
+                rows.extend(new);
+                Some(rows)
+            }
+            (None, Some(new)) if prior_completion == 0 && new.len() == segment_token_count => {
+                Some(new)
+            }
+            _ => None,
+        };
     }
 
     let seg = drained.new_routed_experts.as_ref();
@@ -410,6 +453,57 @@ pub(crate) fn reset_ctx_for_loopback(ctx: &mut RequestContext) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sampler_rows_survive_abort_empty_abort_and_completion() {
+        let mut state = PartialRolloutState::default();
+        let mut first = make_drained(&[3], Some(vec![-0.5]));
+        first.new_top_logprobs = Some(vec![ProtoTopLogProbs {
+            token_ids: vec![3, 4],
+            values: vec![-0.5, -1.0],
+        }]);
+        merge_into_partial_state(&mut state, &mut first).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[], None)).unwrap();
+        let mut last = make_drained(&[5], Some(vec![0.0]));
+        last.new_top_logprobs = Some(vec![ProtoTopLogProbs {
+            token_ids: vec![5, 6],
+            values: vec![0.0, f32::NEG_INFINITY],
+        }]);
+        merge_into_partial_state(&mut state, &mut last).unwrap();
+        let mut complete = last.complete;
+        complete
+            .set_partial_rollout_outputs(
+                state.token_ids,
+                state.logprobs,
+                state.top_logprobs,
+                None,
+                2,
+                0,
+            )
+            .unwrap();
+        assert!(complete
+            .output_logprobs(false)
+            .unwrap()
+            .top_logprobs
+            .is_empty());
+        let output = complete.output_logprobs(true).unwrap();
+        assert_eq!(output.token_ids, vec![3, 5]);
+        assert_eq!(output.top_logprobs[0].token_ids, vec![3, 4]);
+        assert_eq!(output.top_logprobs[1].values, vec![0.0, f32::NEG_INFINITY]);
+    }
+
+    #[test]
+    fn missing_sampler_segment_cannot_recover_later() {
+        let mut state = PartialRolloutState::default();
+        merge_into_partial_state(&mut state, &mut make_drained(&[3], Some(vec![0.0]))).unwrap();
+        let mut last = make_drained(&[5], Some(vec![0.0]));
+        last.new_top_logprobs = Some(vec![ProtoTopLogProbs {
+            token_ids: vec![5],
+            values: vec![0.0],
+        }]);
+        merge_into_partial_state(&mut state, &mut last).unwrap();
+        assert!(state.top_logprobs.is_none());
+    }
+
     // ─── PartialRolloutState ────────────────────────────────────────────
 
     #[test]
@@ -451,6 +545,7 @@ mod tests {
         DrainedStreamResult {
             new_token_ids: tokens.to_vec(),
             new_logprobs: logprobs,
+            new_top_logprobs: None,
             new_routed_experts: routed_experts,
             finish_reason: finish_reason.to_owned(),
             complete,
@@ -524,8 +619,8 @@ mod tests {
     #[test]
     fn merge_tokens_no_logprobs() {
         let mut state = PartialRolloutState::default();
-        let drained = make_drained(&[10, 20, 30], None);
-        merge_into_partial_state(&mut state, &drained).unwrap();
+        let mut drained = make_drained(&[10, 20, 30], None);
+        merge_into_partial_state(&mut state, &mut drained).unwrap();
         assert_eq!(state.token_ids, vec![10, 20, 30]);
         assert!(state.logprobs.is_none());
         assert!(state.routed_experts.is_none());
@@ -536,14 +631,14 @@ mod tests {
         let mut state = PartialRolloutState::default();
 
         // Iteration 1 — with logprobs
-        let d1 = make_drained(&[1, 2], Some(vec![0.1, 0.2]));
-        merge_into_partial_state(&mut state, &d1).unwrap();
+        let mut d1 = make_drained(&[1, 2], Some(vec![0.1, 0.2]));
+        merge_into_partial_state(&mut state, &mut d1).unwrap();
         assert_eq!(state.token_ids, vec![1, 2]);
         assert_eq!(state.logprobs, Some(vec![0.1, 0.2]));
 
         // Iteration 2 — append
-        let d2 = make_drained(&[3, 4], Some(vec![0.3, 0.4]));
-        merge_into_partial_state(&mut state, &d2).unwrap();
+        let mut d2 = make_drained(&[3, 4], Some(vec![0.3, 0.4]));
+        merge_into_partial_state(&mut state, &mut d2).unwrap();
         assert_eq!(state.token_ids, vec![1, 2, 3, 4]);
         assert_eq!(state.logprobs, Some(vec![0.1, 0.2, 0.3, 0.4]));
     }
@@ -557,8 +652,8 @@ mod tests {
             ..PartialRolloutState::default()
         };
         // Second segment has no logprobs → drop the accumulated ones
-        let drained = make_drained(&[2], None);
-        merge_into_partial_state(&mut state, &drained).unwrap();
+        let mut drained = make_drained(&[2], None);
+        merge_into_partial_state(&mut state, &mut drained).unwrap();
         assert_eq!(state.token_ids, vec![1, 2]);
         assert!(state.logprobs.is_none());
     }
@@ -569,12 +664,12 @@ mod tests {
         let mut state = PartialRolloutState::default();
         assert_eq!(state.iteration_count, 0);
 
-        let d1 = make_drained(&[1], None);
-        merge_into_partial_state(&mut state, &d1).unwrap();
+        let mut d1 = make_drained(&[1], None);
+        merge_into_partial_state(&mut state, &mut d1).unwrap();
         assert_eq!(state.iteration_count, 1);
 
-        let d2 = make_drained(&[2], None);
-        merge_into_partial_state(&mut state, &d2).unwrap();
+        let mut d2 = make_drained(&[2], None);
+        merge_into_partial_state(&mut state, &mut d2).unwrap();
         assert_eq!(state.iteration_count, 2);
 
         // Token accumulation is also correct
@@ -587,10 +682,10 @@ mod tests {
         let mut state = PartialRolloutState::default();
         assert_eq!(state.response_token_count(), 0);
 
-        merge_into_partial_state(&mut state, &make_drained(&[10, 20], None)).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[10, 20], None)).unwrap();
         assert_eq!(state.response_token_count(), 2);
 
-        merge_into_partial_state(&mut state, &make_drained(&[30, 40, 50], None)).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[30, 40, 50], None)).unwrap();
         assert_eq!(state.response_token_count(), 5);
     }
 
@@ -598,8 +693,8 @@ mod tests {
     #[test]
     fn merge_initialises_logprobs_from_first_segment() {
         let mut state = PartialRolloutState::default();
-        let d = make_drained(&[1, 2], Some(vec![0.1, 0.2]));
-        merge_into_partial_state(&mut state, &d).unwrap();
+        let mut d = make_drained(&[1, 2], Some(vec![0.1, 0.2]));
+        merge_into_partial_state(&mut state, &mut d).unwrap();
         assert_eq!(state.logprobs, Some(vec![0.1, 0.2]));
     }
 
@@ -607,8 +702,8 @@ mod tests {
     #[test]
     fn merge_no_logprobs_stays_none() {
         let mut state = PartialRolloutState::default();
-        merge_into_partial_state(&mut state, &make_drained(&[1], None)).unwrap();
-        merge_into_partial_state(&mut state, &make_drained(&[2], None)).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[1], None)).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[2], None)).unwrap();
         assert!(state.logprobs.is_none());
     }
 
@@ -622,7 +717,7 @@ mod tests {
             iteration_count: 1,
             ..PartialRolloutState::default()
         };
-        merge_into_partial_state(&mut state, &make_drained(&[], None)).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[], None)).unwrap();
         assert_eq!(state.token_ids, vec![1, 2]);
         assert_eq!(state.logprobs, Some(vec![0.1, 0.2]));
     }
@@ -632,11 +727,12 @@ mod tests {
     #[test]
     fn merge_adopts_logprobs_after_tokenless_iterations() {
         let mut state = PartialRolloutState::default();
-        merge_into_partial_state(&mut state, &make_drained(&[], None)).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[], None)).unwrap();
         assert_eq!(state.iteration_count, 1);
         assert!(state.logprobs.is_none());
 
-        merge_into_partial_state(&mut state, &make_drained(&[1, 2], Some(vec![0.1, 0.2]))).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[1, 2], Some(vec![0.1, 0.2])))
+            .unwrap();
         assert_eq!(state.token_ids, vec![1, 2]);
         assert_eq!(state.logprobs, Some(vec![0.1, 0.2]));
     }
@@ -645,8 +741,8 @@ mod tests {
     #[test]
     fn merge_does_not_adopt_logprobs_over_unlogged_tokens() {
         let mut state = PartialRolloutState::default();
-        merge_into_partial_state(&mut state, &make_drained(&[1], None)).unwrap();
-        merge_into_partial_state(&mut state, &make_drained(&[2], Some(vec![0.9]))).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[1], None)).unwrap();
+        merge_into_partial_state(&mut state, &mut make_drained(&[2], Some(vec![0.9]))).unwrap();
         assert_eq!(state.token_ids, vec![1, 2]);
         assert!(state.logprobs.is_none());
     }
@@ -661,8 +757,8 @@ mod tests {
             ..PartialRolloutState::default()
         };
         let seg = make_re(3, 2, 4, 0xAA); // 3 tokens × 8 bytes
-        let d = make_drained_full(&[1, 2, 3], None, Some(seg.clone()), "abort");
-        merge_into_partial_state(&mut state, &d).unwrap();
+        let mut d = make_drained_full(&[1, 2, 3], None, Some(seg.clone()), "abort");
+        merge_into_partial_state(&mut state, &mut d).unwrap();
 
         let acc = state.routed_experts.as_ref().expect("accumulator seeded");
         assert_eq!(acc.num_tokens(), 3);
@@ -681,12 +777,12 @@ mod tests {
 
         merge_into_partial_state(
             &mut state,
-            &make_drained_full(&[1, 2], None, Some(s1), "abort"),
+            &mut make_drained_full(&[1, 2], None, Some(s1), "abort"),
         )
         .unwrap();
         merge_into_partial_state(
             &mut state,
-            &make_drained_full(&[3, 4, 5], None, Some(s2), "stop"),
+            &mut make_drained_full(&[3, 4, 5], None, Some(s2), "stop"),
         )
         .unwrap();
 
@@ -707,12 +803,12 @@ mod tests {
 
         merge_into_partial_state(
             &mut state,
-            &make_drained_full(&[1, 2], None, Some(s1), "abort"),
+            &mut make_drained_full(&[1, 2], None, Some(s1), "abort"),
         )
         .unwrap();
         let err = merge_into_partial_state(
             &mut state,
-            &make_drained_full(&[3, 4], None, Some(s2), "abort"),
+            &mut make_drained_full(&[3, 4], None, Some(s2), "abort"),
         )
         .unwrap_err();
         assert!(matches!(err, RoutedExpertsError::ShapeMismatch { .. }));
@@ -722,8 +818,8 @@ mod tests {
     #[test]
     fn re_early_abort_no_tokens_no_segment_is_ok() {
         let mut state = PartialRolloutState::default();
-        let d = make_drained_full(&[], None, None, "abort");
-        merge_into_partial_state(&mut state, &d).unwrap();
+        let mut d = make_drained_full(&[], None, None, "abort");
+        merge_into_partial_state(&mut state, &mut d).unwrap();
         assert!(state.routed_experts.is_none());
         assert_eq!(state.token_ids, Vec::<u32>::new());
     }
@@ -736,15 +832,18 @@ mod tests {
         // Iter 1: tokens but no RE (engine not yet capturing).  This is
         // legal at face value — the (None, None, tokens > 0) arm returns
         // Ok because the engine simply isn't producing RE.
-        merge_into_partial_state(&mut state, &make_drained_full(&[1, 2], None, None, "abort"))
-            .unwrap();
+        merge_into_partial_state(
+            &mut state,
+            &mut make_drained_full(&[1, 2], None, None, "abort"),
+        )
+        .unwrap();
         // Iter 2: a segment arrives — but prior tokens are already in
         // state.token_ids → LateArrival, because the prompt segment
         // covering iter 1 is permanently lost.
         let s = make_re(2, 1, 1, 0xFF);
         let err = merge_into_partial_state(
             &mut state,
-            &make_drained_full(&[3, 4], None, Some(s), "stop"),
+            &mut make_drained_full(&[3, 4], None, Some(s), "stop"),
         )
         .unwrap_err();
         assert!(matches!(err, RoutedExpertsError::LateArrival { .. }));
@@ -757,12 +856,14 @@ mod tests {
         let s = make_re(2, 1, 1, 0x10);
         merge_into_partial_state(
             &mut state,
-            &make_drained_full(&[1, 2], None, Some(s), "abort"),
+            &mut make_drained_full(&[1, 2], None, Some(s), "abort"),
         )
         .unwrap();
-        let err =
-            merge_into_partial_state(&mut state, &make_drained_full(&[3, 4], None, None, "stop"))
-                .unwrap_err();
+        let err = merge_into_partial_state(
+            &mut state,
+            &mut make_drained_full(&[3, 4], None, None, "stop"),
+        )
+        .unwrap_err();
         assert!(matches!(err, RoutedExpertsError::MissingSegment { .. }));
     }
 
@@ -772,8 +873,11 @@ mod tests {
     #[test]
     fn re_no_segments_no_accumulator_is_ok() {
         let mut state = PartialRolloutState::default();
-        merge_into_partial_state(&mut state, &make_drained_full(&[1, 2], None, None, "stop"))
-            .unwrap();
+        merge_into_partial_state(
+            &mut state,
+            &mut make_drained_full(&[1, 2], None, None, "stop"),
+        )
+        .unwrap();
         assert!(state.routed_experts.is_none());
     }
 

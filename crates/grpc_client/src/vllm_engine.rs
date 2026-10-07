@@ -366,8 +366,12 @@ impl VllmEngineClient {
 
         // Forward return_logprob to vLLM's SamplingParams.logprobs so the engine
         // actually computes per-token log probabilities during generation.
-        if body.return_logprob.unwrap_or(false) {
-            sampling_params.logprobs = Some(body.top_logprobs_num.unwrap_or(0));
+        // Score-centering capture needs a wider head than the caller's surfaced
+        // alternatives, so request the max of the two.
+        let response_width = body.top_logprobs_num.unwrap_or(0);
+        let capture_width = body.sampler_top_logprobs.unwrap_or(0) as i32;
+        if body.return_logprob.unwrap_or(false) || capture_width > 0 {
+            sampling_params.logprobs = Some(response_width.max(capture_width));
         }
 
         let grpc_request = proto::GenerateRequest {
@@ -444,8 +448,17 @@ impl VllmEngineClient {
 
         // Map logprobs: if request.logprobs is true, use top_logprobs value (or 1 if not specified)
         // OpenAI API only exposes output logprobs, not prompt logprobs, for chat completions
-        let logprobs = if request.logprobs {
-            Some(request.top_logprobs.unwrap_or(1).min(20) as i32)
+        let capture_width = request.sampler_top_logprobs.unwrap_or(0);
+        let logprobs = if request.logprobs || capture_width > 0 {
+            let response_width = if request.logprobs {
+                request.top_logprobs.unwrap_or(1)
+            } else {
+                0
+            };
+            Some(
+                i32::try_from(response_width.max(capture_width))
+                    .map_err(|_| "top_logprobs exceeds i32")?,
+            )
         } else {
             None
         };
@@ -949,6 +962,27 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampler_capture_is_independent_of_response_width() {
+        let request = ChatCompletionRequest {
+            logprobs: true,
+            top_logprobs: Some(0),
+            sampler_top_logprobs: Some(129),
+            ..Default::default()
+        };
+        let params =
+            VllmEngineClient::build_grpc_sampling_params_from_chat(&request, None).unwrap();
+        assert_eq!(params.logprobs, Some(129));
+        let request = ChatCompletionRequest {
+            sampler_top_logprobs: None,
+            top_logprobs: Some(128),
+            ..request
+        };
+        let params =
+            VllmEngineClient::build_grpc_sampling_params_from_chat(&request, None).unwrap();
+        assert_eq!(params.logprobs, Some(128));
+    }
 
     #[test]
     fn test_proto_types_compilation() {

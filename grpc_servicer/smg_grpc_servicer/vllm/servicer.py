@@ -7,7 +7,6 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 
 import asyncio
 import hashlib
-import itertools
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -1394,12 +1393,31 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         logprob_entry: dict,
         num_top_logprobs: int | None,
     ) -> vllm_engine_pb2.TopLogProbs:
-        """Build TopLogProbs proto from a logprob entry dict."""
+        """Build TopLogProbs proto from a logprob entry dict.
+
+        Filters to entries with ``rank <= num_top_logprobs`` so the wire row is exactly
+        ``num_top_logprobs`` columns wide (the engine returns one extra column for the sampled token,
+        which is deduplicated when it also appears in the top-k). ``num_top_logprobs`` is the caller's
+        capture width; see the trainer's ``capture_width`` for the authoritative definition.
+        """
         top = vllm_engine_pb2.TopLogProbs()
         if num_top_logprobs and num_top_logprobs > 0 and logprob_entry:
-            for tid, lp in itertools.islice(logprob_entry.items(), num_top_logprobs):
-                top.token_ids.append(tid)
-                top.values.append(lp.logprob)
+            # No sorting here: this runs in Python once per generated position, so an O(k log k)
+            # sort per position is a real capture-path hotspot. Ordering is canonicalized downstream
+            # in Rust (the TITO path in `extract_turn_record`, the /generate head in
+            # `encode_sampler_topk_for_response`).
+            entries = [
+                (tid, lp.logprob)
+                for tid, lp in logprob_entry.items()
+                # The sampled token is inserted first and can be outside the requested head.
+                if lp.rank is not None and lp.rank <= num_top_logprobs
+            ]
+            if entries:
+                # One bulk constructor fill beats per-element `.append` (which is a Python call each).
+                return vllm_engine_pb2.TopLogProbs(
+                    token_ids=[tid for tid, _ in entries],
+                    values=[logprob for _, logprob in entries],
+                )
         return top
 
     @staticmethod
@@ -1466,19 +1484,25 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if not logprobs:
             return None
 
-        proto = vllm_engine_pb2.OutputLogProbs()
+        rows = [
+            (token_id, logprob_entry[token_id], logprob_entry)
+            for token_id, logprob_entry in zip(token_ids, logprobs)
+            if token_id in logprob_entry
+        ]
+        if not rows:
+            return None
 
-        for token_id, logprob_entry in zip(token_ids, logprobs):
-            if logprob := logprob_entry.get(token_id):
-                proto.token_logprobs.append(logprob.logprob)
-                proto.token_ids.append(token_id)
-
-                if num_top_logprobs:
-                    proto.top_logprobs.append(
-                        VllmEngineServicer._build_top_logprobs(logprob_entry, num_top_logprobs)
-                    )
-
-        return proto if proto.token_ids else None
+        # Bulk constructor fill for the two scalar fields (one C-level call each) instead of a Python
+        # `.append` per element; the per-position alternatives are still one message each.
+        proto = vllm_engine_pb2.OutputLogProbs(
+            token_logprobs=[logprob.logprob for _, logprob, _ in rows],
+            token_ids=[token_id for token_id, _, _ in rows],
+        )
+        if num_top_logprobs:
+            proto.top_logprobs.extend(
+                VllmEngineServicer._build_top_logprobs(entry, num_top_logprobs) for _, _, entry in rows
+            )
+        return proto
 
     @staticmethod
     def _build_input_logprobs(

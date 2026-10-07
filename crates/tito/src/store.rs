@@ -148,6 +148,9 @@ impl SessionState {
 pub struct TurnRecord {
     pub prompt_token_count: usize,
     pub output_logprobs: Option<Vec<(f32, u32)>>,
+    pub sampler_capture_width: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampler_distribution: Option<crate::SamplerDistribution>,
     pub finish_reason: String,
     pub mismatch_report: Vec<MismatchEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -813,10 +816,7 @@ impl TitoStore {
     ) -> Option<PrefixHash> {
         let last_asst = messages.iter().rposition(is_assistant_role)?;
         let second_last_asst = messages[..last_asst].iter().rposition(is_assistant_role)?;
-        Some(self.hash_messages_with_context(
-            &messages[..=second_last_asst],
-            render_context,
-        ))
+        Some(self.hash_messages_with_context(&messages[..=second_last_asst], render_context))
     }
 
     /// Store token IDs for a completed generation using caller-supplied hashes.
@@ -957,10 +957,14 @@ impl TitoStore {
                         .reusable_prefix_token_ids
                         .as_deref()
                         .unwrap_or(&parent.token_ids);
-                    let new_ids: &[u32] = token_ids.reusable.as_deref().unwrap_or(&token_ids.expanded);
+                    let new_ids: &[u32] =
+                        token_ids.reusable.as_deref().unwrap_or(&token_ids.expanded);
                     let max_trim = state.max_trim_tokens;
                     let check_len = prev.len().saturating_sub(max_trim);
-                    if check_len > 0 && new_ids.len() >= check_len && &new_ids[..check_len] != &prev[..check_len] {
+                    if check_len > 0
+                        && new_ids.len() >= check_len
+                        && &new_ids[..check_len] != &prev[..check_len]
+                    {
                         let first = prev[..check_len]
                             .iter()
                             .zip(&new_ids[..check_len])
@@ -1409,7 +1413,10 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
         leaves.push(TitoLeafMeta {
             trajectory_id: *trajectory_id,
             node_id: leaf_id,
-            parent: nodes.iter().find(|n| n.id == leaf_id).and_then(|n| n.parent),
+            parent: nodes
+                .iter()
+                .find(|n| n.id == leaf_id)
+                .and_then(|n| n.parent),
             path_node_ids,
         });
     }
@@ -1527,6 +1534,8 @@ mod tests {
         TurnRecord {
             prompt_token_count,
             output_logprobs: None,
+            sampler_capture_width: 0,
+            sampler_distribution: None,
             finish_reason: finish_reason.to_string(),
             mismatch_report: vec![],
             routed_experts: None,
@@ -1954,7 +1963,13 @@ mod tests {
         assert!(single["trajectories"][0].get("turn_records").is_none());
         assert_eq!(single["tree"]["leaves"].as_array().unwrap().len(), 1);
         assert_eq!(single["tree"]["nodes"][0]["stored"], true);
-        assert_eq!(single["tree"]["leaves"][0]["path_node_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            single["tree"]["leaves"][0]["path_node_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         let multi_store = make_store();
         multi_store.create_session("multi");
@@ -2149,6 +2164,8 @@ mod tests {
                 TurnRecord {
                     prompt_token_count: 42,
                     output_logprobs: Some(vec![(-0.5, 100), (-1.2, 200)]),
+                    sampler_capture_width: 0,
+                    sampler_distribution: None,
                     finish_reason: "stop".to_string(),
                     mismatch_report: vec![MismatchEntry {
                         mismatch_type: "token_diff".to_string(),
@@ -2561,7 +2578,15 @@ mod tests {
 
         let parent_hash: PrefixHash = [1u8; 32];
         store
-            .store_with_hashes("s", parent_hash, None, vec![10, 20, 30], record(3, "stop"), 0, false)
+            .store_with_hashes(
+                "s",
+                parent_hash,
+                None,
+                vec![10, 20, 30],
+                record(3, "stop"),
+                0,
+                false,
+            )
             .unwrap();
 
         // Clean extension: the new checkpoint re-emits the truncated turn's
@@ -2601,7 +2626,10 @@ mod tests {
         // points at the clean-extension leaf, not the divergent node.
         let trajectories = store.get_all_trajectories("s");
         assert_eq!(trajectories.len(), 1);
-        assert_eq!(trajectories[0].accumulated_token_ids, vec![10, 20, 30, 151645, 198]);
+        assert_eq!(
+            trajectories[0].accumulated_token_ids,
+            vec![10, 20, 30, 151645, 198]
+        );
     }
 
     #[test]
@@ -2726,6 +2754,8 @@ mod tests {
         let record = TurnRecord {
             prompt_token_count: 3,
             output_logprobs: None,
+            sampler_capture_width: 0,
+            sampler_distribution: None,
             finish_reason: "stop".to_string(),
             mismatch_report: Vec::new(),
             routed_experts: None,
@@ -2752,6 +2782,8 @@ mod dead_leaf_tests {
             turn_record: TurnRecord {
                 prompt_token_count: 0,
                 output_logprobs: None,
+                sampler_capture_width: 0,
+                sampler_distribution: None,
                 finish_reason: "stop".to_string(),
                 mismatch_report: vec![],
                 routed_experts: None,

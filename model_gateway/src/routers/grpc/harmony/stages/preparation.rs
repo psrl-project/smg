@@ -58,6 +58,14 @@ impl PipelineStage for HarmonyPreparationStage {
 
         if is_chat {
             let request_arc = ctx.chat_request_arc();
+            // Harmony has no TITO turn-record capture, so a sampler-capture request would silently
+            // produce no training distribution; reject it explicitly instead.
+            if request_arc.sampler_top_logprobs.unwrap_or(0) > 0 {
+                return Err(error::bad_request(
+                    "harmony_sampler_capture_unsupported",
+                    "Sampler capture (sampler_top_logprobs) is not supported for Harmony models",
+                ));
+            }
             // Reject ignore_eos for Harmony models: Harmony requires EOS-based stop tokens
             // to produce well-formed output. When ignore_eos is true, some backends skip all
             // stop token checks, causing the Harmony parser to receive malformed token sequences.
@@ -70,6 +78,12 @@ impl PipelineStage for HarmonyPreparationStage {
             self.prepare_chat(ctx, &request_arc)?;
         } else if is_responses {
             let request_arc = ctx.responses_request_arc();
+            if request_arc.sampler_top_logprobs.unwrap_or(0) > 0 {
+                return Err(error::bad_request(
+                    "harmony_sampler_capture_unsupported",
+                    "Sampler capture (sampler_top_logprobs) is not supported for Harmony models",
+                ));
+            }
             self.prepare_responses(ctx, &request_arc)?;
         } else {
             error!(

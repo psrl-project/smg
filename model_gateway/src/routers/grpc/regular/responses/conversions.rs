@@ -249,6 +249,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         parallel_tool_calls: req.parallel_tool_calls,
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
+        sampler_top_logprobs: req.sampler_top_logprobs,
         skip_special_tokens: true,
         tools,
         tool_choice: req.tool_choice.as_ref().map(|tc| tc.to_chat_tool_choice()),

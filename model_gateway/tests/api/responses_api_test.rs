@@ -74,6 +74,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -276,6 +277,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -419,6 +421,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -553,6 +556,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("search something private".to_string()),
         instructions: Some("Use tools when relevant.".to_string()),
@@ -698,6 +702,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
     });
 
     let req1 = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -753,6 +758,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         .to_string();
 
     let req2 = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("Summarize that in five words".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -867,6 +873,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("search something private".to_string()),
         instructions: Some("Use tools when relevant.".to_string()),
@@ -1015,6 +1022,7 @@ async fn test_conversations_crud_basic() {
 #[test]
 fn test_responses_request_creation() {
     let request = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("Hello, world!".to_string()),
         instructions: Some("Be helpful".to_string()),
@@ -1068,6 +1076,7 @@ fn test_responses_request_creation() {
 fn test_responses_request_sglang_extensions() {
     // Test that SGLang-specific sampling parameters are present and serializable
     let request = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("Test".to_string()),
         instructions: None,
@@ -1209,6 +1218,7 @@ fn test_reasoning_param_default() {
 #[test]
 fn test_json_serialization() {
     let request = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("Test input".to_string()),
         instructions: Some("Test instructions".to_string()),
@@ -1318,6 +1328,7 @@ async fn test_multi_turn_loop_with_mcp() {
 
     // Build request with MCP tools
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("search for SGLang".to_string()),
         instructions: Some("Be helpful".to_string()),
@@ -1481,6 +1492,7 @@ async fn test_max_tool_calls_limit() {
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("test max calls".to_string()),
         instructions: None,
@@ -1671,6 +1683,7 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     // Build streaming request with MCP tools
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("search for something interesting".to_string()),
         instructions: Some("Use tools when needed".to_string()),
@@ -1959,6 +1972,7 @@ async fn test_streaming_multi_turn_with_mcp() {
     let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
 
     let req = ResponsesRequest {
+        sampler_top_logprobs: None,
         include: None,
         input: ResponseInput::Text("complex query requiring multiple tool calls".to_string()),
         instructions: Some("Be thorough".to_string()),

@@ -236,9 +236,13 @@ pub struct ChatCompletionRequest {
     /// A list of tools the model may call
     pub tools: Option<Vec<Tool>>,
 
-    /// An integer between 0 and 20 specifying the number of most likely tokens to return
-    #[validate(range(min = 0, max = 20))]
+    /// Number of most likely tokens to return, subject to the engine capture limit.
+    #[validate(range(min = 0, max = 2147483647))]
     pub top_logprobs: Option<u32>,
+
+    /// Capture sampler alternatives in TITO without adding them to the chat response.
+    #[validate(range(min = 0, max = 2147483647))]
+    pub sampler_top_logprobs: Option<u32>,
 
     /// An alternative to sampling with temperature
     #[validate(custom(function = "validate_top_p_value"))]
@@ -376,6 +380,12 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::Validati
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
 ) -> Result<(), validator::ValidationError> {
+    if req.sampler_top_logprobs.unwrap_or(0) > 0 && (req.stream || req.n.unwrap_or(1) != 1) {
+        let mut error = validator::ValidationError::new("invalid_sampler_capture_mode");
+        error.message = Some("Sampler capture requires one non-streaming completion".into());
+        return Err(error);
+    }
+
     // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
         let mut e = validator::ValidationError::new("top_logprobs_requires_logprobs");

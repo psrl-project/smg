@@ -1234,6 +1234,7 @@ pub struct ProtoInputLogProbs {
 /// Convert TRT-LLM TokenLogprob slice to unified ProtoOutputLogProbs.
 fn convert_trtllm_output_logprobs(
     logprobs: &[trtllm::TokenLogprob],
+    include_top_logprobs: bool,
 ) -> Option<ProtoOutputLogProbs> {
     if logprobs.is_empty() {
         return None;
@@ -1241,33 +1242,39 @@ fn convert_trtllm_output_logprobs(
     Some(ProtoOutputLogProbs {
         token_logprobs: logprobs.iter().map(|lp| lp.logprob).collect(),
         token_ids: logprobs.iter().map(|lp| lp.token_id).collect(),
-        top_logprobs: logprobs
-            .iter()
-            .map(|lp| ProtoTopLogProbs {
-                values: lp.top_logprobs.iter().map(|t| t.logprob).collect(),
-                token_ids: lp.top_logprobs.iter().map(|t| t.token_id).collect(),
-            })
-            .collect(),
+        top_logprobs: if include_top_logprobs {
+            logprobs
+                .iter()
+                .map(|lp| ProtoTopLogProbs {
+                    values: lp.top_logprobs.iter().map(|t| t.logprob).collect(),
+                    token_ids: lp.top_logprobs.iter().map(|t| t.token_id).collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
 }
 
 /// Helper macro to convert output logprobs from proto types to unified type.
 /// Both SGLang and vLLM have identical OutputLogProbs structure.
-/// Note: Cloning is necessary as we convert from borrowed proto types to owned unified types.
-/// OOM risk is mitigated by capping top_logprobs at 20 in sampling params.
+/// Sample-only responses skip copying the captured alternatives.
 macro_rules! convert_output_logprobs {
-    ($lp:expr) => {
+    ($lp:expr, $include_top:expr) => {
         ProtoOutputLogProbs {
             token_logprobs: $lp.token_logprobs.clone(),
             token_ids: $lp.token_ids.clone(),
-            top_logprobs: $lp
-                .top_logprobs
-                .iter()
-                .map(|t| ProtoTopLogProbs {
-                    values: t.values.clone(),
-                    token_ids: t.token_ids.clone(),
-                })
-                .collect(),
+            top_logprobs: if $include_top {
+                $lp.top_logprobs
+                    .iter()
+                    .map(|t| ProtoTopLogProbs {
+                        values: t.values.clone(),
+                        token_ids: t.token_ids.clone(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     };
 }
@@ -1799,25 +1806,25 @@ impl ProtoGenerateStreamChunk {
     }
 
     /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
+    pub fn output_logprobs(&self, include_top_logprobs: bool) -> Option<ProtoOutputLogProbs> {
         match self {
             Self::Sglang(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(|lp| convert_output_logprobs!(lp, include_top_logprobs)),
             Self::Vllm(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
+                .map(|lp| convert_output_logprobs!(lp, include_top_logprobs)),
+            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs, include_top_logprobs),
             Self::Mlx(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(|lp| convert_output_logprobs!(lp, include_top_logprobs)),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(|lp| convert_output_logprobs!(lp, include_top_logprobs)),
         }
     }
 
@@ -2105,15 +2112,12 @@ impl ProtoGenerateComplete {
     ///   `num_tokens() == (prompt_len - first_iter_prompt_start) + token_ids.len() - 1`
     ///   On violation returns `Err(RoutedExpertsError::AlignmentMismatch)`.
     ///
-    /// `top_logprobs` is reset to per-position empty entries because the
-    /// partial-rollout drain only retains per-sample `(logprob, token_id)`
-    /// pairs; clients requesting top-k alternatives from a multi-iteration
-    /// rollout will see empty alternatives, which is consistent with the
-    /// information actually available end-to-end.
+    /// Sampler rows remain position-parallel across every loopback segment.
     pub fn set_partial_rollout_outputs(
         &mut self,
         token_ids: Vec<u32>,
         logprobs: Option<Vec<f32>>,
+        top_logprobs: Option<Vec<ProtoTopLogProbs>>,
         routed_experts: Option<ProtoRoutedExperts>,
         prompt_len: u32,
         first_iter_prompt_start: u32,
@@ -2126,37 +2130,70 @@ impl ProtoGenerateComplete {
 
         if let Some(token_logprobs) = token_logprobs {
             let token_ids_for_logprobs = token_ids.clone();
-            let top_logprobs_len = token_ids_for_logprobs.len();
+            let top_logprobs = top_logprobs
+                .filter(|rows| rows.len() == completion_len)
+                .unwrap_or_default();
             match self {
                 Self::Sglang(c) => {
                     c.output_logprobs = Some(sglang::OutputLogProbs {
                         token_logprobs,
                         token_ids: token_ids_for_logprobs,
-                        top_logprobs: vec![sglang::TopLogProbs::default(); top_logprobs_len],
+                        top_logprobs: top_logprobs
+                            .into_iter()
+                            .map(|row| sglang::TopLogProbs {
+                                values: row.values,
+                                token_ids: row.token_ids,
+                            })
+                            .collect(),
                     });
                 }
                 Self::Vllm(c) => {
                     c.output_logprobs = Some(vllm::OutputLogProbs {
                         token_logprobs,
                         token_ids: token_ids_for_logprobs,
-                        top_logprobs: vec![vllm::TopLogProbs::default(); top_logprobs_len],
+                        top_logprobs: top_logprobs
+                            .into_iter()
+                            .map(|row| vllm::TopLogProbs {
+                                values: row.values,
+                                token_ids: row.token_ids,
+                            })
+                            .collect(),
                     });
                 }
                 Self::Mlx(c) => {
                     c.output_logprobs = Some(mlx::OutputLogProbs {
                         token_logprobs,
                         token_ids: token_ids_for_logprobs,
-                        top_logprobs: vec![mlx::TopLogProbs::default(); top_logprobs_len],
+                        top_logprobs: top_logprobs
+                            .into_iter()
+                            .map(|row| mlx::TopLogProbs {
+                                values: row.values,
+                                token_ids: row.token_ids,
+                            })
+                            .collect(),
                     });
                 }
                 Self::Trtllm(c) => {
                     c.logprobs = token_ids_for_logprobs
                         .into_iter()
                         .zip(token_logprobs)
-                        .map(|(token_id, logprob)| trtllm::TokenLogprob {
+                        .enumerate()
+                        .map(|(index, (token_id, logprob))| trtllm::TokenLogprob {
                             token_id,
                             logprob,
-                            top_logprobs: vec![],
+                            top_logprobs: top_logprobs
+                                .get(index)
+                                .map(|row| {
+                                    row.token_ids
+                                        .iter()
+                                        .zip(&row.values)
+                                        .map(|(&token_id, &logprob)| trtllm::TopLogprob {
+                                            token_id,
+                                            logprob,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         })
                         .collect();
                 }
@@ -2289,25 +2326,25 @@ impl ProtoGenerateComplete {
     }
 
     /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
+    pub fn output_logprobs(&self, include_top_logprobs: bool) -> Option<ProtoOutputLogProbs> {
         match self {
             Self::Sglang(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(|lp| convert_output_logprobs!(lp, include_top_logprobs)),
             Self::Vllm(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
+                .map(|lp| convert_output_logprobs!(lp, include_top_logprobs)),
+            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs, include_top_logprobs),
             Self::Mlx(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(|lp| convert_output_logprobs!(lp, include_top_logprobs)),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(|lp| convert_output_logprobs!(lp, include_top_logprobs)),
         }
     }
 

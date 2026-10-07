@@ -3,6 +3,7 @@ pub mod error;
 pub mod harness;
 pub mod model_adapter;
 pub mod normalizer;
+pub mod sampler_distribution;
 pub mod store;
 pub mod validator;
 
@@ -26,3 +27,5 @@ pub const TITO_SESSION_HEADER: &str = "x-smg-tito-session-id";
 ///
 /// Used by the manual strategy and defaults to 0 when absent.
 pub const TITO_TRAJECTORY_ID_HEADER: &str = "x-smg-tito-trajectory-id";
+
+pub use sampler_distribution::SamplerDistribution;
