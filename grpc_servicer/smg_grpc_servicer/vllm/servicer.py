@@ -407,9 +407,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
 
             # Build sampling params with detokenize=False
+            # NOTE: only inject the version tag when LMCache is actually enabled.
+            # Otherwise every request gets a non-empty extra_args["kv_transfer_params"]
+            # even though no KVConnector is configured on this engine, which makes
+            # vLLM log "Got kv_transfer_params, but no KVConnector found" for every
+            # single request (see vllm/v1/engine/core.py EngineCore.add_request).
             _version_tag = (
                 str(self.kv_cache_manager.current_version)
                 if self.kv_cache_manager is not None
+                and getattr(self.kv_cache_manager.config, "enable", False)
                 and getattr(self.kv_cache_manager.config, "multi_version_kv", False)
                 else None
             )
@@ -634,7 +640,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request_ids = request.request_ids
         logger.info("Abort requests: %s", request_ids)
 
-        await self.engine.abort(request_ids)
+        # NOTE: the preemption subscriber forwards scheduler internal request
+        # IDs (request.request_id, which carries the random UUID suffix added
+        # by InputProcessor.assign_request_id), not the external client IDs.
+        # internal=True makes output_processor.abort_requests look them up in
+        # request_states (keyed by internal ID) so a finish_reason=abort output
+        # is produced on the Generate stream and the gateway loopback fires.
+        await self.engine.abort(request_ids, internal=True)
         return vllm_engine_pb2.AbortResponse()
 
     async def GetModelInfo(

@@ -29,7 +29,7 @@
 //! misalignments / late-arrival / shape changes are bug paths
 //! and surface as fail-hard `RoutedExpertsError`.
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::routers::grpc::{
     context::RequestContext,
@@ -129,6 +129,13 @@ pub(crate) struct PartialRolloutState {
     /// Incremented by `merge_into_partial_state` on each `"abort"` cycle.
     /// At completion this equals the number of PS weight-sync interruptions.
     pub iteration_count: u32,
+    /// The caller's generation cap, captured once at iteration 1.
+    ///
+    /// A loopback folds the accumulated output into the prompt, so each
+    /// continuation must be charged `original_max_tokens - tokens_produced`
+    /// rather than the original cap, which was sized for a sequence that had
+    /// generated nothing. `None` when the caller set no cap.
+    pub original_max_tokens: Option<u32>,
 
     // ─── Routed-experts metadata (immutable across loopback) ───────────
     /// Original prompt length at iter 1 dispatch time, before any loopback
@@ -154,6 +161,7 @@ impl Default for PartialRolloutState {
             logprobs: None,
             routed_experts: None,
             iteration_count: 0,
+            original_max_tokens: None,
             prompt_len: 0,
             first_iter_prompt_start: 0,
             expected_final_re_bytes: 0,
@@ -165,6 +173,17 @@ impl PartialRolloutState {
     #[inline]
     pub fn response_token_count(&self) -> usize {
         self.token_ids.len()
+    }
+
+    /// Tokens the next continuation may generate, or `None` when uncapped.
+    ///
+    /// The loopback folds everything produced so far into the prompt, so the
+    /// caller's cap has to be reduced by that much. Reusing the original cap
+    /// would grant a second near-full budget and the trajectory would run past
+    /// the response limit the caller asked for.
+    pub fn remaining_max_tokens(&self) -> Option<u32> {
+        self.original_max_tokens
+            .map(|original| original.saturating_sub(self.response_token_count() as u32))
     }
 }
 
@@ -338,7 +357,16 @@ pub(crate) fn merge_into_partial_state(
 /// `request_building` consumes the live `preparation` via `.take()`, so
 /// without this restore the next iteration's `worker_selection` would
 /// observe `None` and abort the pipeline with `preparation_stage_not_completed`.
-pub(crate) fn reset_ctx_for_loopback(ctx: &mut RequestContext) {
+///
+/// The restored prompt is then **extended with the tokens accumulated so far**,
+/// so the next iteration continues the sequence instead of generating it again
+/// from the original prompt. The snapshot is taken before any generation, so
+/// restoring it alone would discard every token produced before the abort: the
+/// engine would re-decode the whole response under the new weights and the
+/// earlier work would be thrown away. `state.token_ids` already holds the
+/// accumulated output (appended by `merge_into_partial_state`), which is
+/// exactly the continuation prefix the next iteration needs.
+pub(crate) fn reset_ctx_for_loopback(ctx: &mut RequestContext, state: &PartialRolloutState) {
     ctx.state.workers = None;
     ctx.state.clients = None;
     ctx.state.execution_plan = None;
@@ -347,6 +375,23 @@ pub(crate) fn reset_ctx_for_loopback(ctx: &mut RequestContext) {
     // Restore preparation from the snapshot for the next iteration's
     // worker_selection + request_building.
     ctx.state.preparation = ctx.state.preparation_snapshot.clone();
+    // Continue the sequence: prompt + everything generated so far.
+    if let Some(preparation) = ctx.state.preparation.as_mut() {
+        let prompt_only = preparation.token_ids().len();
+        preparation.token_ids_mut().extend_from_slice(&state.token_ids);
+        // Emitted on the `route_trace` target so it lands beside the route/pop
+        // events a loopback produces, making the continuation verifiable from
+        // the logs rather than only by inference.
+        info!(
+            target: "route_trace",
+            event = "loopback_prompt",
+            prompt_only_tokens = prompt_only,
+            accumulated_tokens = state.token_ids.len(),
+            continued_prompt_tokens = preparation.token_ids().len(),
+            iteration_count = state.iteration_count,
+            "loopback prompt extended with accumulated output"
+        );
+    }
     // Clear only per-iteration response fields; keep preparation-stage
     // products (`stop_decoder`, `skip_special_tokens`) intact so the final
     // post-execution stage can use them after the last loopback iteration.
@@ -374,6 +419,64 @@ mod tests {
             ..PartialRolloutState::default()
         };
         assert_eq!(state.response_token_count(), 3);
+    }
+
+    // ─── remaining_max_tokens ───────────────────────────────────────────
+
+    #[test]
+    fn remaining_max_tokens_is_none_when_uncapped() {
+        let state = PartialRolloutState {
+            token_ids: vec![1, 2, 3],
+            ..PartialRolloutState::default()
+        };
+        assert_eq!(state.remaining_max_tokens(), None);
+    }
+
+    #[test]
+    fn remaining_max_tokens_subtracts_what_was_produced() {
+        let state = PartialRolloutState {
+            token_ids: vec![0; 6009],
+            original_max_tokens: Some(11110),
+            ..PartialRolloutState::default()
+        };
+        assert_eq!(state.remaining_max_tokens(), Some(11110 - 6009));
+    }
+
+    #[test]
+    fn remaining_max_tokens_saturates_at_zero() {
+        // A segment may overshoot the cap slightly; the next leg gets nothing
+        // rather than wrapping around to a huge budget.
+        let state = PartialRolloutState {
+            token_ids: vec![0; 12000],
+            original_max_tokens: Some(11110),
+            ..PartialRolloutState::default()
+        };
+        assert_eq!(state.remaining_max_tokens(), Some(0));
+    }
+
+    #[test]
+    fn remaining_max_tokens_never_exceeds_the_original_cap() {
+        // Summed across iterations, generation stays inside one budget.
+        let cap = 11110u32;
+        let mut produced = 0u32;
+        for _ in 0..8 {
+            let state = PartialRolloutState {
+                token_ids: vec![0; produced as usize],
+                original_max_tokens: Some(cap),
+                ..PartialRolloutState::default()
+            };
+            let granted = state.remaining_max_tokens().expect("capped");
+            if granted == 0 {
+                break;
+            }
+            // Take half the allowance so several iterations are exercised.
+            produced += (granted / 2).max(1);
+            assert!(
+                produced <= cap,
+                "produced {produced} exceeded the cap {cap}"
+            );
+        }
+        assert!(produced <= cap);
     }
 
     // ─── merge_into_partial_state ────────────────────────────────────────────
@@ -693,7 +796,8 @@ mod tests {
         // clear it so the next iteration starts clean.
         ctx.state.response.final_response = Some(FinalResponse::Generate(vec![]));
 
-        reset_ctx_for_loopback(&mut ctx);
+        // No tokens generated yet, so the restored prompt is the prompt alone.
+        reset_ctx_for_loopback(&mut ctx, &PartialRolloutState::default());
 
         // Preparation is restored from the snapshot for the next loopback
         // iteration's worker_selection + request_building.
@@ -735,6 +839,65 @@ mod tests {
         assert!(
             ctx.state.response.responses_iteration_result.is_none(),
             "responses_iteration_result must be cleared between iterations"
+        );
+    }
+
+    #[test]
+    fn reset_appends_accumulated_tokens_to_the_prompt() {
+        use std::sync::Arc;
+
+        use openai_protocol::chat::ChatCompletionRequest;
+        use reasoning_parser::ParserFactory as ReasoningParserFactory;
+        use tool_parser::ParserFactory as ToolParserFactory;
+
+        use crate::routers::grpc::context::{
+            PreparationOutput, ProcessingState, RequestContext, RequestInput, RequestType,
+            SharedComponents,
+        };
+
+        let components = Arc::new(SharedComponents {
+            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            configured_tool_parser: None,
+            multimodal: None,
+        });
+        let mut ctx = RequestContext {
+            input: RequestInput {
+                request_type: RequestType::Chat(Arc::new(ChatCompletionRequest::default())),
+                headers: None,
+                model_id: "test-model".to_string(),
+                tenant_request_meta: None,
+            },
+            components,
+            state: ProcessingState::default(),
+        };
+        ctx.state.preparation_snapshot = Some(PreparationOutput::Completion {
+            original_text: "prompt".to_string(),
+            token_ids: vec![1, 2, 3],
+        });
+
+        // Two tokens were generated before the abort.
+        let mut state = PartialRolloutState::default();
+        state.token_ids = vec![7, 8];
+
+        reset_ctx_for_loopback(&mut ctx, &state);
+
+        let PreparationOutput::Completion { token_ids, .. } = ctx
+            .state
+            .preparation
+            .as_ref()
+            .expect("preparation must survive loopback reset")
+        else {
+            panic!("expected Completion preparation output");
+        };
+        // The next iteration continues the sequence instead of regenerating it.
+        // Restoring the snapshot alone would leave [1, 2, 3] and throw away the
+        // tokens produced before the abort.
+        assert_eq!(
+            token_ids,
+            &[1, 2, 3, 7, 8],
+            "loopback prompt must be the original prompt plus the accumulated output"
         );
     }
 }

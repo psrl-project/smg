@@ -149,6 +149,12 @@ impl PipelineStage for RequestExecutionStage {
             Self::set_routed_experts_prompt_start(&mut execution_plan, prompt_start);
         }
 
+        // A loopback continuation may only generate what the caller's cap has
+        // left; the prompt already carries everything produced so far.
+        if let Some(remaining) = ctx.state.partial_rollout_overrides.remaining_max_tokens {
+            Self::cap_max_tokens(&mut execution_plan, remaining);
+        }
+
         let clients = ctx.state.clients.as_mut().ok_or_else(|| {
             error!(
                 function = "RequestExecutionStage::execute",
@@ -234,6 +240,17 @@ impl RequestExecutionStage {
             | ExecutionPlan::EncodePrefillDecode {
                 request: generate, ..
             } => generate.set_routed_experts_prompt_start(prompt_start),
+            ExecutionPlan::Single(ProtoRequest::Embed(_)) => {}
+        }
+    }
+
+    fn cap_max_tokens(execution_plan: &mut ExecutionPlan, remaining: u32) {
+        match execution_plan {
+            ExecutionPlan::Single(ProtoRequest::Generate(generate))
+            | ExecutionPlan::PrefillDecode(generate)
+            | ExecutionPlan::EncodePrefillDecode {
+                request: generate, ..
+            } => generate.cap_max_tokens(remaining),
             ExecutionPlan::Single(ProtoRequest::Embed(_)) => {}
         }
     }

@@ -852,6 +852,7 @@ async fn dispatch_entry_with_partial_rollout(
     let mut partial_state = ctx.state.partial_rollout_state.take().unwrap_or_default();
 
     if partial_state.iteration_count == 0 {
+        partial_state.original_max_tokens = ctx.input.request_type.max_tokens();
         partial_state.first_iter_prompt_start = ctx
             .state
             .partial_rollout_overrides
@@ -1137,7 +1138,7 @@ async fn dispatch_entry_with_partial_rollout(
 
             // Reset ctx for the next iteration (clears workers, clients,
             // execution_plan, dispatch, load_guards, and execution_result).
-            reset_ctx_for_loopback(&mut ctx);
+            reset_ctx_for_loopback(&mut ctx, &partial_state);
 
             // Inject the loopback `routed_experts_prompt_start` override
             // so the next iteration's vLLM `SamplingParams` only captures
@@ -1152,6 +1153,13 @@ async fn dispatch_entry_with_partial_rollout(
             ctx.state
                 .partial_rollout_overrides
                 .routed_experts_prompt_start = Some(prompt_start_next);
+
+            // Charge the continuation only what the caller's cap has left. The
+            // prompt now carries the accumulated output, so reusing the original
+            // cap would grant a second near-full budget and the trajectory would
+            // run past the response limit the caller asked for.
+            ctx.state.partial_rollout_overrides.remaining_max_tokens =
+                partial_state.remaining_max_tokens();
 
             // Inject loopback routing headers so that on the next iteration
             // `parse_routing_request_meta_from_context` picks up the hint.

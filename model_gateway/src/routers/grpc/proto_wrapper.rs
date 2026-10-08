@@ -1461,6 +1461,56 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Shrink the generation cap to `remaining`, leaving a smaller cap alone.
+    ///
+    /// A partial-rollout loopback re-sends the request with the accumulated
+    /// output folded into the prompt. The original cap was sized for a sequence
+    /// that had generated nothing, so reusing it hands the continuation a second
+    /// near-full budget and the trajectory runs past the caller's response
+    /// limit. Every backend names the field differently but means the same
+    /// thing: tokens this leg may still produce.
+    pub fn cap_max_tokens(&mut self, remaining: u32) {
+        match self {
+            Self::Vllm(req) => {
+                let params = req.sampling_params.get_or_insert_with(Default::default);
+                params.max_tokens = Some(match params.max_tokens {
+                    Some(current) => current.min(remaining),
+                    None => remaining,
+                });
+            }
+            Self::Sglang(req) => {
+                let params = req.sampling_params.get_or_insert_with(Default::default);
+                params.max_new_tokens = Some(match params.max_new_tokens {
+                    Some(current) => current.min(remaining),
+                    None => remaining,
+                });
+            }
+            Self::TokenSpeed(req) => {
+                let params = req.sampling_params.get_or_insert_with(Default::default);
+                params.max_new_tokens = Some(match params.max_new_tokens {
+                    Some(current) => current.min(remaining),
+                    None => remaining,
+                });
+            }
+            Self::Mlx(req) => {
+                let params = req.sampling_params.get_or_insert_with(Default::default);
+                params.max_tokens = Some(match params.max_tokens {
+                    Some(current) => current.min(remaining),
+                    None => remaining,
+                });
+            }
+            Self::Trtllm(req) => {
+                // trtllm carries the cap on the request itself, and 0 means
+                // "unset" rather than "generate nothing".
+                req.max_tokens = if req.max_tokens == 0 {
+                    remaining
+                } else {
+                    req.max_tokens.min(remaining)
+                };
+            }
+        }
+    }
+
     /// Clone the inner request (for passing to generate())
     pub fn clone_inner(&self) -> Self {
         self.clone()

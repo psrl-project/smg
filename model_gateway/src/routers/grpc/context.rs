@@ -104,6 +104,24 @@ impl RequestType {
             | Self::Messages(_) => 0,
         }
     }
+
+    /// The caller's generation cap, when the request carries one.
+    ///
+    /// Read once at the first partial-rollout iteration so a continuation can be
+    /// charged only what the cap has left. Only the vLLM-native request exposes
+    /// it in a form the routing loop sees; the OpenAI-shaped variants leave the
+    /// cap to the backend, so there is nothing to carve up here.
+    pub fn max_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Generate(req) => req.sampling_params.as_ref().and_then(|p| p.max_new_tokens),
+            Self::Chat(_)
+            | Self::Completion(_)
+            | Self::Responses(_)
+            | Self::Embedding(_)
+            | Self::Classify(_)
+            | Self::Messages(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for FinalResponse {
@@ -200,6 +218,13 @@ pub(crate) struct PartialRolloutOverrides {
     /// so vLLM does not re-capture RE for tokens already covered by prior
     /// iterations.
     pub routed_experts_prompt_start: Option<u32>,
+    /// Tokens the continuation may still generate, set by the abort branch to
+    /// `original_max_tokens - accumulator.num_tokens()`.
+    ///
+    /// The original cap was sized for a sequence that had generated nothing, so
+    /// reusing it on a loopback hands the continuation a second near-full budget
+    /// and the trajectory runs past the caller's response limit.
+    pub remaining_max_tokens: Option<u32>,
 }
 
 /// Execution shape produced by request building and consumed by request execution.
@@ -316,6 +341,22 @@ pub(crate) enum PreparationOutput {
 impl PreparationOutput {
     /// Token IDs (common to all variants)
     pub fn token_ids(&self) -> &[u32] {
+        match self {
+            Self::Chat { token_ids, .. }
+            | Self::Messages { token_ids, .. }
+            | Self::Completion { token_ids, .. }
+            | Self::Generate { token_ids, .. }
+            | Self::Embedding { token_ids, .. }
+            | Self::Harmony { token_ids, .. } => token_ids,
+        }
+    }
+
+    /// Mutable view of the prepared input tokens.
+    ///
+    /// Partial-rollout loopback appends the tokens generated before an abort so
+    /// the next iteration continues the sequence rather than restarting it. See
+    /// `routing_loop::partial_rollout::reset_ctx_for_loopback`.
+    pub fn token_ids_mut(&mut self) -> &mut Vec<u32> {
         match self {
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
