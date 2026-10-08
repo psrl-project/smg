@@ -19,7 +19,9 @@ use openai_protocol::{
 };
 use tracing::warn;
 
-use crate::routers::grpc::common::responses::utils::extract_tools_from_response_tools;
+use crate::routers::grpc::common::responses::utils::{
+    extract_tools_from_response_tools, flatten_namespace_tool_name, resolve_namespace_tool_name,
+};
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
 ///
@@ -84,6 +86,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                     ResponseInputOutputItem::FunctionToolCall {
                         call_id,
                         name,
+                        namespace,
                         arguments,
                         output,
                         ..
@@ -93,6 +96,10 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         let tool_call_id = call_id.clone();
 
                         // Add assistant message with tool_calls (the LLM's decision)
+                        let name = namespace.as_ref().map_or_else(
+                            || name.clone(),
+                            |namespace| flatten_namespace_tool_name(namespace, name),
+                        );
                         messages.push(ChatMessage::Assistant {
                             content: None,
                             name: None,
@@ -100,7 +107,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                                 id: tool_call_id.clone(),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
-                                    name: name.clone(),
+                                    name,
                                     arguments: Some(arguments.clone()),
                                 },
                             }]),
@@ -378,10 +385,15 @@ pub(crate) fn chat_to_responses(
     // Convert tool calls if present
     if let Some(tool_calls) = &choice.message.tool_calls {
         for tool_call in tool_calls {
+            let (name, namespace) = resolve_namespace_tool_name(
+                original_req.tools.as_deref(),
+                &tool_call.function.name,
+            );
             output.push(ResponseOutputItem::FunctionToolCall {
                 id: Some(tool_call.id.clone()),
                 call_id: tool_call.id.clone(),
-                name: tool_call.function.name.clone(),
+                name,
+                namespace,
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
                 output: None, // Tool hasn't been executed yet
                 status: "in_progress".to_string(),
@@ -485,6 +497,7 @@ mod tests {
                 id: Some("fc_item_id".to_string()),
                 call_id: "call_tool_id".to_string(),
                 name: "lookup".to_string(),
+                namespace: None,
                 arguments: "{\"q\":\"rust\"}".to_string(),
                 output: Some("done".to_string()),
                 status: Some("completed".to_string()),
@@ -509,6 +522,67 @@ mod tests {
             }
             other => panic!("expected tool message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_namespace_function_roundtrip_preserves_wire_identity() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "actor",
+            "input": "delegate",
+            "tools": [{
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Manage agents",
+                "tools": [{
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "description": "Spawn an agent",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }]
+        }))
+        .expect("valid namespace request");
+
+        let chat_req = responses_to_chat(&req).expect("namespace converts to Chat IR");
+        assert_eq!(
+            chat_req.tools.as_ref().expect("tool")[0].function.name,
+            "multi_agent_v1__spawn_agent"
+        );
+
+        let chat_resp: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl_namespace",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "actor",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "multi_agent_v1__spawn_agent",
+                            "arguments": "{\"task\":\"inspect\"}"
+                        }
+                    }],
+                    "reasoning_content": null
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("valid Chat response");
+        let response =
+            chat_to_responses(&chat_resp, &req, None).expect("Chat IR converts to Responses");
+        let ResponseOutputItem::FunctionToolCall {
+            name, namespace, ..
+        } = &response.output[0]
+        else {
+            panic!("expected function call output");
+        };
+        assert_eq!(name, "spawn_agent");
+        assert_eq!(namespace.as_deref(), Some("multi_agent_v1"));
     }
 
     #[test]

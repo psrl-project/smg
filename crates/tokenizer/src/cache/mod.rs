@@ -258,6 +258,10 @@ impl Decoder for CachedTokenizer {
 }
 
 impl Tokenizer for CachedTokenizer {
+    fn model_type(&self) -> Option<&str> {
+        self.inner.model_type()
+    }
+
     fn vocab_size(&self) -> usize {
         self.inner.vocab_size()
     }
@@ -299,6 +303,10 @@ impl Tokenizer for CachedTokenizer {
     }
     fn think_in_prefill(&self) -> bool {
         self.inner.think_in_prefill()
+    }
+
+    fn chat_template_is_position_dependent(&self) -> bool {
+        self.inner.chat_template_is_position_dependent()
     }
 
     fn eos_token_ids(&self) -> &[TokenIdType] {

@@ -152,9 +152,14 @@ pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), 
                 continue;
             };
 
-            // Parse JSON string to object (like Python json.loads)
+            // Parse JSON string to object (like Python json.loads), then
+            // canonicalize (sort keys) so the rendered tool-call block is
+            // order-independent.  This must match the TITO prefix hash, which
+            // also canonicalizes arguments — the model may emit arguments with
+            // one key order while Claude Code re-serializes the parsed `input`
+            // object with a different order on the next turn.
             match serde_json::from_str::<Value>(args_str) {
-                Ok(parsed) => *args = parsed,
+                Ok(parsed) => *args = super::message_utils::canonicalize_json_value(&parsed),
                 Err(e) => {
                     return Err(format!(
                         "Failed to parse tool call arguments as JSON: '{args_str}'. Error: {e}"
@@ -375,13 +380,21 @@ pub(crate) fn get_render_context_from_request(
     request: &ChatCompletionRequest,
     image_placeholder: Option<&str>,
 ) -> Result<RenderContext, String> {
+    // Canonicalize every tool and template kwarg so the RenderContext — and the
+    // rendered system header that carries the tools — is byte-identical across
+    // turns regardless of the client's JSON key order. TITO hashes the tools in
+    // native order; without canonicalization a HashMap-derived key-order change
+    // makes the prefix lookup miss on every turn (one new trajectory per turn).
     let tools_json: Option<Vec<Value>> = request
         .tools
         .as_ref()
         .map(|tools| {
             tools
                 .iter()
-                .map(serde_json::to_value)
+                .map(|tool| {
+                    serde_json::to_value(tool)
+                        .map(|v| super::message_utils::canonicalize_json_value(&v))
+                })
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()
@@ -399,7 +412,10 @@ pub(crate) fn get_render_context_from_request(
 
     if let Some(template_kwargs) = &request.chat_template_kwargs {
         for (key, value) in template_kwargs {
-            combined_template_kwargs.insert(key.clone(), value.clone());
+            combined_template_kwargs.insert(
+                key.clone(),
+                super::message_utils::canonicalize_json_value(value),
+            );
         }
     }
 

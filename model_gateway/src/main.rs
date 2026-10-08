@@ -857,6 +857,30 @@ struct CliArgs {
     )]
     trajectory_id_strategy: String,
 
+    /// Harness-specific tool-input canonicalizer applied while computing TITO
+    /// prefix hashes. `none` disables it; `claude_code` mirrors Claude Code's
+    /// `normalizeToolInput` (drops a redundant `cd <workdir> && ` prefix on
+    /// Bash and materializes the Edit `replace_all` default) so replayed,
+    /// normalized histories keep matching the stored prefix.
+    #[arg(
+        long,
+        default_value = "none",
+        value_parser = ["none", "claude_code"],
+        help_heading = "TITO"
+    )]
+    tito_tool_normalization: String,
+
+    /// Working directory the selected tool canonicalizer assumes commands run
+    /// from (used by `claude_code` to strip a redundant `cd <workdir> && `).
+    #[arg(long, default_value = "/testbed", help_heading = "TITO")]
+    tito_workdir: String,
+
+    /// Drop "dead" (rollback) leaves from TITO session snapshots so abandoned
+    /// branches that forked from a state the session later continued past are
+    /// never down-streamed as training data.
+    #[arg(long, default_value_t = false, help_heading = "TITO")]
+    tito_drop_dead_leaves: bool,
+
     // ==================== WebRTC ====================
     /// Bind address for WebRTC UDP sockets (client-facing ICE candidate IP).
     /// Default: 0.0.0.0 (auto-detect via routing table).
@@ -1650,6 +1674,9 @@ impl CliArgs {
                 .trajectory_id_strategy
                 .parse()
                 .map_err(|reason| ConfigError::ValidationFailed { reason })?,
+            tito_tool_normalization: self.tito_tool_normalization.clone(),
+            tito_workdir: self.tito_workdir.clone(),
+            tito_drop_dead_leaves: self.tito_drop_dead_leaves,
         })
     }
 }

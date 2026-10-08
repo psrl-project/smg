@@ -1518,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_image_matches_tensor_patchify_with_resize() {
+    fn test_preprocess_image_matches_transformers_patchify_with_resize() {
         let processor = QwenVLProcessorBase::new(create_video_test_config());
         let config = PreProcessorConfig {
             image_mean: Some(processor.default_mean().to_vec()),
@@ -1537,12 +1537,23 @@ mod tests {
             .unwrap();
         let actual = result.encoder_input.as_slice_memory_order().unwrap();
 
-        let resized = resize_bicubic_pil(&image, target_w as u32, target_h as u32);
-        let tensor = to_tensor_and_normalize(
-            &resized,
-            &processor.default_mean(),
-            &processor.default_std(),
-        );
+        // Image preprocessing follows Transformers' TorchvisionBackend. Its
+        // uint8-domain fused normalization has a deliberately different f32
+        // rounding order from the PIL/video path, so build the reference with
+        // that exact contract instead of accepting an arbitrary epsilon.
+        let resized = resize_bicubic_torchvision(&image, target_w as u32, target_h as u32);
+        let (width, height, raw) = rgb_bytes(&resized);
+        let mean = processor.default_mean();
+        let std = processor.default_std();
+        let inverse_rescale = (1.0_f64 / (1.0_f64 / 255.0)) as f32;
+        let fused_mean: [f32; 3] =
+            std::array::from_fn(|channel| mean[channel] as f32 * inverse_rescale);
+        let fused_std: [f32; 3] =
+            std::array::from_fn(|channel| std[channel] as f32 * inverse_rescale);
+        let tensor = Array3::from_shape_fn((3, height, width), |(channel, y, x)| {
+            let value = raw[(y * width + x) * 3 + channel] as f32;
+            (value - fused_mean[channel]) / fused_std[channel]
+        });
         let (grid_t, grid_h, grid_w) = processor.calculate_grid_thw(target_h, target_w, 1);
         let mut expected = Vec::new();
         processor

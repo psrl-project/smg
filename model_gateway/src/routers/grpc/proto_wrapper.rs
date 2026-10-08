@@ -1071,14 +1071,37 @@ pub struct ProtoRoutedExperts {
 }
 
 impl ProtoRoutedExperts {
-    /// Construct from the proto wire type.
-    /// Returns `None` if `dtype` is unrecognised or `data` is empty.
-    pub fn from_proto(p: &vllm::RoutedExpertsTensor) -> Option<Self> {
-        if p.data.is_empty() {
-            return None;
+    /// Construct and strictly validate the proto wire type.
+    pub fn from_proto(p: &vllm::RoutedExpertsTensor) -> Result<Self, RoutedExpertsError> {
+        let dtype = RoutedExpertsDtype::parse(&p.dtype).ok_or_else(|| {
+            RoutedExpertsError::MalformedPayload {
+                reason: format!("unsupported dtype {:?}", p.dtype),
+            }
+        })?;
+        if p.num_layers == 0 || p.top_k == 0 {
+            return Err(RoutedExpertsError::MalformedPayload {
+                reason: format!(
+                    "dimensions must be positive, got num_layers={} top_k={}",
+                    p.num_layers, p.top_k
+                ),
+            });
         }
-        let dtype = RoutedExpertsDtype::parse(&p.dtype)?;
-        Some(Self {
+        let token_bytes = (p.num_layers as usize)
+            .checked_mul(p.top_k as usize)
+            .and_then(|elements| elements.checked_mul(dtype.size()))
+            .ok_or_else(|| RoutedExpertsError::MalformedPayload {
+                reason: "byte row stride overflow".to_owned(),
+            })?;
+        if p.data.is_empty() || !p.data.len().is_multiple_of(token_bytes) {
+            return Err(RoutedExpertsError::MalformedPayload {
+                reason: format!(
+                    "payload byte length {} is not a positive multiple of row stride {}",
+                    p.data.len(),
+                    token_bytes
+                ),
+            });
+        }
+        Ok(Self {
             data: bytes::Bytes::copy_from_slice(&p.data),
             num_layers: p.num_layers,
             top_k: p.top_k,
@@ -1135,6 +1158,9 @@ impl ProtoRoutedExperts {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RoutedExpertsError {
+    #[error("malformed routed_experts payload: {reason}")]
+    MalformedPayload { reason: String },
+
     #[error("routed_experts shape mismatch: accumulator={accumulator:?}, segment={segment:?}")]
     ShapeMismatch {
         accumulator: ProtoRoutedExpertsShape,
@@ -1177,6 +1203,7 @@ impl RoutedExpertsError {
     /// Stable error_code emitted in HTTP responses and metric labels.
     pub const fn error_code(&self) -> &'static str {
         match self {
+            Self::MalformedPayload { .. } => "routed_experts_malformed_payload",
             Self::ShapeMismatch { .. } => "routed_experts_shape_mismatch",
             Self::LateArrival { .. } => "routed_experts_late_arrival",
             Self::MissingSegment { .. } => "routed_experts_missing_segment",
@@ -1187,6 +1214,7 @@ impl RoutedExpertsError {
     /// Metric `reason` label without the `routed_experts_` prefix.
     pub const fn metric_reason(&self) -> &'static str {
         match self {
+            Self::MalformedPayload { .. } => "malformed_payload",
             Self::ShapeMismatch { .. } => "shape_mismatch",
             Self::LateArrival { .. } => "late_arrival",
             Self::MissingSegment { .. } => "missing_segment",
@@ -2124,7 +2152,7 @@ impl ProtoGenerateComplete {
     /// - `logprobs`: `len() == token_ids.len()` when `Some(_)`; on mismatch
     ///   the logprobs are dropped
     /// - `routed_experts`:
-    ///     `num_tokens() == (prompt_len - first_iter_prompt_start) + token_ids.len() - 1`
+    ///   `num_tokens() == (prompt_len - first_iter_prompt_start) + token_ids.len() - 1`
     ///   On violation returns `Err(RoutedExpertsError::AlignmentMismatch)`.
     ///
     /// `top_logprobs` is reset to per-position empty entries because the
@@ -2232,14 +2260,15 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get routed experts
-    pub fn routed_experts(&self) -> Option<ProtoRoutedExperts> {
+    /// Get and strictly validate routed experts when the field is present.
+    pub fn routed_experts(&self) -> Result<Option<ProtoRoutedExperts>, RoutedExpertsError> {
         match self {
             Self::Vllm(c) => c
                 .routed_experts
                 .as_ref()
-                .and_then(ProtoRoutedExperts::from_proto),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+                .map(ProtoRoutedExperts::from_proto)
+                .transpose(),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => Ok(None),
         }
     }
 
@@ -2742,6 +2771,61 @@ mod tests {
             shm_enabled: false,
             shm_min_bytes: 0,
             rdma_enabled: false,
+        }
+    }
+
+    #[test]
+    fn routed_experts_accepts_compact_u8_and_u16_payloads() {
+        for (dtype, row_bytes) in [("uint8", 6usize), ("uint16", 12usize)] {
+            let payload = vllm::RoutedExpertsTensor {
+                data: vec![7; row_bytes * 4],
+                num_layers: 2,
+                top_k: 3,
+                dtype: dtype.to_owned(),
+                index: 0,
+            };
+
+            let routed_experts = ProtoRoutedExperts::from_proto(&payload).unwrap();
+            assert_eq!(routed_experts.num_tokens(), 4);
+        }
+    }
+
+    #[test]
+    fn routed_experts_rejects_malformed_present_payloads() {
+        for payload in [
+            vllm::RoutedExpertsTensor {
+                data: vec![],
+                num_layers: 2,
+                top_k: 3,
+                dtype: "uint8".to_owned(),
+                index: 0,
+            },
+            vllm::RoutedExpertsTensor {
+                data: vec![0; 7],
+                num_layers: 2,
+                top_k: 3,
+                dtype: "uint8".to_owned(),
+                index: 0,
+            },
+            vllm::RoutedExpertsTensor {
+                data: vec![0; 6],
+                num_layers: 0,
+                top_k: 3,
+                dtype: "uint8".to_owned(),
+                index: 0,
+            },
+            vllm::RoutedExpertsTensor {
+                data: vec![0; 6],
+                num_layers: 2,
+                top_k: 3,
+                dtype: "int16".to_owned(),
+                index: 0,
+            },
+        ] {
+            assert!(matches!(
+                ProtoRoutedExperts::from_proto(&payload),
+                Err(RoutedExpertsError::MalformedPayload { .. })
+            ));
         }
     }
 

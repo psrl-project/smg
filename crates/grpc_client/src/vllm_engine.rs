@@ -342,6 +342,7 @@ impl VllmEngineClient {
             mm_inputs,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
+            priority: None,
         };
 
         Ok(grpc_request)
@@ -383,6 +384,7 @@ impl VllmEngineClient {
             mm_inputs: multimodal_inputs,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
+            priority: body.priority,
         };
 
         Ok(grpc_request)
@@ -421,6 +423,7 @@ impl VllmEngineClient {
             mm_inputs: None,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
+            priority: Some(body.priority),
         };
 
         Ok(grpc_request)
@@ -627,6 +630,7 @@ impl VllmEngineClient {
             mm_inputs: multimodal_inputs,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
+            priority: None,
         };
 
         Ok(grpc_request)
@@ -691,6 +695,7 @@ impl VllmEngineClient {
             mm_inputs: None,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
+            priority: None,
         };
 
         Ok(grpc_request)
@@ -976,9 +981,11 @@ mod tests {
             mm_inputs: None,
             data_parallel_rank: 0,
             kv_transfer_params_json: None,
+            priority: Some(-7),
         };
 
         assert_eq!(gen_req.request_id, "test-req-123");
+        assert_eq!(gen_req.priority, Some(-7));
         if let Some(proto::generate_request::Input::Tokenized(ref tokenized)) = gen_req.input {
             assert_eq!(tokenized.original_text, "Hello world");
         }

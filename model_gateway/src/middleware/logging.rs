@@ -99,14 +99,15 @@ impl<B> OnResponse<B> for ResponseLogger {
                 "request failed with server error"
             );
         } else if status.is_client_error() {
-            // prompt_overflow is an expected RL termination; do not treat it as
-            // a generic client error. Other 4xx responses keep the WARN.
+            // prompt_overflow (engine overflow) and prompt_too_long (reactive
+            // compaction) are expected RL terminations; do not treat them as
+            // generic client errors. Other 4xx responses keep the WARN.
             let error_code = extract_error_code_from_response(response);
-            if error_code == PROMPT_OVERFLOW_ERROR_CODE {
+            if error_code == PROMPT_OVERFLOW_ERROR_CODE || error_code == "prompt_too_long" {
                 debug!(
                     target: "smg::response",
                     error_code,
-                    "request terminated with prompt_overflow"
+                    "request terminated with expected RL termination error"
                 );
             } else {
                 warn!(

@@ -350,6 +350,31 @@ pub(crate) fn custom_tool_to_chat_tool(tool: &messages::CustomTool) -> ChatTool 
     }
 }
 
+/// Recursively sort JSON object keys so the same logical value always hashes
+/// and renders identically, regardless of the key order the client used on the
+/// wire.
+///
+/// This is required for TITO prefix stability: `serde_json` runs with
+/// `preserve_order`, so tool schemas deserialized into
+/// `HashMap<String, Value>` (e.g. `InputSchema.properties`) keep the HashMap's
+/// iteration order, which differs between requests. Without canonicalization
+/// the `RenderContext` (which hashes the tools in native order) changes every
+/// turn, the TITO prefix lookup misses, and each turn forks a new trajectory.
+pub(crate) fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted: Vec<(String, Value)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_json_value(v)))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_value).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Convert InputSchema struct to a serde_json::Value.
 fn input_schema_to_value(schema: &messages::InputSchema) -> Value {
     let mut obj = serde_json::Map::new();
@@ -359,26 +384,34 @@ fn input_schema_to_value(schema: &messages::InputSchema) -> Value {
     );
 
     if let Some(properties) = &schema.properties {
+        // `properties` is a HashMap: its iteration order is non-deterministic
+        // across requests, so canonicalize it (and the nested values) to keep
+        // the rendered system header and TITO hash stable across turns.
         let props: serde_json::Map<String, Value> = properties
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        obj.insert("properties".to_string(), Value::Object(props));
-    }
-
-    if let Some(required) = &schema.required {
         obj.insert(
-            "required".to_string(),
-            Value::Array(required.iter().map(|s| Value::String(s.clone())).collect()),
+            "properties".to_string(),
+            canonicalize_json_value(&Value::Object(props)),
         );
     }
 
-    // Include any additional schema fields
-    for (key, value) in &schema.additional {
-        obj.insert(key.clone(), value.clone());
+    if let Some(required) = &schema.required {
+        let mut required: Vec<String> = required.clone();
+        required.sort();
+        obj.insert(
+            "required".to_string(),
+            Value::Array(required.into_iter().map(Value::String).collect()),
+        );
     }
 
-    Value::Object(obj)
+    // Include any additional schema fields (canonicalized for the same reason).
+    for (key, value) in &schema.additional {
+        obj.insert(key.clone(), canonicalize_json_value(value));
+    }
+
+    canonicalize_json_value(&Value::Object(obj))
 }
 
 /// Convert a Messages API ToolChoice to a Chat API ToolChoice.
@@ -715,5 +748,59 @@ mod tests {
             other: serde_json::Map::new(),
         };
         assert_eq!(get_history_tool_calls_count_messages(&request), 2);
+    }
+
+    #[test]
+    fn canonicalize_json_value_sorts_keys_recursively() {
+        use serde_json::json;
+
+        let a = json!({"b": 1, "a": {"z": 2, "y": 3}, "arr": [{"k2": 1, "k1": 2}]});
+        let b = json!({"a": {"y": 3, "z": 2}, "b": 1, "arr": [{"k1": 2, "k2": 1}]});
+
+        assert_eq!(canonicalize_json_value(&a), canonicalize_json_value(&b));
+        // Canonical output has sorted keys at every level.
+        assert_eq!(
+            canonicalize_json_value(&a),
+            json!({"a": {"y": 3, "z": 2}, "arr": [{"k1": 2, "k2": 1}], "b": 1})
+        );
+    }
+
+    #[test]
+    fn input_schema_to_value_is_key_order_stable() {
+        use messages::InputSchema;
+        use serde_json::json;
+
+        // Same logical schema, different (HashMap-derived) iteration orders.
+        let mut props1 = std::collections::HashMap::new();
+        props1.insert("pattern".to_string(), json!({"type": "string"}));
+        props1.insert("path".to_string(), json!({"type": "string"}));
+        let schema1 = InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(props1),
+            required: Some(vec!["pattern".to_string(), "path".to_string()]),
+            additional: std::collections::HashMap::new(),
+        };
+
+        let mut props2 = std::collections::HashMap::new();
+        props2.insert("path".to_string(), json!({"type": "string"}));
+        props2.insert("pattern".to_string(), json!({"type": "string"}));
+        let schema2 = InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(props2),
+            required: Some(vec!["path".to_string(), "pattern".to_string()]),
+            additional: std::collections::HashMap::new(),
+        };
+
+        let v1 = input_schema_to_value(&schema1);
+        let v2 = input_schema_to_value(&schema2);
+        assert_eq!(v1, v2, "tool schema must canonicalize identically");
+
+        let props = v1["properties"].as_object().unwrap();
+        let keys: Vec<&String> = props.keys().collect();
+        assert_eq!(keys, vec!["path", "pattern"]);
+        assert_eq!(
+            v1["required"].as_array().unwrap(),
+            &serde_json::json!(["path", "pattern"]).as_array().unwrap().clone()
+        );
     }
 }

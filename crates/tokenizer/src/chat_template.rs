@@ -1025,6 +1025,10 @@ pub struct ChatTemplateState {
     thinking_key_name: Option<ThinkingKeyName>,
     /// Whether the template injects `<think>` in the generation prompt.
     think_in_prefill: bool,
+    /// Whether assistant rendering depends on a message's position relative to
+    /// the last user query. Stock Qwen3.5 templates expose this through the
+    /// `last_query_index` namespace; position-independent overrides omit it.
+    position_dependent: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1042,6 +1046,9 @@ impl ChatTemplateState {
     pub fn new(template: Option<String>) -> Result<Self> {
         let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
             template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
+        let position_dependent = template
+            .as_deref()
+            .is_some_and(|source| source.contains("last_query_index"));
         let env = template.map(build_environment).transpose()?;
         Ok(Self {
             env,
@@ -1049,6 +1056,7 @@ impl ChatTemplateState {
             thinking_toggle,
             thinking_key_name,
             think_in_prefill,
+            position_dependent,
         })
     }
 
@@ -1063,6 +1071,7 @@ impl ChatTemplateState {
             thinking_toggle: ThinkingToggle::None,
             thinking_key_name: None,
             think_in_prefill: false,
+            position_dependent: false,
         }
     }
 
@@ -1107,11 +1116,13 @@ impl ChatTemplateState {
     pub fn set(&mut self, template: String) -> Result<()> {
         let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
             detect_all(&template);
+        let position_dependent = template.contains("last_query_index");
         let env = build_environment(template)?;
         self.content_format = content_format;
         self.thinking_toggle = thinking_toggle;
         self.thinking_key_name = thinking_key_name;
         self.think_in_prefill = think_in_prefill;
+        self.position_dependent = position_dependent;
         self.env = Some(env);
         Ok(())
     }
@@ -1130,6 +1141,10 @@ impl ChatTemplateState {
 
     pub fn think_in_prefill(&self) -> bool {
         self.think_in_prefill
+    }
+
+    pub fn position_dependent(&self) -> bool {
+        self.position_dependent
     }
 }
 
@@ -1150,6 +1165,13 @@ mod tests {
         let mut state = ChatTemplateState::new(None).unwrap();
         state.set("{{ messages }}".to_string()).unwrap();
         assert_eq!(state.content_format(), ChatTemplateContentFormat::String);
+        assert!(!state.position_dependent());
+        state
+            .set(
+                "{% set ns = namespace(last_query_index=0) %}{{ ns.last_query_index }}".to_string(),
+            )
+            .unwrap();
+        assert!(state.position_dependent());
     }
 
     #[test]

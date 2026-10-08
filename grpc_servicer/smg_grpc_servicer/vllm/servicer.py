@@ -406,24 +406,30 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                         f"maximum model length of {max_model_len}."
                     )
 
-            # Build sampling params with detokenize=False
-            # NOTE: only inject the version tag when LMCache is actually enabled.
-            # Otherwise every request gets a non-empty extra_args["kv_transfer_params"]
-            # even though no KVConnector is configured on this engine, which makes
-            # vLLM log "Got kv_transfer_params, but no KVConnector found" for every
-            # single request (see vllm/v1/engine/core.py EngineCore.add_request).
+            # Build sampling params with detokenize=False.
+            # Only convey kv_transfer_params (router-sourced proto field or the
+            # lmcache model-version tag) when the engine actually has a
+            # KVConnector. vLLM creates the connector only when
+            # kv_transfer_config.kv_connector is non-empty (the same signal
+            # GetServerInfo reports to the router), otherwise the engine would
+            # warn per request and silently drop the params.
+            _kv_transfer_config = self.engine.vllm_config.kv_transfer_config
+            _has_kv_connector = _kv_transfer_config is not None and bool(
+                getattr(_kv_transfer_config, "kv_connector", "")
+            )
             _version_tag = (
                 str(self.kv_cache_manager.current_version)
                 if self.kv_cache_manager is not None
                 and getattr(self.kv_cache_manager.config, "enable", False)
                 and getattr(self.kv_cache_manager.config, "multi_version_kv", False)
+                and _has_kv_connector
                 else None
             )
             sampling_params = self._sampling_params_from_proto(
                 request.sampling_params,
                 stream=request.stream,
                 kv_transfer_params=request.kv_transfer_params
-                if request.HasField("kv_transfer_params")
+                if _has_kv_connector and request.HasField("kv_transfer_params")
                 else None,
                 model_version_tag=_version_tag,
             )

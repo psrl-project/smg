@@ -186,6 +186,18 @@ impl PipelineStage for RequestExecutionStage {
         let request_type = execution_plan.request_type();
         let mode = execution_plan.mode_label();
 
+        // Session-scoped prompt-too-long budget (PSRL injects the harness
+        // compaction trigger). When present, engine prompt-overflow is translated
+        // into an Anthropic `prompt_too_long` error so Claude Code reactively
+        // compacts instead of receiving an unrecognized generic 400.
+        let prompt_too_long_limit: Option<usize> = ctx
+            .input
+            .headers
+            .as_ref()
+            .and_then(|h| h.get(error::X_SMG_PROMPT_TOO_LONG_LIMIT))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse().ok());
+
         // Create OTEL span for gRPC request execution
         let span = info_span!(
             target: "smg::otel-trace",
@@ -199,7 +211,10 @@ impl PipelineStage for RequestExecutionStage {
         let result = async {
             match execution_plan {
                 ExecutionPlan::Single(request) => match request {
-                    ProtoRequest::Generate(req) => self.execute_single(req, clients, workers).await,
+                    ProtoRequest::Generate(req) => {
+                        self.execute_single(req, clients, workers, prompt_too_long_limit)
+                            .await
+                    }
                     ProtoRequest::Embed(req) => {
                         self.execute_single_embed(req, clients, workers).await
                     }
@@ -369,6 +384,7 @@ impl RequestExecutionStage {
         mut proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
+        prompt_too_long_limit: Option<usize>,
     ) -> Result<ExecutionResult, Response> {
         let client = clients.single_mut().ok_or_else(|| {
             error!(
@@ -393,6 +409,24 @@ impl RequestExecutionStage {
             // not a gateway failure. Emit a dedicated error code and log at
             // debug so default RUST_LOG=warn stays quiet; real failures remain ERROR.
             if is_prompt_overflow_status(&e) {
+                // When a session carries the prompt-too-long budget, translate
+                // the engine overflow into the Anthropic message Claude Code
+                // recognizes, so its reactive compact fires instead of surfacing
+                // an unrecognized generic 400. Fall back to the legacy
+                // `prompt_overflow` code (PSRL truncates & trains) otherwise.
+                if let Some(limit) = prompt_too_long_limit {
+                    let actual = vllm_overflow_prompt_len(&e.message()).unwrap_or(limit);
+                    debug!(
+                        function = "execute_single",
+                        actual_prompt_len = actual,
+                        limit,
+                        "Translating engine prompt overflow to prompt_too_long for reactive compact"
+                    );
+                    let message = format!(
+                        "Prompt is too long: {actual} tokens > {limit} tokens (approximately)"
+                    );
+                    return e.to_http_error("prompt_too_long", message);
+                }
                 debug!(
                     function = "execute_single",
                     error = %e,
@@ -804,6 +838,17 @@ impl RequestExecutionStage {
     }
 }
 
+/// Extract the actual prompt length from a vLLM overflow message, e.g.
+/// "The decoder prompt (length 32000) is longer than the maximum model length
+/// of 32768."  Used to seed Claude Code's reactive-compact token gap; falls back
+/// to `None` when the message shape is unexpected.
+fn vllm_overflow_prompt_len(message: &str) -> Option<usize> {
+    let re = regex::Regex::new(r"\(length (\d+)\)").ok()?;
+    re.captures(message)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use smg_grpc_client::vllm_proto as vllm;
@@ -1026,5 +1071,24 @@ mod tests {
     fn effective_engine_id_none_for_missing_or_empty_base() {
         assert_eq!(effective_kv_engine_id(None, Some(2), Some(0)), None);
         assert_eq!(effective_kv_engine_id(Some(""), None, None), None);
+    }
+
+    #[test]
+    fn vllm_overflow_prompt_len_extracts_length() {
+        assert_eq!(
+            vllm_overflow_prompt_len(
+                "The decoder prompt (length 32000) is longer than the maximum model length of 32768."
+            ),
+            Some(32000)
+        );
+        assert_eq!(
+            vllm_overflow_prompt_len(
+                "The decoder prompt (length 31000) plus the number of requested output tokens (at least 1) \
+                 is longer than the maximum model length of 32768."
+            ),
+            Some(31000)
+        );
+        assert_eq!(vllm_overflow_prompt_len("unexpected message"), None);
+        assert_eq!(vllm_overflow_prompt_len(""), None);
     }
 }
