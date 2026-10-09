@@ -134,8 +134,9 @@ pub fn build_tool_canonicalizer(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn claude_code_strips_redundant_cd_prefix() {
@@ -174,7 +175,10 @@ mod tests {
     #[test]
     fn noop_keeps_input_untouched() {
         let input = json!({"command": "cd /testbed && make", "replace_all": false});
-        assert_eq!(NoopToolCanonicalizer.canonicalize("Bash", input.clone()), input);
+        assert_eq!(
+            NoopToolCanonicalizer.canonicalize("Bash", input.clone()),
+            input
+        );
     }
 
     #[test]
