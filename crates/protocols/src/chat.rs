@@ -11,6 +11,7 @@ use super::{
         StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
         Usage,
     },
+    sampler_capture::SamplerCaptureWidth,
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
@@ -236,13 +237,12 @@ pub struct ChatCompletionRequest {
     /// A list of tools the model may call
     pub tools: Option<Vec<Tool>>,
 
-    /// Number of most likely tokens to return, subject to the engine capture limit.
-    #[validate(range(min = 0, max = 2147483647))]
+    /// An integer between 0 and 20 specifying the number of most likely tokens to return.
+    #[validate(range(min = 0, max = 20))]
     pub top_logprobs: Option<u32>,
 
     /// Capture sampler alternatives in TITO without adding them to the chat response.
-    #[validate(range(min = 0, max = 2147483647))]
-    pub sampler_top_logprobs: Option<u32>,
+    pub sampler_top_logprobs: Option<SamplerCaptureWidth>,
 
     /// An alternative to sampling with temperature
     #[validate(custom(function = "validate_top_p_value"))]
@@ -380,7 +380,11 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::Validati
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
 ) -> Result<(), validator::ValidationError> {
-    if req.sampler_top_logprobs.unwrap_or(0) > 0 && (req.stream || req.n.unwrap_or(1) != 1) {
+    if req
+        .sampler_top_logprobs
+        .is_some_and(SamplerCaptureWidth::is_enabled)
+        && (req.stream || req.n.unwrap_or(1) != 1)
+    {
         let mut error = validator::ValidationError::new("invalid_sampler_capture_mode");
         error.message = Some("Sampler capture requires one non-streaming completion".into());
         return Err(error);
@@ -793,6 +797,7 @@ pub struct ChatStreamChoice {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+    use validator::Validate;
 
     use super::{thinking_from_reasoning_effort, ChatCompletionRequest};
 
@@ -839,5 +844,12 @@ mod tests {
             let serialized = serde_json::to_value(request).expect("request must serialize");
             assert_eq!(serialized.get("return_audio"), Some(&Value::Bool(value)));
         }
+    }
+
+    #[test]
+    fn top_logprobs_keeps_the_public_response_limit() {
+        let request =
+            request_with_output_fields(&[("logprobs", json!(true)), ("top_logprobs", json!(21))]);
+        assert!(request.validate().is_err());
     }
 }

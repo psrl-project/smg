@@ -423,8 +423,7 @@ impl ResponseProcessor {
         // Score-centering capture needs the sampler head even when no logprobs are surfaced.
         let capture_width = generate_request
             .sampler_top_logprobs
-            .filter(|width| *width > 0)
-            .map(|width| width as usize);
+            .filter(|width| width.is_enabled());
         let collect_logprobs = request_logprobs || capture_width.is_some();
 
         // Collect all responses from the execution result
@@ -496,15 +495,18 @@ impl ResponseProcessor {
             };
 
             // Sampler top-k head for score centering, encoded like the routed-experts payload.
-            let (output_topk_token_ids, output_topk_log_probs, output_topk_shape) = match capture_width {
-                Some(width) => complete
-                    .output_logprobs(true)
-                    .as_ref()
-                    .and_then(|lp| utils::sampler_topk::encode_sampler_topk_for_response(lp, width))
-                    .map(|(ids, log_probs, shape)| (Some(ids), Some(log_probs), Some(shape)))
-                    .unwrap_or((None, None, None)),
-                None => (None, None, None),
-            };
+            let (output_topk_token_ids, output_topk_log_probs, output_topk_shape) =
+                match capture_width {
+                    Some(width) => complete
+                        .output_logprobs(true)
+                        .as_ref()
+                        .and_then(|lp| {
+                            utils::sampler_topk::encode_sampler_topk_for_response(lp, width)
+                        })
+                        .map(|(ids, log_probs, shape)| (Some(ids), Some(log_probs), Some(shape)))
+                        .unwrap_or((None, None, None)),
+                    None => (None, None, None),
+                };
 
             // Build GenerateResponse struct
             let routed_experts = complete

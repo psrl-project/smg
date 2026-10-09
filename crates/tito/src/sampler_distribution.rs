@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use base64::Engine as _;
 use serde::{ser::SerializeStruct, Serialize};
@@ -10,6 +10,41 @@ pub struct SamplerDistribution {
     token_ids: Arc<[u8]>,
     log_probs: Arc<[u8]>,
     complete: Arc<[bool]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedSamplerRow {
+    pub finite_len: usize,
+    pub complete: bool,
+}
+
+/// Validate one rank-ordered sampler row without allocating a normalized copy.
+pub fn validate_sampler_row(ids: &[u32], values: &[f32]) -> Option<ValidatedSamplerRow> {
+    if ids.is_empty() || ids.len() != values.len() {
+        return None;
+    }
+    let mut finite_ids = HashSet::new();
+    finite_ids.try_reserve(ids.len()).ok()?;
+    let mut finite_len = 0;
+    let mut complete = false;
+    for (&id, &value) in ids.iter().zip(values) {
+        if value == f32::NEG_INFINITY {
+            complete = true;
+        } else if complete
+            || !value.is_finite()
+            || value > 0.000001
+            || id > i32::MAX as u32
+            || !finite_ids.insert(id)
+        {
+            return None;
+        } else {
+            finite_len += 1;
+        }
+    }
+    (finite_len > 0).then_some(ValidatedSamplerRow {
+        finite_len,
+        complete,
+    })
 }
 
 impl SamplerDistribution {
@@ -24,26 +59,17 @@ impl SamplerDistribution {
         let mut log_probs = Vec::new();
         let mut complete = Vec::new();
         for (ids, values) in rows {
-            if ids.is_empty() || ids.len() != values.len() {
-                return None;
-            }
-            let mut full = false;
-            for (id, value) in ids.into_iter().zip(values) {
-                if value == f32::NEG_INFINITY {
-                    full = true;
-                } else if full || !value.is_finite() || value > 0.000001 || id > i32::MAX as u32 {
-                    return None;
-                } else {
-                    token_ids.extend_from_slice(&id.to_le_bytes());
-                    log_probs.extend_from_slice(&value.to_le_bytes());
-                }
+            let validated = validate_sampler_row(&ids, &values)?;
+            for (id, value) in ids.into_iter().zip(values).take(validated.finite_len) {
+                token_ids.extend_from_slice(&id.to_le_bytes());
+                log_probs.extend_from_slice(&value.to_le_bytes());
             }
             let end = (token_ids.len() / 4) as u64;
             if offsets.last() == Some(&end) {
                 return None;
             }
             offsets.push(end);
-            complete.push(full);
+            complete.push(validated.complete);
         }
         Some(Self {
             offsets: offsets.into(),
@@ -98,19 +124,22 @@ mod tests {
     fn rejects_misaligned_or_invalid_rows() {
         assert!(SamplerDistribution::from_rows([(vec![1], vec![])]).is_none());
         assert!(SamplerDistribution::from_rows([(vec![1], vec![f32::NAN])]).is_none());
+        assert!(SamplerDistribution::from_rows([(vec![1], vec![f32::INFINITY])]).is_none());
         assert!(SamplerDistribution::from_rows([(vec![1], vec![f32::NEG_INFINITY])]).is_none());
+        assert!(SamplerDistribution::from_rows([(vec![1, 1], vec![-0.1, -0.2])]).is_none());
+        assert!(
+            SamplerDistribution::from_rows([(vec![i32::MAX as u32 + 1], vec![-0.1],)]).is_none()
+        );
     }
 
     #[test]
     fn rejects_finite_entry_after_support_sentinel() {
         // A finite log-prob after the sentinel breaks the "support is a prefix" contract the compact
         // trainer transport relies on, so the row must be rejected rather than silently kept.
-        assert!(
-            SamplerDistribution::from_rows([(
-                vec![2, 9, 4],
-                vec![0.25_f32.ln(), f32::NEG_INFINITY, 0.75_f32.ln()],
-            )])
-            .is_none()
-        );
+        assert!(SamplerDistribution::from_rows([(
+            vec![2, 9, 4],
+            vec![0.25_f32.ln(), f32::NEG_INFINITY, 0.75_f32.ln()],
+        )])
+        .is_none());
     }
 }

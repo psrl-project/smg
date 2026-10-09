@@ -60,7 +60,10 @@ impl PipelineStage for HarmonyPreparationStage {
             let request_arc = ctx.chat_request_arc();
             // Harmony has no TITO turn-record capture, so a sampler-capture request would silently
             // produce no training distribution; reject it explicitly instead.
-            if request_arc.sampler_top_logprobs.unwrap_or(0) > 0 {
+            if request_arc
+                .sampler_top_logprobs
+                .is_some_and(|width| width.is_enabled())
+            {
                 return Err(error::bad_request(
                     "harmony_sampler_capture_unsupported",
                     "Sampler capture (sampler_top_logprobs) is not supported for Harmony models",
@@ -78,7 +81,10 @@ impl PipelineStage for HarmonyPreparationStage {
             self.prepare_chat(ctx, &request_arc)?;
         } else if is_responses {
             let request_arc = ctx.responses_request_arc();
-            if request_arc.sampler_top_logprobs.unwrap_or(0) > 0 {
+            if request_arc
+                .sampler_top_logprobs
+                .is_some_and(|width| width.is_enabled())
+            {
                 return Err(error::bad_request(
                     "harmony_sampler_capture_unsupported",
                     "Sampler capture (sampler_top_logprobs) is not supported for Harmony models",

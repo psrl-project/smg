@@ -349,7 +349,10 @@ fn do_tito_capture_non_streaming(
         dispatched_prompt_start,
         weight_version,
         mismatch_report,
-        tito_ctx.request.sampler_top_logprobs.unwrap_or(0),
+        tito_ctx.request.sampler_top_logprobs.map_or(
+            0,
+            openai_protocol::sampler_capture::SamplerCaptureWidth::get,
+        ),
     )?;
 
     let store_result =

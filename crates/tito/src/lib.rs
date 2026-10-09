@@ -28,4 +28,4 @@ pub const TITO_SESSION_HEADER: &str = "x-smg-tito-session-id";
 /// Used by the manual strategy and defaults to 0 when absent.
 pub const TITO_TRAJECTORY_ID_HEADER: &str = "x-smg-tito-trajectory-id";
 
-pub use sampler_distribution::SamplerDistribution;
+pub use sampler_distribution::{validate_sampler_row, SamplerDistribution, ValidatedSamplerRow};

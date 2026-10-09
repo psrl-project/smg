@@ -6,6 +6,7 @@ use validator::Validate;
 
 use super::{
     common::{default_true, deserialize_null_as_false, GenerationRequest, InputIds},
+    sampler_capture::SamplerCaptureWidth,
     sampling_params::SamplingParams,
 };
 use crate::validated::Normalizable;
@@ -143,7 +144,7 @@ pub struct GenerateRequest {
     /// The /generate response carries the head in `meta_info.output_topk_*`, independent of the
     /// `top_logprobs_num` alternatives surfaced to the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampler_top_logprobs: Option<u32>,
+    pub sampler_top_logprobs: Option<SamplerCaptureWidth>,
 
     /// If return logprobs, the token ids to return logprob for.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,7 +275,11 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
     }
 
     // Sampler capture is delivered through the completed response metadata, so it cannot stream.
-    if req.sampler_top_logprobs.unwrap_or(0) > 0 && req.stream {
+    if req
+        .sampler_top_logprobs
+        .is_some_and(SamplerCaptureWidth::is_enabled)
+        && req.stream
+    {
         return Err(validator::ValidationError::new(
             "sampler_top_logprobs requires a non-streaming /generate request",
         ));

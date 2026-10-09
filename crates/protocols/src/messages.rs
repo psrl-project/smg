@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::{common::GenerationRequest, validated::Normalizable};
+use crate::{
+    common::GenerationRequest, sampler_capture::SamplerCaptureWidth, validated::Normalizable,
+};
 
 // ============================================================================
 // Request Types
@@ -72,7 +74,7 @@ pub struct CreateMessageRequest {
     /// Anthropic Messages lowers to the canonical chat training IR, so this mirrors
     /// `ChatCompletionRequest.sampler_top_logprobs` and only applies to TITO training requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampler_top_logprobs: Option<u32>,
+    pub sampler_top_logprobs: Option<SamplerCaptureWidth>,
 
     // Beta features
     /// Container configuration for code execution (beta).
@@ -198,7 +200,11 @@ impl Tool {
 /// Validate cross-field constraints for Messages API requests.
 fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator::ValidationError> {
     // TITO sampler capture is served one completed non-streaming turn at a time.
-    if req.sampler_top_logprobs.unwrap_or(0) > 0 && req.stream.unwrap_or(false) {
+    if req
+        .sampler_top_logprobs
+        .is_some_and(SamplerCaptureWidth::is_enabled)
+        && req.stream.unwrap_or(false)
+    {
         let mut e = validator::ValidationError::new("invalid_sampler_capture_mode");
         e.message = Some("Sampler capture requires one non-streaming completion".into());
         return Err(e);
