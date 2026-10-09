@@ -1400,25 +1400,31 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         which is deduplicated when it also appears in the top-k). ``num_top_logprobs`` is the caller's
         capture width; see the trainer's ``capture_width`` for the authoritative definition.
         """
-        top = vllm_engine_pb2.TopLogProbs()
-        if num_top_logprobs and num_top_logprobs > 0 and logprob_entry:
-            # No sorting here: this runs in Python once per generated position, so an O(k log k)
-            # sort per position is a real capture-path hotspot. Ordering is canonicalized downstream
-            # in Rust (the TITO path in `extract_turn_record`, the /generate head in
-            # `encode_sampler_topk_for_response`).
-            entries = [
-                (tid, lp.logprob)
-                for tid, lp in logprob_entry.items()
-                # The sampled token is inserted first and can be outside the requested head.
-                if lp.rank is not None and lp.rank <= num_top_logprobs
-            ]
-            if entries:
-                # One bulk constructor fill beats per-element `.append` (which is a Python call each).
-                return vllm_engine_pb2.TopLogProbs(
-                    token_ids=[tid for tid, _ in entries],
-                    values=[logprob for _, logprob in entries],
-                )
-        return top
+        if not num_top_logprobs or not logprob_entry:
+            return vllm_engine_pb2.TopLogProbs()
+        if len(logprob_entry) <= num_top_logprobs:
+            # The engine returns the top-`num` entries plus, at most, the sampled token when it falls
+            # outside them (deduplicated when it is inside). A dict no larger than the budget therefore
+            # holds only in-head entries, so this common case skips the per-entry rank filter and its
+            # attribute access entirely. A stray out-of-head entry is harmless: the Rust encoders sort
+            # by log-prob and take ``width``, dropping the lowest entry anyway.
+            return vllm_engine_pb2.TopLogProbs(
+                token_ids=list(logprob_entry),
+                values=[lp.logprob for lp in logprob_entry.values()],
+            )
+        # No sorting here: this runs in Python once per generated position, so an O(k log k) sort per
+        # position is a real capture-path hotspot. Ordering is canonicalized downstream in Rust (the
+        # TITO path in `extract_turn_record`, the /generate head in `encode_sampler_topk_for_response`).
+        # One fused pass (the sampled token, inserted first, is the only entry that can fall outside
+        # the requested head) beats a filter comprehension plus two projection comprehensions.
+        token_ids, values = [], []
+        for token_id, logprob in logprob_entry.items():
+            if logprob.rank is not None and logprob.rank <= num_top_logprobs:
+                token_ids.append(token_id)
+                values.append(logprob.logprob)
+        if not token_ids:
+            return vllm_engine_pb2.TopLogProbs()
+        return vllm_engine_pb2.TopLogProbs(token_ids=token_ids, values=values)
 
     @staticmethod
     def _build_routed_experts_tensor(
@@ -1484,10 +1490,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if not logprobs:
             return None
 
+        # One dict lookup per position via the walrus (the previous `in` + `[]` did two).
         rows = [
-            (token_id, logprob_entry[token_id], logprob_entry)
+            (token_id, logprob, logprob_entry)
             for token_id, logprob_entry in zip(token_ids, logprobs)
-            if token_id in logprob_entry
+            if (logprob := logprob_entry.get(token_id)) is not None
         ]
         if not rows:
             return None
@@ -1499,8 +1506,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             token_ids=[token_id for token_id, _, _ in rows],
         )
         if num_top_logprobs:
+            build_top_logprobs = VllmEngineServicer._build_top_logprobs
             proto.top_logprobs.extend(
-                VllmEngineServicer._build_top_logprobs(entry, num_top_logprobs) for _, _, entry in rows
+                build_top_logprobs(logprob_entry, num_top_logprobs) for _, _, logprob_entry in rows
             )
         return proto
 
