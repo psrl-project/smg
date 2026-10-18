@@ -11,17 +11,20 @@ use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
 };
 use smg_tito::{
-    engine::TitoEngine, model_adapter, PrefixLookup, TitoStore, TITO_SESSION_HEADER,
-    TITO_TRAJECTORY_ID_HEADER,
+    engine::TitoEngine, model_adapter, LookupMissReason, PrefixLookup, TitoStore,
+    TITO_SESSION_HEADER, TITO_TRAJECTORY_ID_HEADER,
 };
 use tracing::{debug, error, warn};
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::{PipelineStage, StagePhase},
-        context::{PreparationOutput, RequestContext, RequestType, TitoRequestContext},
-        multimodal, utils, ProcessedMessages,
+use crate::{
+    observability::metrics::record_tito_lookup,
+    routers::{
+        error,
+        grpc::{
+            common::stages::{PipelineStage, StagePhase},
+            context::{PreparationOutput, RequestContext, RequestType, TitoRequestContext},
+            multimodal, utils, ProcessedMessages,
+        },
     },
 };
 
@@ -457,6 +460,14 @@ impl ChatPreparationStage {
                     ));
                 }
             };
+
+        // Record the raw lookup outcome once: this is the hit-rate signal
+        // (`smg_tito_prefix_lookup_total{result,reason}`). Keep `session_id` out
+        // of metric labels — it is high cardinality.
+        record_tito_lookup(
+            lookup.matched.is_some(),
+            lookup.miss_reason.map(LookupMissReason::as_str),
+        );
 
         // Stash the running hasher state and parent hash into the TITO context
         // so the response stage can derive the leaf hash by extending this

@@ -388,6 +388,37 @@ pub struct PrefixMatch {
     pub has_assistant_in_appended: bool,
 }
 
+/// Why a [`PrefixLookup`] failed to match a stored prefix.
+///
+/// Bounded by construction so the value is safe to use as a low-cardinality
+/// metric label.  `None` (the [`PrefixLookup::miss_reason`] value on a hit)
+/// means the lookup succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookupMissReason {
+    /// The request carried too few messages, or none of them were assistant
+    /// boundaries, so there was nothing to match against.  Structural: the
+    /// harness is not sending a replayable conversation.
+    NoCandidates,
+    /// The session has no stored state — first turn, or the session was
+    /// evicted/never created.
+    SessionNotFound,
+    /// Candidate assistant boundaries were computed, but none matched a stored
+    /// node.  The replayed assistant turn hashed differently from the one the
+    /// session generated (a hash round-trip drift).
+    NoMatchingNode,
+}
+
+impl LookupMissReason {
+    /// Stable, low-cardinality wire label (metric label / log field).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCandidates => "no_candidates",
+            Self::SessionNotFound => "session_not_found",
+            Self::NoMatchingNode => "no_matching_node",
+        }
+    }
+}
+
 /// `running_hasher` is the [`PrefixHasher`] state after folding both the
 /// render context and every message in the lookup `messages` slice.
 ///
@@ -405,6 +436,9 @@ pub struct PrefixLookup {
     /// Hash at the last assistant boundary in the lookup `messages`.  This is
     /// the parent hash for any node about to be stored after this lookup.
     pub parent_hash: Option<PrefixHash>,
+    /// `None` on a hit; otherwise why the lookup missed.  Callers fold this
+    /// into the hit-rate metric so a forking session is classified by reason.
+    pub miss_reason: Option<LookupMissReason>,
 }
 
 impl Default for TitoStore {
@@ -684,39 +718,24 @@ impl TitoStore {
         // We still return the running hasher so the caller
         // can store a root-level entry.
         if messages.len() < 2 || candidates.is_empty() {
-            tracing::debug!(
-                session_id = %session_id,
-                msg_count = messages.len(),
-                candidate_count = candidates.len(),
-                "find_prefix_with_lookup: no candidates"
-            );
             return Ok(PrefixLookup {
                 matched: None,
                 running_hasher: hasher,
                 parent_hash,
+                miss_reason: Some(LookupMissReason::NoCandidates),
             });
         }
-
-        tracing::debug!(
-            session_id = %session_id,
-            candidate_count = candidates.len(),
-            entries_count = self
-                .get_session_arc(session_id)
-                .map(|arc| arc.lock().entries.len())
-                .unwrap_or(0),
-            "find_prefix_with_lookup: lookup start"
-        );
 
         // Check from longest prefix to shortest. `get_session_arc` ensures the
         // DashMap shard lock is released before we lock the per-session Mutex.
         let arc = match self.get_session_arc(session_id) {
             Some(arc) => arc,
             None => {
-                tracing::debug!(session_id = %session_id, "find_prefix_with_lookup: session not found");
                 return Ok(PrefixLookup {
                     matched: None,
                     running_hasher: hasher,
                     parent_hash,
+                    miss_reason: Some(LookupMissReason::SessionNotFound),
                 });
             }
         };
@@ -724,42 +743,13 @@ impl TitoStore {
 
         for (k, hash) in candidates.iter().rev() {
             if let Some(entry) = state.entries.get(hash) {
+                // The harness compacted / re-injected the conversation when the
+                // appended slice contains assistant turns this session's model
+                // never generated.  Keep the hit and treat them as prompt —
+                // `merge_incremental` re-tokenizes them and the training mask
+                // stays 0 (only generated output is masked 1).
                 let appended = &messages[*k..];
                 let has_assistant_in_appended = appended.iter().any(is_assistant_role);
-                if has_assistant_in_appended {
-                    // The harness compacted / re-injected the conversation: the
-                    // appended slice contains assistant turns that this session's
-                    // model never generated.  Keep the hit and treat them as
-                    // prompt — `merge_incremental` re-tokenizes them and the
-                    // training mask stays 0 (only generated output is masked 1).
-                    // WARN in debug mode (compaction is notable there); DEBUG
-                    // otherwise so production logs do not spam on every hit.
-                    if self.is_debug() {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            matched_len = *k,
-                            appended_with_assistant = true,
-                            appended_msg_count = appended.len(),
-                            "TITO HIT — appended slice contains assistant turn(s); \
-                             treating as compacted context (prompt, mask 0)"
-                        );
-                    } else {
-                        tracing::debug!(
-                            session_id = %session_id,
-                            matched_len = *k,
-                            appended_with_assistant = true,
-                            appended_msg_count = appended.len(),
-                            "TITO HIT — appended slice contains assistant turn(s); \
-                             treating as compacted context (prompt, mask 0)"
-                        );
-                    }
-                }
-                tracing::debug!(
-                    session_id = %session_id,
-                    matched_len = *k,
-                    prefix_tokens = entry.token_ids.len(),
-                    "find_prefix_with_lookup: HIT"
-                );
                 let reusable_prefix_token_ids = entry
                     .reusable_prefix_token_ids
                     .as_deref()
@@ -772,6 +762,7 @@ impl TitoStore {
                     }),
                     running_hasher: hasher,
                     parent_hash,
+                    miss_reason: None,
                 });
             }
         }
@@ -780,6 +771,7 @@ impl TitoStore {
             matched: None,
             running_hasher: hasher,
             parent_hash,
+            miss_reason: Some(LookupMissReason::NoMatchingNode),
         })
     }
 
@@ -1779,6 +1771,60 @@ mod tests {
         let hit = store.find_prefix("s1", &msgs, &ctx).unwrap().unwrap();
         assert_eq!(hit.pretokenized_ids, vec![1, 2, 3]);
         assert_eq!(hit.matched_message_num, 2);
+    }
+
+    #[test]
+    fn lookup_reports_a_miss_reason() {
+        let store = make_store();
+        let ctx = render_context();
+
+        // (a) No assistant boundary to match → NoCandidates, before any session
+        //     is consulted.
+        let no_candidates = vec![user_msg("hi"), user_msg("there")];
+        let lookup = store
+            .find_prefix_with_lookup("missing", &no_candidates, &ctx)
+            .unwrap();
+        assert!(lookup.matched.is_none());
+        assert_eq!(lookup.miss_reason, Some(LookupMissReason::NoCandidates));
+
+        // (b) A replayable assistant boundary exists but the session has no
+        //     state → SessionNotFound.
+        let with_boundary = vec![
+            user_msg("hi"),
+            assistant_msg("hello"),
+            tool_msg("result", "call_1"),
+        ];
+        let lookup = store
+            .find_prefix_with_lookup("missing", &with_boundary, &ctx)
+            .unwrap();
+        assert_eq!(lookup.miss_reason, Some(LookupMissReason::SessionNotFound));
+
+        // (c) Session has state, but the replayed assistant turn hashes
+        //     differently → NoMatchingNode.
+        store.create_session("s1");
+        store_turn(
+            &store,
+            "s1",
+            &vec![user_msg("hi"), assistant_msg("hello")],
+            vec![1, 2, 3],
+            record(2, "stop"),
+            &ctx,
+        );
+        let drifted = vec![
+            user_msg("hi"),
+            assistant_msg("DIFFERENT"),
+            tool_msg("result", "call_1"),
+        ];
+        let lookup = store.find_prefix_with_lookup("s1", &drifted, &ctx).unwrap();
+        assert!(lookup.matched.is_none());
+        assert_eq!(lookup.miss_reason, Some(LookupMissReason::NoMatchingNode));
+
+        // (d) A real hit carries no miss reason.
+        let lookup = store
+            .find_prefix_with_lookup("s1", &with_boundary, &ctx)
+            .unwrap();
+        assert!(lookup.matched.is_some());
+        assert_eq!(lookup.miss_reason, None);
     }
 
     #[test]

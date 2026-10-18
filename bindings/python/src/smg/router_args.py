@@ -975,11 +975,11 @@ class RouterArgs:
         tito_group.add_argument(
             f"--{prefix}tito-tool-normalization",
             type=str,
-            choices=["none", "claude_code"],
+            choices=["none", "claude_code", "codex"],
             default=RouterArgs.tito_tool_normalization,
             help=(
                 "Harness-specific tool-input canonicalizer for TITO prefix "
-                "hashing (none|claude_code)"
+                "hashing (none|claude_code|codex)"
             ),
         )
         tito_group.add_argument(

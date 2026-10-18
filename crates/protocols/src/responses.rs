@@ -629,12 +629,15 @@ pub struct CustomTool {
     /// `custom_tool_call` items.
     pub name: String,
     /// Optional human-readable description supplied to the model.
+    #[serde(default)]
     pub description: Option<String>,
     /// When `true`, the tool definition is deferred to a later
     /// `tool_search`-style fetch instead of being loaded inline.
+    #[serde(default)]
     pub defer_loading: Option<bool>,
     /// Optional input-format constraint — `text` (unconstrained) or
     /// `grammar` (Lark / regex production).
+    #[serde(default)]
     pub format: Option<CustomToolInputFormat>,
 }
 
@@ -1534,15 +1537,44 @@ fn default_reasoning_effort() -> Option<ReasoningEffort> {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     Medium,
     High,
+    /// Spelling is `xhigh` on the wire, not the `snake_case` `x_high`.
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+    Ultra,
+    Persistent,
+}
+
+impl ReasoningEffort {
+    /// Wire spelling, identical to the serde `snake_case` representation.
+    ///
+    /// Callers that forward the effort to a plain `Option<String>` chat field
+    /// (e.g. the Responses→Chat conversion) use this so the value they pass has
+    /// exactly the spelling the client sent.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+            Self::Persistent => "persistent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningSummary {
+    None,
     Auto,
     Concise,
     Detailed,
@@ -1928,6 +1960,26 @@ pub enum ResponseInputOutputItem {
         error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// `type: "custom_tool_call"` — output-side mirror of
+    /// [`ResponseInputOutputItem::CustomToolCall`], emitted when the model
+    /// calls a user-defined `type: "custom"` tool (e.g. Codex's `apply_patch`).
+    ///
+    /// Field set intentionally matches the input variant so an output item can
+    /// be echoed back verbatim on the next turn and re-parsed as an input item.
+    /// `input` is the model's free-form payload; the client owns execution and
+    /// replies with a `custom_tool_call_output`.
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        input: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -3245,19 +3297,10 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
     };
 
     let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
-    let is_some_choice = !matches!(
-        tool_choice,
-        ResponsesToolChoice::Options(ToolChoiceOptions::None)
-    );
-
-    // Check if tool_choice requires tools but none are provided
-    if is_some_choice && !has_tools {
-        let mut e = ValidationError::new("tool_choice_requires_tools");
-        e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
-        return Err(e);
-    }
-
-    // Validate tool references exist when tools are present
+    
+    // A tools-less request cannot call anything, so a non-`none` `tool_choice` is inert
+    // rather than invalid. Codex sends `tool_choice: "auto"` unconditionally — including on
+    // its tools-less compaction turns — so rejecting the pair aborts the whole turn.
     if !has_tools {
         return Ok(());
     }
@@ -3976,5 +4019,75 @@ mod tests {
         .unwrap();
         let output_json = serde_json::to_value(output).unwrap();
         assert_eq!(output_json["namespace"], "multi_agent_v1");
+    }
+
+    #[test]
+    fn custom_tool_call_output_item_roundtrips_as_input_item() {
+        // The output variant mirrors the input variant so an emitted
+        // custom tool call can be echoed back verbatim on the next turn.
+        let item: ResponseOutputItem = serde_json::from_value(serde_json::json!({
+            "type": "custom_tool_call",
+            "id": "ctc_1",
+            "call_id": "call_1",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** End Patch"
+        }))
+        .unwrap();
+        match &item {
+            ResponseOutputItem::CustomToolCall {
+                call_id, name, input, ..
+            } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(name, "apply_patch");
+                assert_eq!(input, "*** Begin Patch\n*** End Patch");
+            }
+            other => panic!("expected custom_tool_call, got {other:?}"),
+        }
+
+        // Absent optional fields stay absent on the wire.
+        let json = serde_json::to_value(&item).unwrap();
+        assert!(json.get("namespace").is_none());
+        assert!(json.get("status").is_none());
+
+        // The emitted item re-parses as the input item type used for replay.
+        let as_input: ResponseInputOutputItem = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            as_input,
+            ResponseInputOutputItem::CustomToolCall { .. }
+        ));
+    }
+
+    #[test]
+    fn reasoning_enums_accept_codex_levels() {
+        // Codex emits effort/summary values beyond the original four; a rejected
+        // value would 400 the whole turn.
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let param: ResponseReasoningParam =
+                serde_json::from_value(serde_json::json!({ "effort": effort })).unwrap();
+            assert_eq!(param.effort.unwrap().as_str(), effort);
+        }
+        for summary in ["none", "auto", "concise", "detailed"] {
+            serde_json::from_value::<ResponseReasoningParam>(
+                serde_json::json!({ "summary": summary }),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_tool_optional_fields_default() {
+        // Codex sends `{"type":"custom","name":"apply_patch","description":...,
+        // "format":...}` and omits `defer_loading`; every optional field must
+        // default so the whole Responses request is not rejected.
+        let tool: ResponseTool =
+            serde_json::from_value(serde_json::json!({ "type": "custom", "name": "apply_patch" }))
+                .unwrap();
+        assert!(matches!(tool, ResponseTool::Custom(_)));
+
+        let nested: NamespaceTool = serde_json::from_value(
+            serde_json::json!({ "type": "custom", "name": "shell" }),
+        )
+        .unwrap();
+        assert!(matches!(nested, NamespaceTool::Custom(_)));
     }
 }

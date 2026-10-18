@@ -19,7 +19,10 @@ pub use auth::{auth_middleware, AuthConfig};
 pub use concurrency::{
     concurrency_limit_middleware, ConcurrencyLimiter, QueueProcessor, QueuedRequest, TokenGuardBody,
 };
-pub use logging::{create_logging_layer, RequestLogger, RequestSpan, ResponseLogger};
+pub use logging::{
+    create_logging_layer, create_request_line_bridge, RequestLine, RequestLineBridge, RequestLogger,
+    RequestSpan, ResponseLogger,
+};
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use storage_context::storage_context_middleware;

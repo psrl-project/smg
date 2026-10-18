@@ -58,7 +58,6 @@ use crate::{
             common::responses::{
                 build_sse_response, persist_response_if_needed,
                 streaming::{attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter},
-                utils::resolve_namespace_tool_name,
                 ResponsesContext,
             },
             utils,
@@ -388,21 +387,25 @@ impl StreamingResponseAccumulator {
             ));
         }
 
-        // Add tool calls, restoring Responses namespace metadata from the
-        // original typed tool definitions.
-        let mut tool_calls = self.tool_calls;
-        for item in &mut tool_calls {
+        // Rebuild each tool call as its wire item: restore Responses namespace
+        // metadata from the original typed tools, and return `custom_tool_call`
+        // for tools declared `type:"custom"` (e.g. Codex's apply_patch).
+        let tools = self.original_request.tools.as_deref();
+        for item in self.tool_calls {
             if let ResponseOutputItem::FunctionToolCall {
-                name, namespace, ..
+                call_id,
+                name,
+                arguments,
+                ..
             } = item
             {
-                let (restored_name, restored_namespace) =
-                    resolve_namespace_tool_name(self.original_request.tools.as_deref(), name);
-                *name = restored_name;
-                *namespace = restored_namespace;
+                output.push(conversions::tool_call_output_item(
+                    call_id, name, arguments, tools,
+                ));
+            } else {
+                output.push(item);
             }
         }
-        output.extend(tool_calls);
 
         // Determine final status
         let status = match self.finish_reason.as_deref() {
@@ -412,7 +415,8 @@ impl StreamingResponseAccumulator {
             _ => ResponseStatus::Completed,
         };
 
-        // Convert usage
+        // Convert usage. The Responses API wire shape is `input_tokens`/`output_tokens`
+        // (not the chat `prompt_tokens`); strict clients reject the chat shape.
         let usage = self.usage.as_ref().map(|u| {
             let usage_info = UsageInfo {
                 prompt_tokens: u.prompt_tokens,
@@ -424,7 +428,7 @@ impl StreamingResponseAccumulator {
                     .and_then(|d| d.reasoning_tokens),
                 prompt_tokens_details: None,
             };
-            ResponsesUsage::Classic(usage_info)
+            ResponsesUsage::Modern(usage_info.to_response_usage())
         });
 
         ResponsesResponse::builder(&self.response_id, &self.model)

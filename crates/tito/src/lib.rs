@@ -15,9 +15,9 @@ pub use normalizer::{
     RenderContext,
 };
 pub use store::{
-    MismatchEntry, PrefixLookup, PrefixMatch, ResolvedTrajectoryId, TitoSessionData, TitoStore,
-    Trajectory, TrajectoryIdReservation, TrajectoryIdStrategy, TurnRecord, TurnRoutedExperts,
-    TurnRoutedExpertsDtype,
+    LookupMissReason, MismatchEntry, PrefixLookup, PrefixMatch, ResolvedTrajectoryId,
+    TitoSessionData, TitoStore, Trajectory, TrajectoryIdReservation, TrajectoryIdStrategy,
+    TurnRecord, TurnRoutedExperts, TurnRoutedExpertsDtype,
 };
 
 /// HTTP header name for the TITO session identifier.
