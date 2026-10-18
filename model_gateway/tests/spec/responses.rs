@@ -864,26 +864,21 @@ fn test_validate_tool_choice_requires_tools() {
         "tool_choice=none without tools should be valid"
     );
 
-    // Invalid: tool_choice=auto without tools
+    // Valid: tool_choice=auto without tools is inert, not invalid.
+    //
+    // Codex sends `tool_choice: "auto"` unconditionally (`core/src/client.rs`), including on
+    // its tools-less compaction turns; rejecting the pair returned a 400 and aborted the
+    // whole turn (observed: 146/320 episodes died mid-run on this error).
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
         tools: None,
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         ..Default::default()
     };
-    let result = request.validate();
     assert!(
-        result.is_err(),
-        "tool_choice=auto without tools should be invalid"
+        request.validate().is_ok(),
+        "tool_choice=auto without tools should be inert, not invalid"
     );
-
-    if let Err(errors) = result {
-        let error_msg = errors.to_string();
-        assert!(
-            error_msg.contains("tool_choice") && error_msg.contains("tools"),
-            "Error should mention tool_choice requires tools"
-        );
-    }
 }
 
 /// Test top_logprobs requires include field

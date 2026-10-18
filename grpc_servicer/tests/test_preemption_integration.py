@@ -13,7 +13,7 @@ from vllm.outputs import STREAM_FINISHED
 
 def _make_stats(req_ids):
     s = MagicMock()
-    s.gateway_preemption_req_ids = req_ids
+    s.preemption_req_ids = req_ids
     return s
 
 

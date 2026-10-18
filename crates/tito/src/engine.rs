@@ -337,10 +337,11 @@ fn tokenize_segment_incremental(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::model_adapter::DefaultAdapter;
     use llm_tokenizer::chat_template::ChatTemplateProcessor;
     use openai_protocol::chat::MessageContent;
+
+    use super::*;
+    use crate::model_adapter::DefaultAdapter;
 
     fn user_msg(content: &str) -> ChatMessage {
         ChatMessage::User {

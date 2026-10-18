@@ -464,10 +464,16 @@ impl HarmonyBuilder {
             .as_ref()
             .and_then(|r| r.effort.as_ref())
             .map(|effort| match effort {
-                ResponsesReasoningEffort::High => ReasoningEffort::High,
+                ResponsesReasoningEffort::High
+                | ResponsesReasoningEffort::XHigh
+                | ResponsesReasoningEffort::Max
+                | ResponsesReasoningEffort::Ultra
+                | ResponsesReasoningEffort::Persistent => ReasoningEffort::High,
                 ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
                 ResponsesReasoningEffort::Low => ReasoningEffort::Low,
-                ResponsesReasoningEffort::Minimal => ReasoningEffort::Low,
+                ResponsesReasoningEffort::None | ResponsesReasoningEffort::Minimal => {
+                    ReasoningEffort::Low
+                }
             });
 
         self.build_system_message(reasoning_effort, with_custom_tools)

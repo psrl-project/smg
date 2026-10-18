@@ -6,6 +6,7 @@ use validator::Validate;
 
 use super::{
     common::{default_true, deserialize_null_as_false, GenerationRequest, InputIds},
+    sampler_capture::SamplerCaptureWidth,
     sampling_params::SamplingParams,
 };
 use crate::validated::Normalizable;
@@ -138,6 +139,13 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs_num: Option<i32>,
 
+    /// Capture the sampler's top-k head for score centering.
+    ///
+    /// The /generate response carries the head in `meta_info.output_topk_*`, independent of the
+    /// `top_logprobs_num` alternatives surfaced to the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampler_top_logprobs: Option<SamplerCaptureWidth>,
+
     /// If return logprobs, the token ids to return logprob for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids_logprob: Option<Vec<u32>>,
@@ -263,6 +271,17 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
     if count > 1 {
         return Err(validator::ValidationError::new(
             "Either text or input_ids should be provided.",
+        ));
+    }
+
+    // Sampler capture is delivered through the completed response metadata, so it cannot stream.
+    if req
+        .sampler_top_logprobs
+        .is_some_and(SamplerCaptureWidth::is_enabled)
+        && req.stream
+    {
+        return Err(validator::ValidationError::new(
+            "sampler_top_logprobs requires a non-streaming /generate request",
         ));
     }
 
@@ -395,6 +414,15 @@ pub struct GenerateMetaInfo {
     pub prompt_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routed_experts: Option<String>,
+    /// Base64 little-endian int32 sampler top-k token ids for score centering, shape `[R, k]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_topk_token_ids: Option<String>,
+    /// Base64 little-endian float32 sampler top-k logprobs matching `output_topk_token_ids`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_topk_log_probs: Option<String>,
+    /// Shape `[R, k]` of the sampler top-k head in `output_topk_token_ids`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_topk_shape: Option<Vec<u32>>,
 }
 
 /// Finish reason for generate endpoint

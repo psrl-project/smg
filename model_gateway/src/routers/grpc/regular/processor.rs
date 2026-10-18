@@ -194,12 +194,28 @@ impl ResponseProcessor {
         let matched_stop = complete.matched_stop_json();
 
         // Step 4: Convert output logprobs if present.
-        let logprobs = if suppress_logprobs {
+        let logprobs = if suppress_logprobs || !original_request.logprobs {
             None
         } else {
-            complete.output_logprobs().map(|ref proto_logprobs| {
-                utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer)
-            })
+            complete
+                .output_logprobs(original_request.top_logprobs.unwrap_or(1) > 0)
+                .map(|mut proto_logprobs| {
+                    let width = original_request.top_logprobs.unwrap_or(1) as usize;
+                    if width == 0 {
+                        proto_logprobs.top_logprobs.clear();
+                    } else {
+                        for row in &mut proto_logprobs.top_logprobs {
+                            if row.token_ids.len() > width {
+                                let mut entries: Vec<_> =
+                                    row.token_ids.drain(..).zip(row.values.drain(..)).collect();
+                                entries.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                                entries.truncate(width);
+                                (row.token_ids, row.values) = entries.into_iter().unzip();
+                            }
+                        }
+                    }
+                    utils::convert_proto_to_openai_logprobs(&proto_logprobs, tokenizer)
+                })
         };
 
         // Step 5: Build ChatCompletionMessage (proper response message type)
@@ -397,16 +413,22 @@ impl ResponseProcessor {
     pub async fn process_non_streaming_generate_response(
         &self,
         execution_result: ExecutionResult,
-        _generate_request: Arc<GenerateRequest>,
+        generate_request: Arc<GenerateRequest>,
         dispatch: DispatchMetadata,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
         mut prompt_token_ids: Option<Vec<u32>>,
         start_time: Instant,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
+        // Score-centering capture needs the sampler head even when no logprobs are surfaced.
+        let capture_width = generate_request
+            .sampler_top_logprobs
+            .filter(|width| width.is_enabled());
+        let collect_logprobs = request_logprobs || capture_width.is_some();
+
         // Collect all responses from the execution result
         let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
+            response_collection::collect_responses(execution_result, collect_logprobs).await?;
 
         // Process each completion
         let response_count = all_responses.len();
@@ -465,12 +487,26 @@ impl ResponseProcessor {
 
             let output_token_logprobs = if request_logprobs {
                 complete
-                    .output_logprobs()
+                    .output_logprobs(true)
                     .as_ref()
                     .map(utils::convert_generate_output_logprobs)
             } else {
                 None
             };
+
+            // Sampler top-k head for score centering, encoded like the routed-experts payload.
+            let (output_topk_token_ids, output_topk_log_probs, output_topk_shape) =
+                match capture_width {
+                    Some(width) => complete
+                        .output_logprobs(true)
+                        .as_ref()
+                        .and_then(|lp| {
+                            utils::sampler_topk::encode_sampler_topk_for_response(lp, width)
+                        })
+                        .map(|(ids, log_probs, shape)| (Some(ids), Some(log_probs), Some(shape)))
+                        .unwrap_or((None, None, None)),
+                    None => (None, None, None),
+                };
 
             // Build GenerateResponse struct
             let routed_experts = complete
@@ -499,6 +535,9 @@ impl ResponseProcessor {
                     prompt_token_ids.clone()
                 },
                 routed_experts,
+                output_topk_token_ids,
+                output_topk_log_probs,
+                output_topk_shape,
             };
 
             result_array.push(GenerateResponse {

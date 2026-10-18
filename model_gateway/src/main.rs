@@ -860,18 +860,20 @@ struct CliArgs {
     /// Harness-specific tool-input canonicalizer applied while computing TITO
     /// prefix hashes. `none` disables it; `claude_code` mirrors Claude Code's
     /// `normalizeToolInput` (drops a redundant `cd <workdir> && ` prefix on
-    /// Bash and materializes the Edit `replace_all` default) so replayed,
-    /// normalized histories keep matching the stored prefix.
+    /// Bash and materializes the Edit `replace_all` default); `codex` drops the
+    /// same redundant prefix on `exec_command` so replayed, normalized histories
+    /// keep matching the stored prefix.
     #[arg(
         long,
         default_value = "none",
-        value_parser = ["none", "claude_code"],
+        value_parser = ["none", "claude_code", "codex"],
         help_heading = "TITO"
     )]
     tito_tool_normalization: String,
 
     /// Working directory the selected tool canonicalizer assumes commands run
-    /// from (used by `claude_code` to strip a redundant `cd <workdir> && `).
+    /// from (used by the `claude_code` / `codex` canonicalizers to strip a
+    /// redundant `cd <workdir> && `).
     #[arg(long, default_value = "/testbed", help_heading = "TITO")]
     tito_workdir: String,
 

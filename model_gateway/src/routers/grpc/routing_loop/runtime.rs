@@ -1005,7 +1005,7 @@ async fn dispatch_entry_with_partial_rollout(
 
     // ── Step 4: drain the stream, collecting tokens and finish_reason ────
     let mut stream = stream;
-    let drained = match drain_stream_for_partial_rollout(&mut stream).await {
+    let mut drained = match drain_stream_for_partial_rollout(&mut stream).await {
         Ok(d) => d,
         Err(msg) => {
             error!(
@@ -1026,7 +1026,7 @@ async fn dispatch_entry_with_partial_rollout(
     match drained.finish_reason.as_str() {
         "stop" | "length" => {
             // ── ROLLOUT_COMPLETED ────────────────────────────────────────
-            if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
+            if let Err(re_err) = merge_into_partial_state(&mut partial_state, &mut drained) {
                 let response =
                     router_error::internal_error(re_err.error_code(), re_err.to_string().as_str());
                 send_completion_error(completion, response);
@@ -1077,6 +1077,7 @@ async fn dispatch_entry_with_partial_rollout(
                 if let Err(re_err) = complete.set_partial_rollout_outputs(
                     merged_token_ids,
                     partial_state.logprobs.take(),
+                    partial_state.top_logprobs.take(),
                     merged_re,
                     partial_state.prompt_len,
                     partial_state.first_iter_prompt_start,
@@ -1139,7 +1140,7 @@ async fn dispatch_entry_with_partial_rollout(
         }
         "abort" => {
             // ── ROLLOUT_INTERRUPTED — loopback to newly-synced instance ──
-            if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
+            if let Err(re_err) = merge_into_partial_state(&mut partial_state, &mut drained) {
                 let response =
                     router_error::internal_error(re_err.error_code(), re_err.to_string().as_str());
                 send_completion_error(completion, response);

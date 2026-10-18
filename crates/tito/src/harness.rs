@@ -26,6 +26,7 @@
 //!
 //! The trait is the extension point for future harnesses: implement
 //! [`ToolInputCanonicalizer`] and register it in [`build_tool_canonicalizer`].
+//! `claude_code` and `codex` are the two shipped adapters.
 
 use std::sync::Arc;
 
@@ -114,9 +115,53 @@ impl ToolInputCanonicalizer for ClaudeCodeToolCanonicalizer {
     }
 }
 
+/// Codex CLI value-level canonicalization.
+///
+/// Codex resends the model's `exec_command` arguments verbatim, so unlike Claude Code it
+/// does not itself rewrite tool inputs. What it does share is the Bash semantics: the
+/// shell runs in the session working directory, and the model frequently spells a command
+/// with a redundant `cd {workdir} && ` prefix. Stripping that prefix symmetrically keeps
+/// the stored prefix and a replayed prefix on the same hash whether or not the model
+/// included it.
+///
+/// `apply_patch` input is a free-form patch body and is never touched.
+#[derive(Debug)]
+pub struct CodexToolCanonicalizer {
+    workdir: String,
+}
+
+impl CodexToolCanonicalizer {
+    pub fn new(workdir: impl Into<String>) -> Self {
+        Self {
+            workdir: workdir.into(),
+        }
+    }
+}
+
+impl ToolInputCanonicalizer for CodexToolCanonicalizer {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    fn canonicalize(&self, tool_name: &str, input: Value) -> Value {
+        let Value::Object(mut map) = input else {
+            return input;
+        };
+        if tool_name.to_ascii_lowercase() == "exec_command" {
+            if let Some(Value::String(command)) = map.get_mut("cmd") {
+                let prefix = format!("cd {} && ", self.workdir);
+                if let Some(rest) = command.strip_prefix(&prefix) {
+                    *command = rest.to_string();
+                }
+            }
+        }
+        Value::Object(map)
+    }
+}
+
 /// Build the canonicalizer selected by a configuration string.
 ///
-/// `mode` accepts `none` (default, identity) or `claude_code`.  Unknown modes
+/// `mode` accepts `none` (default, identity), `claude_code`, or `codex`. Unknown modes
 /// fall back to the identity canonicalizer and are reported to the caller via
 /// logging inside the store, never by panicking.
 pub fn build_tool_canonicalizer(
@@ -128,6 +173,7 @@ pub fn build_tool_canonicalizer(
         "claude_code" => Arc::new(ClaudeCodeToolCanonicalizer::new(
             workdir.unwrap_or("/testbed"),
         )),
+        "codex" => Arc::new(CodexToolCanonicalizer::new(workdir.unwrap_or("/testbed"))),
         _ => Arc::new(NoopToolCanonicalizer),
     }
 }
@@ -136,6 +182,7 @@ pub fn build_tool_canonicalizer(
 mod tests {
     use super::*;
     use serde_json::json;
+
 
     #[test]
     fn claude_code_strips_redundant_cd_prefix() {
@@ -178,12 +225,37 @@ mod tests {
     }
 
     #[test]
+    fn codex_strips_redundant_cd_prefix_on_exec_command() {
+        let c = CodexToolCanonicalizer::new("/testbed");
+        let input = json!({"cmd": "cd /testbed && python -m pytest -q", "yield_time_ms": 1000});
+        let out = c.canonicalize("exec_command", input);
+        assert_eq!(out["cmd"], "python -m pytest -q");
+        assert_eq!(out["yield_time_ms"], 1000);
+    }
+
+    #[test]
+    fn codex_preserves_other_prefixes_and_apply_patch_input() {
+        let c = CodexToolCanonicalizer::new("/testbed");
+        assert_eq!(
+            c.canonicalize("exec_command", json!({"cmd": "cd /tmp && ls"}))["cmd"],
+            "cd /tmp && ls"
+        );
+        // apply_patch input is a free-form patch body and must survive untouched.
+        let patch = json!({"input": "*** Begin Patch\n*** Update File: a.py\n+x\n*** End Patch"});
+        assert_eq!(c.canonicalize("apply_patch", patch.clone()), patch);
+    }
+
+    #[test]
     fn builder_selects_known_harnesses_only() {
         assert_eq!(build_tool_canonicalizer(Some("none"), None).name(), "none");
         assert_eq!(build_tool_canonicalizer(None, None).name(), "none");
         assert_eq!(
             build_tool_canonicalizer(Some("claude_code"), Some("/repo")).name(),
             "claude_code"
+        );
+        assert_eq!(
+            build_tool_canonicalizer(Some("codex"), Some("/repo")).name(),
+            "codex"
         );
         assert_eq!(
             build_tool_canonicalizer(Some("unknown"), None).name(),

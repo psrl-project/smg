@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::{
-    common::Tool,
+    common::{Function, Tool},
     responses::{NamespaceTool, ResponseTool, ResponsesRequest, ResponsesResponse},
 };
-use serde_json::to_value;
+use serde_json::{json, to_value};
 use smg_data_connector::{
     ConversationItemStorage, ConversationStorage, RequestContext as StorageRequestContext,
     ResponseStorage,
@@ -172,25 +172,94 @@ pub(crate) fn extract_tools_from_response_tools(
                 tool_type: "function".to_string(),
                 function: ft.function.clone(),
             }],
+            // A user-defined `type:"custom"` tool (e.g. Codex's `apply_patch`)
+            // carries a free-form `input` string rather than a JSON schema. The
+            // chat template can only render function tools, so expose it as a
+            // single-`input` function; `chat_to_responses` maps the call back to
+            // a `custom_tool_call` for tools listed here.
+            ResponseTool::Custom(custom) => vec![custom_tool_as_function(custom.name.clone(), custom.description.clone())],
             ResponseTool::Namespace(namespace) => namespace
                 .tools
                 .iter()
-                .filter_map(|tool| match tool {
+                .map(|tool| match tool {
                     NamespaceTool::Function(function) => {
                         let mut function = function.function.clone();
                         function.name =
                             flatten_namespace_tool_name(&namespace.name, &function.name);
-                        Some(Tool {
+                        Tool {
                             tool_type: "function".to_string(),
                             function,
-                        })
+                        }
                     }
-                    NamespaceTool::Custom(_) => None,
+                    NamespaceTool::Custom(custom) => custom_tool_as_function(
+                        flatten_namespace_tool_name(&namespace.name, &custom.name),
+                        custom.description.clone(),
+                    ),
                 })
                 .collect(),
             _ => Vec::new(),
         })
         .collect()
+}
+
+/// Model-facing name of a custom tool, flattened under its namespace if any.
+fn custom_tool_flat_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) => flatten_namespace_tool_name(namespace, name),
+        None => name.to_string(),
+    }
+}
+
+/// Expose a `type:"custom"` tool to the chat model as a single-`input` function.
+///
+/// The model cannot be grammar-constrained through the chat template, so the
+/// free-form payload is carried as one string parameter. `chat_to_responses`
+/// unwraps it back into the custom tool's `input` field.
+fn custom_tool_as_function(name: String, description: Option<String>) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name,
+            description,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "The free-form payload for this tool.",
+                    }
+                },
+                "required": ["input"],
+            }),
+            strict: Some(false),
+        },
+    }
+}
+
+/// Names (model-facing, namespace-flattened) of every `type:"custom"` tool in
+/// the request. `chat_to_responses` uses this set to decide whether a tool call
+/// is emitted as a `custom_tool_call` or a plain `function_call`.
+pub(crate) fn custom_tool_names(response_tools: Option<&[ResponseTool]>) -> std::collections::HashSet<String> {
+    let Some(tools) = response_tools else {
+        return std::collections::HashSet::new();
+    };
+    let mut names = std::collections::HashSet::new();
+    for tool in tools {
+        match tool {
+            ResponseTool::Custom(custom) => {
+                names.insert(custom_tool_flat_name(None, &custom.name));
+            }
+            ResponseTool::Namespace(namespace) => {
+                for nested in &namespace.tools {
+                    if let NamespaceTool::Custom(custom) = nested {
+                        names.insert(custom_tool_flat_name(Some(&namespace.name), &custom.name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 /// Persist response to storage if store=true
@@ -224,5 +293,61 @@ pub(crate) async fn persist_response_if_needed(
         } else {
             debug!("Persisted response: {}", response.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tools(value: serde_json::Value) -> Vec<ResponseTool> {
+        serde_json::from_value(value).expect("valid tools")
+    }
+
+    #[test]
+    fn custom_tool_becomes_single_input_function() {
+        let tools = tools(json!([
+            { "type": "custom", "name": "apply_patch", "description": "patch files" }
+        ]));
+
+        let extracted = extract_tools_from_response_tools(Some(&tools));
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].function.name, "apply_patch");
+        assert_eq!(extracted[0].function.description.as_deref(), Some("patch files"));
+        assert_eq!(extracted[0].function.parameters["required"], json!(["input"]));
+        assert_eq!(
+            extracted[0].function.parameters["properties"]["input"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn custom_tool_names_flatten_namespace() {
+        let tools = tools(json!([
+            { "type": "custom", "name": "apply_patch" },
+            { "type": "namespace", "name": "ns", "description": "group",
+              "tools": [{ "type": "custom", "name": "shell" }] }
+        ]));
+
+        let names = custom_tool_names(Some(&tools));
+
+        assert!(names.contains("apply_patch"));
+        assert!(names.contains("ns__shell"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn namespaced_custom_extracted_with_flattened_name() {
+        let tools = tools(json!([
+            { "type": "namespace", "name": "ns", "description": "group",
+              "tools": [{ "type": "custom", "name": "shell" }] }
+        ]));
+
+        let extracted = extract_tools_from_response_tools(Some(&tools));
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].function.name, "ns__shell");
     }
 }

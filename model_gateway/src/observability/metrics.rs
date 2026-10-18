@@ -1,6 +1,13 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
@@ -403,6 +410,22 @@ pub(crate) fn init_metrics() {
         "SHM tensor write attempts that failed and fell back to inline, by runtime"
     );
 
+    // TITO prefix-lookup observability.  A miss forks a new trajectory, so the
+    // hit ratio and the miss-reason split are the primary signal for diagnosing
+    // a tree that degenerates into per-turn roots.
+    describe_counter!(
+        "smg_tito_prefix_lookup_total",
+        "TITO prefix lookups by result (hit/miss)"
+    );
+    describe_counter!(
+        "smg_tito_prefix_lookup_miss_total",
+        "TITO prefix lookup misses by reason (no_candidates/session_not_found/no_matching_node)"
+    );
+    describe_gauge!(
+        "smg_tito_prefix_hit_ratio",
+        "Cumulative TITO prefix lookup hit ratio since process start"
+    );
+
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
 
@@ -413,6 +436,40 @@ pub(crate) fn init_metrics() {
     // is enabled and recording).
     use crate::middleware::scheduler::metrics as scheduler_metrics;
     scheduler_metrics::describe();
+}
+
+/// Cumulative TITO prefix-lookup counters backing the hit-ratio gauge.
+///
+/// Prometheus can derive the live rate from `smg_tito_prefix_lookup_total`;
+/// these atomics additionally expose a process-lifetime ratio as a gauge so it
+/// is visible without a PromQL query.
+static TITO_LOOKUP_HITS: AtomicU64 = AtomicU64::new(0);
+static TITO_LOOKUP_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Record one TITO prefix lookup and refresh the cumulative hit-ratio gauge.
+///
+/// `miss_reason` must be a stable, low-cardinality label (see
+/// [`smg_tito::LookupMissReason::as_str`]); it is ignored on a hit.  Callers
+/// log the per-request detail (including `session_id`) themselves; keeping it
+/// out of the metric labels avoids high cardinality.
+pub(crate) fn record_tito_lookup(hit: bool, miss_reason: Option<&'static str>) {
+    if hit {
+        counter!("smg_tito_prefix_lookup_total", "result" => "hit").increment(1);
+        TITO_LOOKUP_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        counter!("smg_tito_prefix_lookup_total", "result" => "miss").increment(1);
+        if let Some(reason) = miss_reason {
+            counter!("smg_tito_prefix_lookup_miss_total", "reason" => reason).increment(1);
+        }
+        TITO_LOOKUP_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let hits = TITO_LOOKUP_HITS.load(Ordering::Relaxed);
+    let misses = TITO_LOOKUP_MISSES.load(Ordering::Relaxed);
+    let total = hits + misses;
+    if total > 0 {
+        gauge!("smg_tito_prefix_hit_ratio").set(hits as f64 / total as f64);
+    }
 }
 
 #[expect(

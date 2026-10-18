@@ -523,6 +523,9 @@ struct Router {
     tito_tool_normalization: String,
     tito_workdir: String,
     tito_drop_dead_leaves: bool,
+    /// LMCache multiprocess coordinator base URL. Empty disables the off-GPU
+    /// cache-event source (appended at the very end, see the note above).
+    psrl_lmcache_coordinator_addr: String,
 }
 
 impl Router {
@@ -944,6 +947,7 @@ impl Router {
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .worker_selection_strategy(worker_selection_strategy)
             .psrl_ps_manager_addr(&self.psrl_ps_manager_addr)
+            .psrl_lmcache_coordinator_addr(&self.psrl_lmcache_coordinator_addr)
             .psrl_candidate_sort_key(candidate_sort_key)
             .psrl_enable_group_sticky(self.psrl_enable_group_sticky)
             .psrl_kv_transfer(kv_transfer_config)
@@ -1111,6 +1115,7 @@ impl Router {
         tito_tool_normalization = String::from("none"),
         tito_workdir = String::from("/testbed"),
         tito_drop_dead_leaves = false,
+        psrl_lmcache_coordinator_addr = String::new(),
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1267,6 +1272,7 @@ impl Router {
         tito_tool_normalization: String,
         tito_workdir: String,
         tito_drop_dead_leaves: bool,
+        psrl_lmcache_coordinator_addr: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1446,6 +1452,7 @@ impl Router {
             tito_tool_normalization,
             tito_workdir,
             tito_drop_dead_leaves,
+            psrl_lmcache_coordinator_addr,
         })
     }
 

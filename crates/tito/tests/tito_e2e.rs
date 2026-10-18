@@ -11,15 +11,13 @@
 //! on the training hosts.  If neither exists the tests are skipped (they are not
 //! part of a hermetic CI build).
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use llm_tokenizer::{
     chat_template::ChatTemplateParams, create_tokenizer_with_chat_template, traits::Tokenizer,
 };
 use openai_protocol::chat::{ChatMessage, MessageContent};
 use serde_json::json;
-
 use smg_tito::{
     engine::TitoEngine,
     model_adapter::{select_adapter_for_tokenizer, ModelAdapter},
@@ -327,6 +325,8 @@ fn record(prompt_token_count: usize) -> TurnRecord {
     TurnRecord {
         prompt_token_count,
         output_logprobs: None,
+        sampler_capture_width: 0,
+        sampler_distribution: None,
         finish_reason: "stop".to_string(),
         mismatch_report: vec![],
         routed_experts: None,

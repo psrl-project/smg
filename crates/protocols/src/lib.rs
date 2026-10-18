@@ -29,6 +29,7 @@ pub mod realtime_response;
 pub mod realtime_session;
 pub mod rerank;
 pub mod responses;
+pub mod sampler_capture;
 pub mod sampling_params;
 pub mod tokenize;
 pub mod transcription;

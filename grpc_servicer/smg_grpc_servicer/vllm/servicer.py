@@ -7,7 +7,6 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 
 import asyncio
 import hashlib
-import itertools
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -1025,65 +1024,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if isinstance(event, BlockStored):
             cache_level = 0 if (event.medium is None or event.medium == "GPU") else 1
 
-            # region agent log
-            try:
-                _dbg_a = globals().setdefault(
-                    "_DBG_KVEVENT_AGG",
-                    {
-                        "stored_level0": 0,
-                        "stored_level1": 0,
-                        "mediums": {},
-                        "lmc_parent_none": 0,
-                        "lmc_parent_zero_sentinel": 0,
-                        "lmc_parent_real": 0,
-                    },
-                )
-                _dbg_a["stored_level0" if cache_level == 0 else "stored_level1"] += 1
-                _dbg_mk = f"{type(event.medium).__name__}:{event.medium!r}"
-                _dbg_a["mediums"][_dbg_mk] = _dbg_a["mediums"].get(_dbg_mk, 0) + 1
-                if cache_level == 1:
-                    if event.parent_block_hash is None:
-                        _dbg_a["lmc_parent_none"] += 1
-                    elif event.parent_block_hash == 0:
-                        _dbg_a["lmc_parent_zero_sentinel"] += 1
-                    else:
-                        _dbg_a["lmc_parent_real"] += 1
-                _dbg_tot = _dbg_a["stored_level0"] + _dbg_a["stored_level1"]
-                if _dbg_tot % 2000 == 0 or (
-                    cache_level == 1 and _dbg_a["stored_level1"] <= 3
-                ):
-                    import json as _dbg_json
-                    import os as _dbg_os
-                    import time as _dbg_time
-
-                    with open(
-                        "/apdcephfs_zwfy10/share_303541817/lhy/.cursor/debug-48f20e.log",
-                        "a",
-                    ) as _dbg_f:
-                        _dbg_f.write(
-                            _dbg_json.dumps(
-                                {
-                                    "sessionId": "48f20e",
-                                    "runId": "run1",
-                                    "hypothesisId": "H1+H5",
-                                    "location": "smg_grpc_servicer/vllm/servicer.py:905",
-                                    "message": "KV BlockStored events bridged to router, by cache_level",
-                                    "data": dict(
-                                        _dbg_a,
-                                        pid=_dbg_os.getpid(),
-                                        last_block_size=int(event.block_size),
-                                        last_n_hashes=len(event.block_hashes),
-                                        last_n_token_ids=len(event.token_ids or []),
-                                    ),
-                                    "timestamp": int(_dbg_time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-            except Exception:
-                pass
-            # endregion
-
             blocks = []
             for i, bh in enumerate(event.block_hashes):
                 start = i * event.block_size
@@ -1460,13 +1400,38 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         logprob_entry: dict,
         num_top_logprobs: int | None,
     ) -> vllm_engine_pb2.TopLogProbs:
-        """Build TopLogProbs proto from a logprob entry dict."""
-        top = vllm_engine_pb2.TopLogProbs()
-        if num_top_logprobs and num_top_logprobs > 0 and logprob_entry:
-            for tid, lp in itertools.islice(logprob_entry.items(), num_top_logprobs):
-                top.token_ids.append(tid)
-                top.values.append(lp.logprob)
-        return top
+        """Build TopLogProbs proto from a logprob entry dict.
+
+        Filters to entries with ``rank <= num_top_logprobs`` so the wire row is exactly
+        ``num_top_logprobs`` columns wide (the engine returns one extra column for the sampled token,
+        which is deduplicated when it also appears in the top-k). ``num_top_logprobs`` is the caller's
+        capture width; see the trainer's ``capture_width`` for the authoritative definition.
+        """
+        if not num_top_logprobs or not logprob_entry:
+            return vllm_engine_pb2.TopLogProbs()
+        if len(logprob_entry) <= num_top_logprobs:
+            # The engine returns the top-`num` entries plus, at most, the sampled token when it falls
+            # outside them (deduplicated when it is inside). A dict no larger than the budget therefore
+            # holds only in-head entries, so this common case skips the per-entry rank filter and its
+            # attribute access entirely. A stray out-of-head entry is harmless: the Rust encoders sort
+            # by log-prob and take ``width``, dropping the lowest entry anyway.
+            return vllm_engine_pb2.TopLogProbs(
+                token_ids=list(logprob_entry),
+                values=[lp.logprob for lp in logprob_entry.values()],
+            )
+        # No sorting here: this runs in Python once per generated position, so an O(k log k) sort per
+        # position is a real capture-path hotspot. Ordering is canonicalized downstream in Rust (the
+        # TITO path in `extract_turn_record`, the /generate head in `encode_sampler_topk_for_response`).
+        # One fused pass (the sampled token, inserted first, is the only entry that can fall outside
+        # the requested head) beats a filter comprehension plus two projection comprehensions.
+        token_ids, values = [], []
+        for token_id, logprob in logprob_entry.items():
+            if logprob.rank is not None and logprob.rank <= num_top_logprobs:
+                token_ids.append(token_id)
+                values.append(logprob.logprob)
+        if not token_ids:
+            return vllm_engine_pb2.TopLogProbs()
+        return vllm_engine_pb2.TopLogProbs(token_ids=token_ids, values=values)
 
     @staticmethod
     def _build_routed_experts_tensor(
@@ -1532,19 +1497,27 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if not logprobs:
             return None
 
-        proto = vllm_engine_pb2.OutputLogProbs()
+        # One dict lookup per position via the walrus (the previous `in` + `[]` did two).
+        rows = [
+            (token_id, logprob, logprob_entry)
+            for token_id, logprob_entry in zip(token_ids, logprobs)
+            if (logprob := logprob_entry.get(token_id)) is not None
+        ]
+        if not rows:
+            return None
 
-        for token_id, logprob_entry in zip(token_ids, logprobs):
-            if logprob := logprob_entry.get(token_id):
-                proto.token_logprobs.append(logprob.logprob)
-                proto.token_ids.append(token_id)
-
-                if num_top_logprobs:
-                    proto.top_logprobs.append(
-                        VllmEngineServicer._build_top_logprobs(logprob_entry, num_top_logprobs)
-                    )
-
-        return proto if proto.token_ids else None
+        # Bulk constructor fill for the two scalar fields (one C-level call each) instead of a Python
+        # `.append` per element; the per-position alternatives are still one message each.
+        proto = vllm_engine_pb2.OutputLogProbs(
+            token_logprobs=[logprob.logprob for _, logprob, _ in rows],
+            token_ids=[token_id for token_id, _, _ in rows],
+        )
+        if num_top_logprobs:
+            build_top_logprobs = VllmEngineServicer._build_top_logprobs
+            proto.top_logprobs.extend(
+                build_top_logprobs(logprob_entry, num_top_logprobs) for _, _, logprob_entry in rows
+            )
+        return proto
 
     @staticmethod
     def _build_input_logprobs(

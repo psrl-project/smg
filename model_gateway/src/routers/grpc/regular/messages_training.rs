@@ -326,6 +326,7 @@ pub(crate) fn messages_to_training_chat(
         tools,
         top_p: request.top_p.map(|value| value as f32),
         top_k: request.top_k.map(|value| value as i32),
+        sampler_top_logprobs: request.sampler_top_logprobs,
         chat_template_kwargs,
         ..Default::default()
     };

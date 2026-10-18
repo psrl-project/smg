@@ -691,6 +691,7 @@ impl ResponseStreamEventEmitter {
 
         // Convert Usage to ResponsesUsage
         let responses_usage = usage.map(|u| {
+            // Responses API wire shape (`input_tokens`/`output_tokens`), not the chat one.
             let usage_info = UsageInfo {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
@@ -701,7 +702,7 @@ impl ResponseStreamEventEmitter {
                     .and_then(|d| d.reasoning_tokens),
                 prompt_tokens_details: None,
             };
-            ResponsesUsage::Classic(usage_info)
+            ResponsesUsage::Modern(usage_info.to_response_usage())
         });
 
         // Build response using builder

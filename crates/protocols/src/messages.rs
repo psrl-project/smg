@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::{common::GenerationRequest, validated::Normalizable};
+use crate::{
+    common::GenerationRequest, sampler_capture::SamplerCaptureWidth, validated::Normalizable,
+};
 
 // ============================================================================
 // Request Types
@@ -66,6 +68,13 @@ pub struct CreateMessageRequest {
 
     /// Use nucleus sampling.
     pub top_p: Option<f64>,
+
+    /// Capture the sampler's top-k head for score centering.
+    ///
+    /// Anthropic Messages lowers to the canonical chat training IR, so this mirrors
+    /// `ChatCompletionRequest.sampler_top_logprobs` and only applies to TITO training requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampler_top_logprobs: Option<SamplerCaptureWidth>,
 
     // Beta features
     /// Container configuration for code execution (beta).
@@ -190,6 +199,17 @@ impl Tool {
 }
 /// Validate cross-field constraints for Messages API requests.
 fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator::ValidationError> {
+    // TITO sampler capture is served one completed non-streaming turn at a time.
+    if req
+        .sampler_top_logprobs
+        .is_some_and(SamplerCaptureWidth::is_enabled)
+        && req.stream.unwrap_or(false)
+    {
+        let mut e = validator::ValidationError::new("invalid_sampler_capture_mode");
+        e.message = Some("Sampler capture requires one non-streaming completion".into());
+        return Err(e);
+    }
+
     if req.has_mcp_toolset() && req.mcp_server_configs().is_none() {
         let mut e = validator::ValidationError::new("mcp_servers_required");
         e.message = Some("mcp_servers is required when mcp_toolset tools are present".into());
@@ -2015,6 +2035,7 @@ mod tests {
             tools: None,
             top_k: None,
             top_p: None,
+            sampler_top_logprobs: None,
             container: None,
             mcp_servers: None,
             other: Map::new(),

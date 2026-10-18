@@ -4,9 +4,15 @@
 //! handlers that propagate W3C trace context, attach the request ID into
 //! the span, and record HTTP-level metrics via the observability layer.
 
-use std::time::Duration;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{extract::Request, response::Response};
+use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -19,6 +25,84 @@ use crate::observability::{
 use crate::routers::error::{
     extract_error_code_from_response, PROMPT_OVERFLOW_ERROR_CODE,
 };
+
+/// The request line a completed response answers, carried on the response so the
+/// completion log can name the caller.
+///
+/// The default (non-JSON) log format prints no span fields, so the `method`/`uri`
+/// recorded on the request span never reach the log line, and `OnResponse` sees
+/// only the response. [`RequestLineBridge`] therefore captures these on the
+/// request and hands them to `on_response` through the response extensions —
+/// the one channel both sides share.
+#[derive(Clone, Debug)]
+pub struct RequestLine {
+    /// HTTP method, interned through [`method_to_static_str`].
+    pub method: &'static str,
+    /// Raw request path as the caller sent it (`uri.path()`).
+    pub uri: String,
+    /// Matched axum route template, or `"other"` when nothing matched.
+    pub matched: String,
+}
+
+/// Layer that copies the request line from a request onto its response.
+///
+/// Apply it *inside* [`create_logging_layer`]: the response it annotates is the
+/// one `ResponseLogger` then reads. A request that never produces a response
+/// (client disconnect) simply drops its line with the request, so nothing is
+/// retained between requests.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestLineBridge;
+
+impl<S> Layer<S> for RequestLineBridge {
+    type Service = RequestLineBridgeService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestLineBridgeService { inner }
+    }
+}
+
+/// Service produced by [`RequestLineBridge`].
+#[derive(Clone, Debug)]
+pub struct RequestLineBridgeService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<Request<B>> for RequestLineBridgeService<S>
+where
+    S: Service<Request<B>, Response = Response<B>> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = Response<B>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        // `matched_path_label` borrows the request extensions, so resolve the
+        // whole line before the request moves into the inner service.
+        let line = RequestLine {
+            method: method_to_static_str(req.method().as_str()),
+            uri: req.uri().path().to_owned(),
+            matched: matched_path_label(req.extensions()).to_owned(),
+        };
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            let mut response = inner.call(req).await?;
+            response.extensions_mut().insert(line);
+            Ok(response)
+        })
+    }
+}
+
+/// Build the request-line bridge layer.
+pub fn create_request_line_bridge() -> RequestLineBridge {
+    RequestLineBridge
+}
+
 
 /// Custom span maker that includes request ID
 #[derive(Clone, Debug)]
@@ -93,9 +177,19 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         // Log the response completion
         let _enter = span.enter();
+        // The caller's method and route, when the bridge ran. Absent only for a
+        // response that bypassed the layer stack, which is worth saying.
+        let line = response.extensions().get::<RequestLine>();
+        let method = line.map_or("<unknown>", |line| line.method);
+        let uri = line.map_or("<unknown>", |line| line.uri.as_str());
+        let matched_route = line.map_or("<unknown>", |line| line.matched.as_str());
         if status.is_server_error() {
             error!(
                 target: "smg::response",
+                method,
+                uri,
+                matched_route,
+                status_code,
                 "request failed with server error"
             );
         } else if status.is_client_error() {
@@ -112,6 +206,11 @@ impl<B> OnResponse<B> for ResponseLogger {
             } else {
                 warn!(
                     target: "smg::response",
+                    method,
+                    uri,
+                    matched_route,
+                    status_code,
+                    error_code,
                     "request failed with client error"
                 );
             }
