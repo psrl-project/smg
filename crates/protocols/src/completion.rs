@@ -14,6 +14,16 @@ use crate::validated::Normalizable;
 // Completions API (v1/completions) - DEPRECATED but still supported
 // ============================================================================
 
+/// Completion prompts may contain text or pretokenized inputs.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    String(String),
+    Array(Vec<String>),
+    TokenIds(Vec<u32>),
+    TokenIdBatch(Vec<Vec<u32>>),
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_completion_cross_parameters"))]
@@ -23,7 +33,7 @@ pub struct CompletionRequest {
 
     /// The prompt(s) to generate completions for
     #[validate(custom(function = "validate_completion_prompt"))]
-    pub prompt: StringOrArray,
+    pub prompt: CompletionPrompt,
 
     /// Generates `best_of` completions server-side and returns the "best"
     #[validate(range(min = 0, max = 20))]
@@ -147,16 +157,25 @@ pub struct CompletionRequest {
 
 impl Normalizable for CompletionRequest {}
 
-fn validate_completion_prompt(prompt: &StringOrArray) -> Result<(), validator::ValidationError> {
+fn validate_completion_prompt(prompt: &CompletionPrompt) -> Result<(), validator::ValidationError> {
     match prompt {
-        StringOrArray::String(_) => {}
-        StringOrArray::Array(arr) => {
+        CompletionPrompt::String(_) => {}
+        CompletionPrompt::Array(arr) => {
             if arr.is_empty() {
                 let mut error = validator::ValidationError::new("prompt_empty");
                 error.message = Some("prompt array cannot be empty".into());
                 return Err(error);
             }
         }
+        CompletionPrompt::TokenIds(ids) if ids.is_empty() => {
+            return Err(validator::ValidationError::new("prompt_empty"));
+        }
+        CompletionPrompt::TokenIdBatch(batch)
+            if batch.is_empty() || batch.iter().any(Vec::is_empty) =>
+        {
+            return Err(validator::ValidationError::new("prompt_empty"));
+        }
+        CompletionPrompt::TokenIds(_) | CompletionPrompt::TokenIdBatch(_) => {}
     }
 
     Ok(())
@@ -219,8 +238,9 @@ impl GenerationRequest for CompletionRequest {
 
     fn extract_text_for_routing(&self) -> String {
         match &self.prompt {
-            StringOrArray::String(s) => s.clone(),
-            StringOrArray::Array(v) => v.join(" "),
+            CompletionPrompt::String(s) => s.clone(),
+            CompletionPrompt::Array(v) => v.join(" "),
+            CompletionPrompt::TokenIds(_) | CompletionPrompt::TokenIdBatch(_) => String::new(),
         }
     }
 }
@@ -279,4 +299,33 @@ pub struct CompletionStreamChoice {
     /// Only attached on the terminal stream chunk; intermediate chunks are `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routed_experts: Option<String>,
+}
+
+#[cfg(test)]
+mod token_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn completion_token_prompt_preserves_ids_and_sampling() {
+        let value = serde_json::json!({
+            "model": "test-rm", "prompt": [1000, 1, 5, 2],
+            "max_tokens": 20480, "temperature": 1.0, "top_p": 1.0, "top_k": -1
+        });
+        let request: CompletionRequest = serde_json::from_value(value.clone()).unwrap();
+        request.validate().unwrap();
+        assert_eq!(
+            request.prompt,
+            CompletionPrompt::TokenIds(vec![1000, 1, 5, 2])
+        );
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["prompt"],
+            value["prompt"]
+        );
+    }
+
+    #[test]
+    fn invalid_token_ids_are_rejected() {
+        let value = serde_json::json!({"model": "test-rm", "prompt": [-1, 2]});
+        assert!(serde_json::from_value::<CompletionRequest>(value).is_err());
+    }
 }

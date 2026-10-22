@@ -138,6 +138,22 @@ impl PipelineStage for RequestExecutionStage {
             error::internal_error("execution_plan_not_built", "Execution plan not built")
         })?;
 
+        if let Some(state) = ctx.state.partial_rollout_state.as_mut() {
+            let generate = match &mut execution_plan {
+                ExecutionPlan::Single(ProtoRequest::Generate(generate))
+                | ExecutionPlan::PrefillDecode(generate)
+                | ExecutionPlan::EncodePrefillDecode {
+                    request: generate, ..
+                } => Some(generate),
+                ExecutionPlan::Single(ProtoRequest::Embed(_)) => None,
+            };
+            if let Some(generate) = generate {
+                if state.iteration_count == 0 && state.original_max_tokens.is_none() {
+                    state.original_max_tokens = generate.max_new_tokens();
+                }
+            }
+        }
+
         // Set `partial_rollout_overrides.routed_experts_prompt_start = Some(...)`
         // before re-entering the pipeline on iter ≥ 2 so vLLM only captures
         // RE for new token positions.

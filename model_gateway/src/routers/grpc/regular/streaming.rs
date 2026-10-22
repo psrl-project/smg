@@ -20,7 +20,7 @@ use openai_protocol::{
     common::{
         FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
     },
-    completion::{CompletionRequest, CompletionStreamChoice, CompletionStreamResponse},
+    completion::{CompletionPrompt, CompletionRequest, CompletionStreamChoice, CompletionStreamResponse},
     generate::GenerateRequest,
     messages::{
         self, ContentBlock, ContentBlockDelta, CreateMessageRequest, Message, MessageDelta,
@@ -2449,19 +2449,17 @@ impl StreamingProcessor {
         let system_fingerprint = dispatch.weight_version.as_deref();
 
         let echo = completion_request.echo;
-        let prompt_text: &str = if echo {
+        let prompt_text = if echo {
             match &completion_request.prompt {
-                StringOrArray::String(s) => s.as_str(),
-                // Array prompts are rejected by CompletionPreparationStage (Stage 1).
-                // If this arm is ever reached, it means a new code path bypassed Stage 1.
-                StringOrArray::Array(_) => {
-                    debug_assert!(false, "Array prompt reached streaming — CompletionPreparationStage should have rejected it");
-                    warn!("Array prompt reached completion streaming — CompletionPreparationStage should have rejected it");
-                    ""
+                CompletionPrompt::String(text) => text.clone(),
+                CompletionPrompt::TokenIds(ids) => tokenizer.decode(ids, false)
+                    .map_err(|error| format!("Prompt decoding failed: {error}"))?,
+                CompletionPrompt::Array(_) | CompletionPrompt::TokenIdBatch(_) => {
+                    return Err("Batched prompts are not supported for gRPC completions.".into());
                 }
             }
         } else {
-            ""
+            String::new()
         };
         let suffix = completion_request.suffix.as_deref();
         // TODO: wire per-token logprob streaming when backend support is available
@@ -2527,7 +2525,7 @@ impl StreamingProcessor {
 
                     if *is_first {
                         if echo {
-                            chunk_text.insert_str(0, prompt_text);
+                            chunk_text.insert_str(0, &prompt_text);
                         }
                         *is_first = false;
                     }

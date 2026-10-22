@@ -144,6 +144,26 @@ impl<T: RequestPriority> PriorityRequestQueue<T> {
     pub(crate) fn iter_requests(&self) -> impl Iterator<Item = &T> {
         self.heap.iter().map(|entry| &entry.request)
     }
+
+    fn ordered_requests(&self) -> Vec<&T> {
+        let mut entries: Vec<_> = self.heap.iter().collect();
+        entries.sort_by(|a, b| b.cmp(a));
+        entries.into_iter().map(|entry| &entry.request).collect()
+    }
+
+    fn pop_matching(&mut self, predicate: &impl Fn(&T) -> bool) -> Option<T> {
+        let mut held = Vec::new();
+        let mut selected = None;
+        while let Some(entry) = self.heap.pop() {
+            if predicate(&entry.request) {
+                selected = Some(entry.request);
+                break;
+            }
+            held.push(entry);
+        }
+        self.heap.extend(held);
+        selected
+    }
 }
 
 /// Version-partitioned unbounded priority queue.
@@ -241,9 +261,21 @@ impl<T: RequestPriority> MultiPriorityRequestQueue<T> {
             .flat_map(|(_, queue)| queue.iter_requests())
     }
 
+    pub(crate) fn ordered_requests(&self) -> Vec<&T> {
+        self.queues.values().flat_map(|queue| queue.ordered_requests()).collect()
+    }
+
+    pub(crate) fn pop_matching(&mut self, predicate: impl Fn(&T) -> bool) -> Option<T> {
+        self.queues.values_mut().find_map(|queue| queue.pop_matching(&predicate))
+    }
+
     fn partition_for(&self, request: &T) -> i32 {
         if self.enable_multi_priority_queue {
-            request.partition_key()
+            if request.is_validation() {
+                i32::MIN
+            } else {
+                request.partition_key()
+            }
         } else {
             0
         }
@@ -289,6 +321,49 @@ mod tests {
         fn request_id(&self) -> Option<i64> {
             Some(self.id)
         }
+    }
+
+    #[test]
+    fn snapshot_follows_dispatch_order_without_consuming_requests() {
+        let mut q = MultiPriorityRequestQueue::new(RequestSortKey::ShortLength, true);
+        q.push(TestReq::new(1, 2, 1));
+        q.push(TestReq::new(2, 1, 8));
+        q.push(TestReq::new(3, 1, 2));
+        q.push(TestReq::new(4, 1, 2));
+        assert_eq!(q.ordered_requests().iter().map(|r| r.id).collect::<Vec<_>>(), vec![3, 4, 2, 1]);
+        assert_eq!(q.len(), 4);
+        let mut actual = Vec::new();
+        while let Some(request) = q.pop() {
+            actual.push(request.id);
+        }
+        assert_eq!(actual, vec![3, 4, 2, 1]);
+    }
+
+    #[test]
+    fn validation_precedes_older_training_partitions() {
+        for multi_queue in [false, true] {
+            let mut queue = MultiPriorityRequestQueue::new(RequestSortKey::ShortLength, multi_queue);
+            queue.push(TestReq::new(1, 1, 1));
+            let mut validation = TestReq::new(2, 5, 100);
+            validation.validate = true;
+            queue.push(validation);
+            assert_eq!(queue.ordered_requests()[0].id, 2);
+            assert_eq!(queue.peek().map(|request| request.id), Some(2));
+            assert_eq!(queue.pop().map(|request| request.id), Some(2));
+            assert_eq!(queue.pop().map(|request| request.id), Some(1));
+        }
+    }
+
+    #[test]
+    fn exclusive_migration_pop_preserves_other_requests_and_fifo_ties() {
+        let mut q = MultiPriorityRequestQueue::new(RequestSortKey::ShortLength, true);
+        q.push(TestReq::new(1, 0, 2));
+        q.push(TestReq::new(2, 0, 2));
+        q.push(TestReq::new(3, 1, 1));
+        assert_eq!(q.pop_matching(|r| r.id == 3).map(|r| r.id), Some(3));
+        assert_eq!(q.pop_matching(|r| r.id == 99), None);
+        assert_eq!(q.pop().map(|r| r.id), Some(1));
+        assert_eq!(q.pop().map(|r| r.id), Some(2));
     }
 
     #[test]

@@ -222,6 +222,31 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
 
         let meta = routing_meta?;
 
+        // Request eligibility also applies to sticky pins and elastic migrations.
+        candidates.retain(|worker| {
+            match worker.metadata().spec.labels.get("psrl_request_scope").map(String::as_str) {
+                Some("all") => true,
+                Some("validate") => meta.is_validate,
+                Some("train") => !meta.is_validate,
+                _ => false,
+            }
+        });
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        if let Some(worker_id) = headers.and_then(|h| h.get("x-elastic-worker-id")).and_then(|v| v.to_str().ok()) {
+            let dp_rank: usize = headers?.get("x-elastic-dp-rank")?.to_str().ok()?.parse().ok()?;
+            let _lock = self.selection_lock.lock();
+            let worker = candidates.into_iter().find(|worker| {
+                self.worker_instance_id(worker) == (worker_id.to_string(), dp_rank)
+                    && self.version_after_sync(worker) >= meta.version_tag
+            })?;
+            worker.increment_load();
+            return Some(worker);
+        }
+
         // ── Stage 1: version filter ─────────────────────────────────────────
         candidates.retain(|w| self.version_after_sync(w) >= meta.version_tag);
 
@@ -920,6 +945,80 @@ mod tests {
             force_pin_once: false,
             rollout_instance_hint: None,
             response_token_count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_request_scope_overrides_sticky_and_group_pins() {
+        for is_validate in [false, true] {
+            let runtime = make_runtime();
+            let selector = make_selector(&runtime);
+            let mut workers = Vec::new();
+            for scope in ["train", "validate"] {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://{scope}:8000"))
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(openai_protocol::worker::HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .label("psrl_request_scope", scope)
+                        .build(),
+                );
+                selector.worker_registry.register(Arc::clone(&worker));
+                workers.push(worker);
+            }
+            let expected = usize::from(is_validate);
+            let wrong_instance = selector.worker_instance_id(&workers[1 - expected]);
+            let mut meta = make_meta(0);
+            meta.is_validate = is_validate;
+            meta.is_sticky = true;
+            meta.force_pin_once = true;
+            meta.rollout_instance_hint = Some(wrong_instance.clone());
+            runtime.record_selected_instance(2, Some(meta.prompt_id), wrong_instance);
+            let selected = selector
+                .select_single_worker(UNKNOWN_MODEL_ID, None, None, None, Some(&meta))
+                .await
+                .expect("A worker with the matching request scope must be available.");
+            assert_eq!(selected.url(), workers[expected].url());
+        }
+    }
+
+    #[tokio::test]
+    async fn request_scope_controls_forced_elastic_destinations() {
+        for (scope, is_validate, expected) in [
+            (Some("train"), false, true),
+            (Some("train"), true, false),
+            (Some("validate"), false, false),
+            (Some("validate"), true, true),
+            (Some("all"), false, true),
+            (Some("all"), true, true),
+            (Some("unknown"), false, false),
+            (None, true, false),
+        ] {
+            let runtime = make_runtime();
+            let selector = make_selector(&runtime);
+            let mut builder = BasicWorkerBuilder::new("grpc://worker:8000")
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(openai_protocol::worker::HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                });
+            if let Some(scope) = scope {
+                builder = builder.label("psrl_request_scope", scope);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            selector.worker_registry.register(Arc::clone(&worker));
+            let instance = selector.worker_instance_id(&worker);
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-elastic-worker-id", instance.0.parse().unwrap());
+            headers.insert("x-elastic-dp-rank", "0".parse().unwrap());
+            let mut meta = make_meta(0);
+            meta.is_validate = is_validate;
+            let selected = selector
+                .select_single_worker(UNKNOWN_MODEL_ID, None, None, Some(&headers), Some(&meta))
+                .await;
+            assert_eq!(selected.is_some(), expected, "Scope {scope:?}, validation {is_validate}.");
         }
     }
 

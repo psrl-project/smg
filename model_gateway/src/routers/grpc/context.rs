@@ -178,6 +178,9 @@ pub(crate) struct ProcessingState {
     // Stage 5: Dispatch metadata
     pub dispatch: Option<DispatchMetadata>,
 
+    /// Backend request identity retained across partial rollout loopback for migration settlement.
+    pub last_dispatch_request_id: Option<String>,
+
     // Load guard for worker load tracking (created at execution stage)
     pub load_guards: Option<LoadGuards>,
 

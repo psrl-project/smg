@@ -124,10 +124,7 @@ pub(crate) struct PartialRolloutState {
     /// Routed-experts accumulator.  `None` when the request did not opt in,
     /// or before the first iteration that produces a non-empty RE segment.
     pub routed_experts: Option<RoutedExpertsAccumulator>,
-    /// Number of loopback iterations completed so far (excluding the final one).
-    ///
-    /// Incremented by `merge_into_partial_state` on each `"abort"` cycle.
-    /// At completion this equals the number of PS weight-sync interruptions.
+    /// Number of merged backend segments, including the final segment.
     pub iteration_count: u32,
     /// The caller's generation cap, captured once at iteration 1.
     ///
@@ -236,6 +233,9 @@ pub(crate) async fn drain_stream_for_partial_rollout(
             ProtoResponseVariant::Complete(complete) => {
                 if new_token_ids.is_empty() {
                     new_token_ids = complete.output_ids().to_vec();
+                }
+                if new_logprobs.is_none() {
+                    new_logprobs = complete.output_logprobs().map(|lp| lp.token_logprobs);
                 }
                 let finish_reason = complete.finish_reason().to_owned();
                 let new_routed_experts = complete

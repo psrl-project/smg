@@ -16,6 +16,7 @@ mod consistent_hashing;
 pub(crate) mod cost_model_utils;
 mod dp_min_token;
 mod factory;
+mod itl;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -34,6 +35,7 @@ pub use cache_aware_v1::CacheAwareV1Policy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
+pub use itl::{ItlConfig, ItlPolicy};
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;
 pub use least_load::LeastLoadPolicy;

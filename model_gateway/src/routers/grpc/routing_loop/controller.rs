@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::runtime::RoutingLoopRuntime;
+use super::runtime::{RequestMigrationTarget, RoutingLoopRuntime};
 use crate::{routers::error, server::AppState};
 
 fn runtime_from_state(state: &AppState) -> Result<Arc<RoutingLoopRuntime>, Box<Response>> {
@@ -64,6 +64,51 @@ pub(crate) async fn resume_routing_loop(State(state): State<Arc<AppState>>) -> R
 pub(crate) async fn routing_loop_status(State(state): State<Arc<AppState>>) -> Response {
     match runtime_from_state(&state) {
         Ok(runtime) => Json(runtime.status().await).into_response(),
+        Err(response) => *response,
+    }
+}
+
+pub(crate) async fn routing_loop_snapshot(State(state): State<Arc<AppState>>) -> Response {
+    match runtime_from_state(&state) {
+        Ok(runtime) => Json(runtime.queued_request_snapshot().await).into_response(),
+        Err(response) => *response,
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MigrationQuery {
+    request_id: String,
+}
+
+pub(crate) async fn prepare_request_migration(
+    State(state): State<Arc<AppState>>, Json(target): Json<RequestMigrationTarget>,
+) -> Response {
+    match runtime_from_state(&state) {
+        Ok(runtime) => {
+            runtime.prepare_migration(target);
+            Json(serde_json::json!({"prepared": true})).into_response()
+        }
+        Err(response) => *response,
+    }
+}
+
+pub(crate) async fn request_migration_status(
+    State(state): State<Arc<AppState>>, Query(query): Query<MigrationQuery>,
+) -> Response {
+    match runtime_from_state(&state) {
+        Ok(runtime) => Json(runtime.migration_status(&query.request_id)).into_response(),
+        Err(response) => *response,
+    }
+}
+
+pub(crate) async fn finish_request_migration(
+    State(state): State<Arc<AppState>>, Json(query): Json<MigrationQuery>,
+) -> Response {
+    match runtime_from_state(&state) {
+        Ok(runtime) => {
+            runtime.finish_migration(&query.request_id);
+            Json(serde_json::json!({"finished": true})).into_response()
+        }
         Err(response) => *response,
     }
 }

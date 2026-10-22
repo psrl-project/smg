@@ -1318,6 +1318,17 @@ pub enum ProtoGenerateRequest {
 }
 
 impl ProtoGenerateRequest {
+    /// Return the resolved generation budget before loopback adjustment.
+    pub(crate) fn max_new_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Sglang(req) => req.sampling_params.as_ref()?.max_new_tokens,
+            Self::Vllm(req) => req.sampling_params.as_ref()?.max_tokens,
+            Self::Trtllm(req) => Some(req.max_tokens),
+            Self::Mlx(req) => req.sampling_params.as_ref()?.max_tokens,
+            Self::TokenSpeed(req) => req.sampling_params.as_ref()?.max_new_tokens,
+        }
+    }
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
@@ -1940,6 +1951,35 @@ pub enum ProtoGenerateComplete {
 }
 
 impl ProtoGenerateComplete {
+    /// Replace backend segment accounting with the original request accounting.
+    pub(crate) fn set_token_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        macro_rules! update {
+            ($complete:expr) => {{
+                $complete.prompt_tokens = prompt_tokens;
+                $complete.completion_tokens = completion_tokens;
+                $complete.cached_tokens = $complete.cached_tokens.min(prompt_tokens);
+            }};
+        }
+        match self {
+            Self::Sglang(c) => update!(c),
+            Self::Vllm(c) => update!(c),
+            Self::Trtllm(c) => update!(c),
+            Self::Mlx(c) => update!(c),
+            Self::TokenSpeed(c) => update!(c),
+        }
+    }
+
+    /// Finish an interrupted request that has consumed its generation budget.
+    pub(crate) fn finish_at_length(&mut self) {
+        match self {
+            Self::Sglang(c) => c.finish_reason = "length".to_owned(),
+            Self::Vllm(c) => c.finish_reason = "length".to_owned(),
+            Self::Trtllm(c) => c.finish_reason = "length".to_owned(),
+            Self::Mlx(c) => c.finish_reason = "length".to_owned(),
+            Self::TokenSpeed(c) => c.finish_reason = "length".to_owned(),
+        }
+    }
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,

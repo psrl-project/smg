@@ -20,6 +20,7 @@ COMMON_POLICY_CHOICES = [
     "least_load",
     "manual",
     "request_num_balance",
+    "itl",
     "throughput_optimal",
     "throughput_optimal_with_budget",
     "consistent_hashing",
@@ -72,6 +73,7 @@ class RouterArgs:
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
+    itl_max_latency: float | None = None
     cost_model_path: str | None = None  # Path to cost model JSON for throughput_optimal / throughput_optimal_with_budget policy
     max_concurrent_seqs_per_instance: int = 100  # Max concurrent sequences per instance (throughput_optimal policy)
     delta_throughput_threshold: float = 0.5  # Throughput delta threshold for throughput_optimal policy
@@ -365,7 +367,7 @@ class RouterArgs:
             type=str,
             default=RouterArgs.policy,
             choices=["random", "round_robin", "cache_aware", "cache_aware_v1", "power_of_two", "manual",
-                     "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"],
+                     "request_num_balance", "itl", "throughput_optimal", "throughput_optimal_with_budget"],
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"
@@ -468,6 +470,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.bucket_adjust_interval_secs,
             help="Interval in seconds between bucket boundary adjustment operations",
+        )
+        routing_group.add_argument(
+            f"--{prefix}itl-max-latency",
+            type=float,
+            default=None,
+            help="Maximum predicted inter-token latency in seconds for ITL admission.",
         )
         routing_group.add_argument(
             f"--{prefix}cost-model-path",

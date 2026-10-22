@@ -471,6 +471,20 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::Itl {
+                cost_model_path,
+                max_concurrent_seqs_per_instance,
+                max_itl,
+            } => {
+                if cost_model_path.is_empty()
+                    || *max_concurrent_seqs_per_instance == 0
+                    || max_itl.is_some_and(|value| !value.is_finite() || value <= 0.0)
+                {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "ITL requires a cost model, positive concurrency and a positive finite latency limit.".to_string(),
+                    });
+                }
+            }
             PolicyConfig::RequestNumBalance | PolicyConfig::ThroughputOptimal { .. } => {}
             PolicyConfig::ThroughputOptimalWithBudget { request_budget, .. } => {
                 if *request_budget == 0 {

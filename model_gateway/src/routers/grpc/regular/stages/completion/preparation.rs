@@ -5,10 +5,12 @@
 //! `CompletionRequest` native in the request context instead of laundering it
 //! through `GenerateRequest`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::common::StringOrArray;
-use tracing::error;
+use llm_tokenizer::traits::Tokenizer;
+use openai_protocol::completion::CompletionPrompt;
 
 use crate::routers::{
     error,
@@ -29,26 +31,10 @@ impl PipelineStage for CompletionPreparationStage {
         let tokenizer =
             utils::resolve_tokenizer(ctx, "CompletionPreparationStage::execute").map_err(|e| *e)?;
 
-        let prompt_text = match &request.prompt {
-            StringOrArray::String(text) => text.clone(),
-            StringOrArray::Array(_) => {
-                return Err(error::bad_request(
-                    "batch_prompts_not_supported",
-                    "Batched prompt arrays are not supported for gRPC /v1/completions yet",
-                ));
-            }
-        };
-
-        let encoding = utils::encode_blocking(tokenizer.clone(), prompt_text.clone(), false)
-            .await
-            .map_err(|e| {
-                error!(
-                    function = "CompletionPreparationStage::execute",
-                    error = %e,
-                    "Tokenization failed"
-                );
-                error::bad_request("tokenization_failed", format!("Tokenization failed: {e}"))
-            })?;
+        let (prompt_text, token_ids) =
+            resolve_completion_prompt(tokenizer.clone(), &request.prompt)
+                .await
+                .map_err(|message| error::bad_request("invalid_prompt", message))?;
 
         let stop_decoder = utils::create_stop_decoder(
             &tokenizer,
@@ -61,7 +47,7 @@ impl PipelineStage for CompletionPreparationStage {
 
         ctx.state.preparation = Some(PreparationOutput::Completion {
             original_text: prompt_text,
-            token_ids: encoding.token_ids().to_vec(),
+            token_ids,
         });
 
         ctx.state.response.stop_decoder = Some(stop_decoder);
@@ -75,5 +61,62 @@ impl PipelineStage for CompletionPreparationStage {
 
     fn phase(&self) -> StagePhase {
         StagePhase::Preparation
+    }
+}
+
+async fn resolve_completion_prompt(
+    tokenizer: Arc<dyn Tokenizer>,
+    prompt: &CompletionPrompt,
+) -> Result<(String, Vec<u32>), String> {
+    match prompt {
+        CompletionPrompt::String(text) => {
+            let encoding = utils::encode_blocking(tokenizer, text.clone(), false)
+                .await
+                .map_err(|error| format!("Tokenization failed: {error}"))?;
+            Ok((text.clone(), encoding.token_ids().to_vec()))
+        }
+        CompletionPrompt::TokenIds(ids) => {
+            let token_ids = ids.clone();
+            tokio::task::spawn_blocking(move || {
+                let text = tokenizer
+                    .decode(&token_ids, false)
+                    .map_err(|error| format!("Prompt decoding failed: {error}"))?;
+                Ok((text, token_ids))
+            })
+            .await
+            .map_err(|error| format!("Prompt decoding task failed: {error}"))?
+        }
+        CompletionPrompt::Array(_) | CompletionPrompt::TokenIdBatch(_) => {
+            Err("Batched prompts are not supported for gRPC /v1/completions.".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use llm_tokenizer::MockTokenizer;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn completion_preparation_preserves_special_and_space_tokens() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let ids = vec![1000, 1, 5, 2, 1002];
+        let (_, prepared) =
+            resolve_completion_prompt(tokenizer, &CompletionPrompt::TokenIds(ids.clone()))
+                .await
+                .unwrap();
+        assert_eq!(prepared, ids);
+    }
+
+    #[tokio::test]
+    async fn completion_preparation_keeps_text_tokenization() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let (text, ids) =
+            resolve_completion_prompt(tokenizer, &CompletionPrompt::String("Hello world".into()))
+                .await
+                .unwrap();
+        assert_eq!(text, "Hello world");
+        assert_eq!(ids, vec![1, 2]);
     }
 }

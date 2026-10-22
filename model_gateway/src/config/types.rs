@@ -761,6 +761,16 @@ pub enum PolicyConfig {
     #[serde(rename = "request_num_balance")]
     RequestNumBalance,
 
+    /// Minimize predicted inter-token latency after admitting the next request.
+    #[serde(rename = "itl")]
+    Itl {
+        cost_model_path: String,
+        #[serde(default = "default_max_concurrent_seqs_per_instance")]
+        max_concurrent_seqs_per_instance: usize,
+        #[serde(default)]
+        max_itl: Option<f64>,
+    },
+
     /// Throughput-optimal policy.
     ///
     /// Selects the healthy worker with the lowest total token count
@@ -912,6 +922,7 @@ impl PolicyConfig {
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
             PolicyConfig::RequestNumBalance => "request_num_balance",
+            PolicyConfig::Itl { .. } => "itl",
             PolicyConfig::ThroughputOptimal { .. } => "throughput_optimal",
             PolicyConfig::ThroughputOptimalWithBudget { .. } => "throughput_optimal_with_budget",
         }
@@ -1440,8 +1451,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
-        enable_kv_admission_control: false,
-                kv_capacity_threshold: 1.0,
+            enable_kv_admission_control: false,
+            kv_capacity_threshold: 1.0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1468,8 +1479,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
-        enable_kv_admission_control: false,
-                kv_capacity_threshold: 1.0,
+            enable_kv_admission_control: false,
+            kv_capacity_threshold: 1.0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1497,8 +1508,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
-        enable_kv_admission_control: false,
-                kv_capacity_threshold: 1.0,
+            enable_kv_admission_control: false,
+            kv_capacity_threshold: 1.0,
         };
 
         match cache_aware {
@@ -1912,7 +1923,7 @@ mod tests {
                 lmcache_overlap_weight: 0.5,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
-            enable_kv_admission_control: false,
+                enable_kv_admission_control: false,
                 kv_capacity_threshold: 1.0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
@@ -1949,7 +1960,7 @@ mod tests {
                 lmcache_overlap_weight: 0.5,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
-            enable_kv_admission_control: false,
+                enable_kv_admission_control: false,
                 kv_capacity_threshold: 1.0,
             }),
             decode_policy: None,
@@ -2012,8 +2023,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
-        enable_kv_admission_control: false,
-                kv_capacity_threshold: 1.0,
+            enable_kv_admission_control: false,
+            kv_capacity_threshold: 1.0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

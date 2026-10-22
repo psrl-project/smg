@@ -343,9 +343,7 @@ fn do_tito_capture_non_streaming(
         mismatch_count = mismatch_report.len(),
         "do_tito_capture_non_streaming: storing tokens"
     );
-    // A malformed routed-experts segment means the capture would record tokens
-    // against metadata that does not describe them, so skip the turn rather than
-    // store a record the trainer would read as valid.
+    // A malformed routed-experts segment would record tokens against the wrong metadata.
     let turn_record = match extract_turn_record(
         first_complete,
         prompt_ids.len(),
@@ -360,8 +358,11 @@ fn do_tito_capture_non_streaming(
                 session_id = %tito_ctx.session_id,
                 error_code = error.error_code(),
                 error = %error,
-                "Routed-experts extraction failed, skipping TITO capture"
+                "Invalid routed-experts payload. Generation will not be captured."
             );
+            if let Some(reservation) = tito_ctx.trajectory_id_reservation.as_ref() {
+                reservation.release();
+            }
             return;
         }
     };

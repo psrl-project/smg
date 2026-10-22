@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, CacheAwareV1Policy,
-    ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
-    PassthroughPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
-    RequestNumBalancePolicy, RoundRobinPolicy, ThroughputOptimalConfig, ThroughputOptimalPolicy,
-    ThroughputOptimalWithBudgetPolicy,
+    ConsistentHashingPolicy, ItlConfig, ItlPolicy, LeastLoadPolicy, LoadBalancingPolicy,
+    ManualConfig, ManualPolicy, PassthroughPolicy, PowerOfTwoPolicy, PrefixHashConfig,
+    PrefixHashPolicy, RandomPolicy, RequestNumBalancePolicy, RoundRobinPolicy,
+    ThroughputOptimalConfig, ThroughputOptimalPolicy, ThroughputOptimalWithBudgetPolicy,
 };
 use crate::config::{ConfigError, ConfigResult, PolicyConfig};
 
@@ -128,6 +128,19 @@ impl PolicyFactory {
                 Ok(Arc::new(PrefixHashPolicy::new(config)))
             }
             PolicyConfig::RequestNumBalance => Ok(Arc::new(RequestNumBalancePolicy::new())),
+            PolicyConfig::Itl {
+                cost_model_path,
+                max_concurrent_seqs_per_instance,
+                max_itl,
+            } => {
+                let policy = ItlPolicy::with_config(ItlConfig {
+                    cost_model_path: cost_model_path.clone(),
+                    max_concurrent_seqs_per_instance: *max_concurrent_seqs_per_instance,
+                    max_itl: *max_itl,
+                })
+                .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+                Ok(Arc::new(policy))
+            }
             PolicyConfig::ThroughputOptimal {
                 cost_model_path,
                 max_concurrent_seqs_per_instance,
@@ -241,8 +254,8 @@ mod tests {
             lmcache_overlap_weight: 0.5,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
-        enable_kv_admission_control: false,
-                kv_capacity_threshold: 1.0,
+            enable_kv_admission_control: false,
+            kv_capacity_threshold: 1.0,
         })
         .unwrap();
         assert_eq!(policy.name(), "cache_aware");

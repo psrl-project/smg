@@ -45,7 +45,7 @@ impl WorkerSelectorStrategy for NaiveWorkerSelector {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
-        _routing_meta: Option<&RoutingMeta>,
+        routing_meta: Option<&RoutingMeta>,
     ) -> Option<Arc<dyn Worker>> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
@@ -83,21 +83,41 @@ impl WorkerSelectorStrategy for NaiveWorkerSelector {
         // (stable tie-break on equal loads → always index 0).
         let selected = {
             let _lock = self.selection_lock.lock();
-            let idx = policy.select_worker(
-                &available,
-                &SelectWorkerInfo {
-                    request_text: text,
-                    tokens,
-                    headers,
-                    hash_ring,
-                    priority_groups: None,
-                    response_token_count: None,
-                    score_trace: None,
-                    leg: WorkerLeg::Single,
-                },
-            )?;
-            available[idx].increment_load();
-            available[idx].clone()
+            let worker = if let Some(worker_id) = headers.and_then(|h| h.get("x-elastic-worker-id"))
+            {
+                let worker_id = worker_id.to_str().ok()?;
+                let dp_rank: usize = headers?
+                    .get("x-elastic-dp-rank")?
+                    .to_str()
+                    .ok()?
+                    .parse()
+                    .ok()?;
+                available.iter().find(|worker| {
+                    self.worker_registry
+                        .reserve_id_for_url(worker.base_url())
+                        .as_str()
+                        == worker_id
+                        && worker.dp_rank().unwrap_or(0) == dp_rank
+                })?
+            } else {
+                let idx = policy.select_worker(
+                    &available,
+                    &SelectWorkerInfo {
+                        request_text: text,
+                        tokens,
+                        headers,
+                        hash_ring,
+                        priority_groups: None,
+                        response_token_count: routing_meta
+                            .and_then(|meta| meta.response_token_count),
+                        score_trace: None,
+                        leg: WorkerLeg::Single,
+                    },
+                )?;
+                &available[idx]
+            };
+            worker.increment_load();
+            worker.clone()
         };
 
         // Record worker selection metric
