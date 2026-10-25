@@ -626,6 +626,7 @@ async fn test_unsupported_endpoints() {
         return_prompt_token_ids: false,
         logprob_start_len: None,
         top_logprobs_num: None,
+        sampler_top_logprobs: None,
         token_ids_logprob: None,
         return_text_in_logprobs: false,
         stream: false,

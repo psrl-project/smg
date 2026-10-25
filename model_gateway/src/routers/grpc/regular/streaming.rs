@@ -392,7 +392,7 @@ impl StreamingProcessor {
                     }
 
                     // Process logprobs if present
-                    let choice_logprobs = chunk.output_logprobs().map(|ref proto_logprobs| {
+                    let choice_logprobs = chunk.output_logprobs(true).map(|ref proto_logprobs| {
                         utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer)
                     });
 
@@ -1032,7 +1032,7 @@ impl StreamingProcessor {
                     // Handle output logprobs based on backend behavior:
                     // - SGLang sends cumulative logprobs (replace is correct)
                     // - vLLM sends delta logprobs (need to extend/accumulate)
-                    if let Some(ref output_logprobs) = chunk.output_logprobs() {
+                    if let Some(ref output_logprobs) = chunk.output_logprobs(true) {
                         let converted = utils::convert_generate_output_logprobs(output_logprobs);
                         if chunk.is_vllm() {
                             // vLLM sends delta - extend existing logprobs

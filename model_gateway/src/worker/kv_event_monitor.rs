@@ -22,13 +22,19 @@
 //! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
 //! - `stop` — signals shutdown to all tasks, clears state
 
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use kv_index::{
     compute_content_hash, ApplyError, SequenceHash, StoredBlock, Tier, TieredIndexer,
     WorkerBlockMap,
 };
+use serde::Deserialize;
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
@@ -49,6 +55,81 @@ const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 /// Maximum reconnection delay (caps exponential backoff).
 const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
 
+/// Worker label carrying the LMCache MP instance id that serves it.
+const LMCACHE_INSTANCE_LABEL: &str = "lmcache_instance_id";
+
+/// Coordinator registry metadata key carrying a server's event stream URL.
+const LMCACHE_EVENT_STREAM_KEY: &str = "event_stream_url";
+
+/// Seconds between coordinator polls for off-GPU event endpoints.
+const LMCACHE_DISCOVERY_INTERVAL_S: u64 = 10;
+
+/// Upper bound on a single streamed JSON line, to reject a runaway payload.
+const LMCACHE_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One instance entry from the coordinator's `GET /instances`.
+#[derive(Debug, Deserialize)]
+struct CoordinatorInstance {
+    instance_id: String,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+}
+
+/// Body of the coordinator's `GET /instances`.
+#[derive(Debug, Deserialize)]
+struct CoordinatorInstanceList {
+    #[serde(default)]
+    instances: Vec<CoordinatorInstance>,
+}
+
+/// Body of one streamed line from an MP server's cache-event stream.
+#[derive(Debug, Deserialize)]
+struct LmcacheEventBatchList {
+    #[serde(default)]
+    batches: Vec<LmcacheEventBatch>,
+}
+
+/// One cache-event batch published by an MP server.
+#[derive(Debug, Deserialize)]
+struct LmcacheEventBatch {
+    #[serde(default)]
+    incarnation: i64,
+    event_type: String,
+    tier: String,
+    #[serde(default)]
+    entries: Vec<LmcacheEventEntry>,
+}
+
+/// One key's worth of change inside a batch.
+#[derive(Debug, Deserialize)]
+struct LmcacheEventEntry {
+    key: LmcacheObjectKey,
+    #[serde(default)]
+    token_ids: Vec<u32>,
+    #[serde(default)]
+    token_offset: i64,
+}
+
+/// The cache key of one chunk.
+#[derive(Debug, Deserialize)]
+struct LmcacheObjectKey {
+    chunk_hash_hex: String,
+}
+
+/// Derive a stable sequence hash from an LMCache chunk hash.
+///
+/// The off-GPU tier is indexed in its own hash space, so this only has to be
+/// consistent between a store and its later delete within one process. The
+/// LMCache chunk hash is prefix chained, so chained sequence hashes here give
+/// the tier a faithful prefix structure.
+fn lmcache_seq_hash(chunk_hash_hex: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    chunk_hash_hex.hash(&mut hasher);
+    hasher.finish() as i64
+}
+
 /// Manages per-worker KV cache event subscriptions.
 ///
 /// Each (gRPC worker, dp_rank) gets a dedicated tokio task that subscribes to
@@ -63,6 +144,16 @@ pub struct KvEventMonitor {
     worker_handles: Mutex<HashMap<SubscriptionKey, WorkerSubscription>>,
     /// Jump size for new `TieredIndexer` instances.
     jump_size: usize,
+    /// Maps an LMCache MP instance id to the worker URL that serves it, so
+    /// off-GPU events can be attributed to a worker the router already knows.
+    lmcache_workers: DashMap<String, String>,
+    /// Maps a worker URL to its model id, used to pick the tier indexer an
+    /// off-GPU stream feeds.
+    worker_models: DashMap<String, String>,
+    /// One running consumer task per discovered event-stream URL.
+    lmcache_streams: StdMutex<HashMap<String, JoinHandle<()>>>,
+    /// The coordinator discovery task, when off-GPU events are enabled.
+    lmcache_discovery: StdMutex<Option<JoinHandle<()>>>,
 }
 
 /// Identifies a single subscription stream. A backend may front multiple DP
@@ -98,6 +189,10 @@ impl KvEventMonitor {
             indexers: DashMap::new(),
             worker_handles: Mutex::new(HashMap::new()),
             jump_size,
+            lmcache_workers: DashMap::new(),
+            worker_models: DashMap::new(),
+            lmcache_streams: StdMutex::new(HashMap::new()),
+            lmcache_discovery: StdMutex::new(None),
         }
     }
 
@@ -132,6 +227,13 @@ impl KvEventMonitor {
             .entry(model_id.clone())
             .or_insert_with(|| Arc::new(TieredIndexer::new(self.jump_size)))
             .clone();
+
+        // Remember how to attribute off-GPU cache events for this worker.
+        self.worker_models.insert(url.clone(), model_id.clone());
+        if let Some(instance_id) = worker.metadata().spec.labels.get(LMCACHE_INSTANCE_LABEL) {
+            self.lmcache_workers
+                .insert(instance_id.clone(), url.clone());
+        }
 
         // Seed GPU-tier block_size provisionally from WorkerSpec. The event
         // stream overwrites this with the backend's actual page size once a
@@ -193,6 +295,12 @@ impl KvEventMonitor {
                 .filter_map(|k| handles.remove(&k))
                 .collect()
         };
+
+        // Drop the off-GPU attribution for this worker even when it had no
+        // gRPC subscription, so a stale instance id cannot be reused.
+        self.worker_models.remove(worker_url);
+        self.lmcache_workers
+            .retain(|_, mapped_url| mapped_url != worker_url);
 
         if subscriptions.is_empty() {
             return;
@@ -666,12 +774,312 @@ fn convert_kv_block(block: &KvBlock) -> StoredBlock {
     }
 }
 
+impl KvEventMonitor {
+    // -----------------------------------------------------------------------
+    // Off-GPU (LMCache MP) event source
+    // -----------------------------------------------------------------------
+
+    /// Start following the off-GPU cache-event streams of an LMCache fleet.
+    ///
+    /// Each MP server publishes its stream URL to the coordinator's instance
+    /// registry, so this discovers endpoints there and keeps one consumer per
+    /// URL. A server restart bumps its incarnation, which voids the blocks that
+    /// server previously reported.
+    pub fn start_lmcache_events(self: &Arc<Self>, coordinator_addr: String) {
+        if coordinator_addr.trim().is_empty() {
+            debug!("No LMCache coordinator address, off-GPU cache events are disabled");
+            return;
+        }
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                warn!("No async runtime, off-GPU cache events are disabled");
+                return;
+            }
+        };
+        let monitor = Arc::clone(self);
+        let task = runtime.spawn(async move {
+            Self::lmcache_discovery_loop(monitor, coordinator_addr).await;
+        });
+        if let Ok(mut slot) = self.lmcache_discovery.lock() {
+            *slot = Some(task);
+        }
+    }
+
+    /// Poll the coordinator for instances that publish an event stream.
+    async fn lmcache_discovery_loop(monitor: Arc<Self>, coordinator_addr: String) {
+        let client = reqwest::Client::new();
+        let url = format!("{}/instances", coordinator_addr.trim_end_matches('/'));
+        loop {
+            match Self::fetch_event_endpoints(&client, &url).await {
+                Ok(endpoints) => monitor.sync_lmcache_streams(endpoints),
+                Err(e) => warn!(error = %e, %url, "Failed to discover LMCache event streams"),
+            }
+            tokio::time::sleep(Duration::from_secs(LMCACHE_DISCOVERY_INTERVAL_S)).await;
+        }
+    }
+
+    /// Fetch `(instance_id, stream_url)` pairs from the coordinator.
+    async fn fetch_event_endpoints(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let response = client.get(url).send().await.map_err(|e| e.to_string())?;
+        let list: CoordinatorInstanceList = response.json().await.map_err(|e| e.to_string())?;
+        Ok(list
+            .instances
+            .into_iter()
+            .filter_map(|instance| {
+                instance
+                    .metadata
+                    .get(LMCACHE_EVENT_STREAM_KEY)
+                    .map(|stream_url| (instance.instance_id, stream_url.clone()))
+            })
+            .collect())
+    }
+
+    /// Add and remove consumers so one runs per live event-stream URL.
+    fn sync_lmcache_streams(self: &Arc<Self>, endpoints: Vec<(String, String)>) {
+        let live: HashSet<String> = endpoints.iter().map(|(_, url)| url.clone()).collect();
+        let mut streams = match self.lmcache_streams.lock() {
+            Ok(streams) => streams,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let stale: Vec<String> = streams
+            .keys()
+            .filter(|url| !live.contains(*url))
+            .cloned()
+            .collect();
+        for url in stale {
+            if let Some(handle) = streams.remove(&url) {
+                handle.abort();
+            }
+        }
+
+        for (instance_id, stream_url) in endpoints {
+            if streams.contains_key(&stream_url) {
+                continue;
+            }
+            let monitor = Arc::clone(self);
+            let key = stream_url.clone();
+            let task = tokio::spawn(async move {
+                monitor.lmcache_stream_loop(instance_id, stream_url).await;
+            });
+            streams.insert(key, task);
+        }
+    }
+
+    /// Reconnect loop for one MP server's event stream.
+    async fn lmcache_stream_loop(self: Arc<Self>, instance_id: String, stream_url: String) {
+        let client = reqwest::Client::new();
+        let mut delay_ms = INITIAL_RECONNECT_DELAY_MS;
+        loop {
+            match client.get(&stream_url).send().await {
+                Ok(response) => {
+                    info!(%instance_id, %stream_url, "Off-GPU event stream connected");
+                    delay_ms = INITIAL_RECONNECT_DELAY_MS;
+                    match Self::consume_lmcache_stream(&self, &instance_id, response).await {
+                        Ok(()) => info!(%instance_id, "Off-GPU event stream ended"),
+                        Err(e) => warn!(%instance_id, error = %e, "Off-GPU event stream failed"),
+                    }
+                }
+                Err(e) => warn!(
+                    %instance_id,
+                    %stream_url,
+                    error = %e,
+                    "Failed to open off-GPU event stream"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            delay_ms = (delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
+        }
+    }
+
+    /// Read newline delimited batches until the stream closes.
+    async fn consume_lmcache_stream(
+        monitor: &Arc<Self>,
+        instance_id: &str,
+        response: reqwest::Response,
+    ) -> Result<(), String> {
+        use futures_util::StreamExt as _;
+
+        let mut stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut state: Option<(WorkerTierState, Arc<TieredIndexer>)> = None;
+        let mut incarnation: Option<i64> = None;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            buffer.extend_from_slice(&chunk);
+            if buffer.len() > LMCACHE_MAX_LINE_BYTES {
+                return Err(format!("event line exceeds {LMCACHE_MAX_LINE_BYTES} bytes"));
+            }
+            while let Some(position) = buffer.iter().position(|&byte| byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=position).collect();
+                let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+                // Blank lines are keepalives from an idle stream.
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let batch_list: LmcacheEventBatchList =
+                    serde_json::from_str(&text).map_err(|e| e.to_string())?;
+
+                if state.is_none() {
+                    match monitor.resolve_lmcache_worker(instance_id) {
+                        Some((worker_url, indexer)) => {
+                            let tier_state = WorkerTierState::new(&indexer, &worker_url);
+                            state = Some((tier_state, indexer));
+                        }
+                        None => {
+                            debug!(
+                                %instance_id,
+                                "Off-GPU events for an unknown instance, skipping"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let (tier_state, indexer) = state.as_mut().expect("state was just resolved");
+                for batch in &batch_list.batches {
+                    Self::apply_lmcache_batch(batch, indexer, tier_state, &mut incarnation);
+                }
+            }
+        }
+
+        if let Some((mut tier_state, indexer)) = state {
+            tier_state.cleanup(&indexer);
+        }
+        Ok(())
+    }
+
+    /// Resolve the worker URL and tier indexer for an MP instance.
+    fn resolve_lmcache_worker(&self, instance_id: &str) -> Option<(String, Arc<TieredIndexer>)> {
+        let worker_url = self.lmcache_workers.get(instance_id)?.value().clone();
+        let model_id = self.worker_models.get(&worker_url)?.value().clone();
+        let indexer = self.indexers.get(&model_id)?.value().clone();
+        Some((worker_url, indexer))
+    }
+
+    /// Apply one off-GPU batch to the LMCache tier.
+    fn apply_lmcache_batch(
+        batch: &LmcacheEventBatch,
+        indexer: &TieredIndexer,
+        state: &mut WorkerTierState,
+        incarnation: &mut Option<i64>,
+    ) {
+        // A higher incarnation means the server restarted with empty pools, so
+        // everything previously reported for it is void.
+        if let Some(previous) = *incarnation {
+            if batch.incarnation > previous {
+                indexer.tier(Tier::Lmcache).apply_cleared(
+                    state.worker_id(Tier::Lmcache),
+                    state.blocks_mut(Tier::Lmcache),
+                );
+                info!(
+                    incarnation = batch.incarnation,
+                    "Off-GPU cache cleared on server restart"
+                );
+            }
+        }
+        *incarnation = Some(batch.incarnation);
+
+        // Only the server's own pool is the off-GPU tier a router scores.
+        if batch.tier != "l1" {
+            return;
+        }
+
+        match batch.event_type.as_str() {
+            "store" => Self::apply_lmcache_store(batch, indexer, state),
+            "delete" => {
+                let seq_hashes: Vec<SequenceHash> = batch
+                    .entries
+                    .iter()
+                    .map(|entry| SequenceHash::from(lmcache_seq_hash(&entry.key.chunk_hash_hex)))
+                    .collect();
+                indexer.tier(Tier::Lmcache).apply_removed(
+                    state.worker_id(Tier::Lmcache),
+                    &seq_hashes,
+                    state.blocks_mut(Tier::Lmcache),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply the stored chunks of one batch, keeping prefix chains intact.
+    fn apply_lmcache_store(
+        batch: &LmcacheEventBatch,
+        indexer: &TieredIndexer,
+        state: &mut WorkerTierState,
+    ) {
+        // A chunk is reported once per KV rank with identical content, so
+        // dedupe by chunk hash before indexing.
+        let mut chunks: Vec<&LmcacheEventEntry> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for entry in &batch.entries {
+            if entry.token_ids.is_empty() {
+                continue;
+            }
+            if seen.insert(entry.key.chunk_hash_hex.as_str()) {
+                chunks.push(entry);
+            }
+        }
+        if chunks.is_empty() {
+            return;
+        }
+        chunks.sort_by_key(|entry| entry.token_offset);
+
+        let block_size = chunks[0].token_ids.len();
+        if indexer.block_size(Tier::Lmcache).is_none() {
+            indexer.set_block_size(Tier::Lmcache, block_size);
+            info!(block_size, "Learned off-GPU chunk size from cache events");
+        }
+
+        let mut parent: Option<SequenceHash> = None;
+        let mut previous_end: Option<i64> = None;
+        for entry in chunks {
+            let seq_hash = SequenceHash::from(lmcache_seq_hash(&entry.key.chunk_hash_hex));
+            let block = [StoredBlock {
+                seq_hash,
+                content_hash: compute_content_hash(&entry.token_ids),
+            }];
+            // Chain a chunk onto the previous one only when they are adjacent,
+            // so a gap in the stream starts a new chain instead of aliasing.
+            let chain_parent = match previous_end {
+                Some(end) if end == entry.token_offset => parent,
+                _ => None,
+            };
+            if let Err(e) = indexer.tier(Tier::Lmcache).apply_stored(
+                state.worker_id(Tier::Lmcache),
+                &block,
+                chain_parent,
+                state.blocks_mut(Tier::Lmcache),
+            ) {
+                warn!(?e, "Failed to index an off-GPU chunk");
+            }
+            parent = Some(seq_hash);
+            previous_end = Some(entry.token_offset + block_size as i64);
+        }
+    }
+}
+
 impl Drop for KvEventMonitor {
     fn drop(&mut self) {
         if let Ok(mut handles) = self.worker_handles.try_lock() {
             for (_, sub) in handles.drain() {
                 let _ = sub.shutdown_tx.send(());
                 sub.handle.abort(); // Can't await in Drop, abort as fallback
+            }
+        }
+        if let Ok(mut streams) = self.lmcache_streams.lock() {
+            for (_, handle) in streams.drain() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut discovery) = self.lmcache_discovery.lock() {
+            if let Some(handle) = discovery.take() {
+                handle.abort();
             }
         }
     }
@@ -983,5 +1391,143 @@ mod tests {
 
         monitor.stop().await;
         assert!(monitor.block_size("llama").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Off-GPU (LMCache MP) event ingestion
+    // -----------------------------------------------------------------------
+
+    /// One streamed line, shaped exactly as the MP server serializes it.
+    fn lmcache_line(event_type: &str, incarnation: i64, chunks: &[(&str, i64)]) -> String {
+        let entries: Vec<String> = chunks
+            .iter()
+            .map(|(hash, offset)| {
+                format!(
+                    r#"{{"key":{{"chunk_hash_hex":"{hash}","model_name":"m","kv_rank":1,"object_group_id":0,"cache_salt":"","tags":[]}},"size_bytes":1024,"token_ids":[1,2,3,4],"token_offset":{offset}}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"batches":[{{"instance_id":"psrl_instance_0","incarnation":{incarnation},"seq":1,"event_type":"{event_type}","tier":"l1","backend":"dram","entries":[{}],"shared":false,"ts":1.5,"capacity_bytes":0,"capacity_revision":0}}]}}"#,
+            entries.join(",")
+        )
+    }
+
+    fn decode_line(line: &str) -> LmcacheEventBatchList {
+        serde_json::from_str(line).expect("line should decode")
+    }
+
+    fn lmcache_state(indexer: &TieredIndexer) -> WorkerTierState {
+        WorkerTierState::new(indexer, "grpc://worker-0:8000")
+    }
+
+    #[test]
+    fn test_lmcache_seq_hash_is_stable() {
+        let first = lmcache_seq_hash("00ff");
+        assert_eq!(first, lmcache_seq_hash("00ff"));
+        assert_ne!(first, lmcache_seq_hash("00fe"));
+    }
+
+    #[test]
+    fn test_decode_lmcache_store_line() {
+        let decoded = decode_line(&lmcache_line("store", 7, &[("aa", 0), ("bb", 4)]));
+        assert_eq!(decoded.batches.len(), 1);
+        let batch = &decoded.batches[0];
+        assert_eq!(batch.event_type, "store");
+        assert_eq!(batch.tier, "l1");
+        assert_eq!(batch.incarnation, 7);
+        assert_eq!(batch.entries.len(), 2);
+        assert_eq!(batch.entries[1].token_offset, 4);
+        assert_eq!(batch.entries[0].token_ids.len(), 4);
+    }
+
+    #[test]
+    fn test_apply_lmcache_store_then_delete() {
+        let indexer = TieredIndexer::new(4);
+        let mut state = lmcache_state(&indexer);
+        let mut incarnation = None;
+
+        let store = decode_line(&lmcache_line("store", 7, &[("aa", 0), ("bb", 4)]));
+        KvEventMonitor::apply_lmcache_batch(
+            &store.batches[0],
+            &indexer,
+            &mut state,
+            &mut incarnation,
+        );
+        assert_eq!(incarnation, Some(7));
+        assert_eq!(indexer.block_size(Tier::Lmcache), Some(4));
+        assert_eq!(indexer.tier(Tier::Lmcache).current_size(), 2);
+
+        let delete = decode_line(&lmcache_line("delete", 7, &[("aa", 0)]));
+        KvEventMonitor::apply_lmcache_batch(
+            &delete.batches[0],
+            &indexer,
+            &mut state,
+            &mut incarnation,
+        );
+        // Removing a chunk drops at least that chunk from the tier.
+        assert!(indexer.tier(Tier::Lmcache).current_size() < 2);
+    }
+
+    #[test]
+    fn test_apply_lmcache_duplicate_ranks_dedupe() {
+        let indexer = TieredIndexer::new(4);
+        let mut state = lmcache_state(&indexer);
+        let mut incarnation = None;
+
+        // The same chunk arrives once per KV rank, so it must index once.
+        let store = decode_line(&lmcache_line("store", 1, &[("aa", 0), ("aa", 0)]));
+        KvEventMonitor::apply_lmcache_batch(
+            &store.batches[0],
+            &indexer,
+            &mut state,
+            &mut incarnation,
+        );
+        assert_eq!(indexer.tier(Tier::Lmcache).current_size(), 1);
+    }
+
+    #[test]
+    fn test_apply_lmcache_incarnation_clears() {
+        let indexer = TieredIndexer::new(4);
+        let mut state = lmcache_state(&indexer);
+        let mut incarnation = None;
+
+        let store = decode_line(&lmcache_line("store", 1, &[("aa", 0)]));
+        KvEventMonitor::apply_lmcache_batch(
+            &store.batches[0],
+            &indexer,
+            &mut state,
+            &mut incarnation,
+        );
+        assert_eq!(indexer.tier(Tier::Lmcache).current_size(), 1);
+
+        // A restart bumps the incarnation, so prior blocks are void.
+        let restarted = decode_line(&lmcache_line("store", 2, &[("cc", 0)]));
+        KvEventMonitor::apply_lmcache_batch(
+            &restarted.batches[0],
+            &indexer,
+            &mut state,
+            &mut incarnation,
+        );
+        assert_eq!(incarnation, Some(2));
+        assert_eq!(indexer.tier(Tier::Lmcache).current_size(), 1);
+    }
+
+    #[test]
+    fn test_apply_lmcache_ignores_l2_batches() {
+        let indexer = TieredIndexer::new(4);
+        let mut state = lmcache_state(&indexer);
+        let mut incarnation = None;
+
+        let line =
+            lmcache_line("store", 1, &[("aa", 0)]).replace(r#""tier":"l1""#, r#""tier":"l2""#);
+        let decoded = decode_line(&line);
+        KvEventMonitor::apply_lmcache_batch(
+            &decoded.batches[0],
+            &indexer,
+            &mut state,
+            &mut incarnation,
+        );
+        assert_eq!(indexer.tier(Tier::Lmcache).current_size(), 0);
     }
 }

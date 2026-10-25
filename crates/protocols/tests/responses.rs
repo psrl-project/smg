@@ -2162,6 +2162,7 @@ fn test_custom_tool_call_input_item_round_trip() {
             name,
             id,
             namespace,
+            ..
         } => {
             assert_eq!(call_id, "call_abc123");
             assert_eq!(input, "SELECT count(*) FROM events");

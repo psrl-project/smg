@@ -55,8 +55,13 @@ pub enum KvTransferMode {
     Async,
     /// Await the `TransferKv` RPC before dispatching to B (B is guaranteed warm).
     Sync,
-    /// `PinKv(A)` → `TransferKv(A→B)` → dispatch → `UnpinKv(A)`. Protects the
-    /// source prefix from LRU eviction mid-transfer.
+    /// Deprecated alias for [`KvTransferMode::Sync`].
+    ///
+    /// It used to wrap the transfer in `PinKv` / `UnpinKv` on the source.
+    /// LMCache now read-locks the source objects in the same call that resolves
+    /// them and holds the lock until the read finishes, so the pin added no
+    /// protection while costing two extra RPCs per transfer, and the GPU half
+    /// of it never protected a transfer that reads L1.
     PinSync,
 }
 
@@ -104,6 +109,9 @@ pub struct PsrlConfig {
     pub max_concurrent_seqs_per_instance: usize,
     /// Admission gate: reject a worker that already has engine waiting.
     pub admission_reject_on_waiting: bool,
+    /// Base URL of the LMCache multiprocess coordinator, for example
+    /// `http://10.0.0.1:9300`. Empty disables off-GPU cache events.
+    pub lmcache_coordinator_addr: String,
 }
 
 impl Default for PsrlConfig {
@@ -115,6 +123,7 @@ impl Default for PsrlConfig {
             kv_transfer: KvTransferConfig::default(),
             max_concurrent_seqs_per_instance: 0,
             admission_reject_on_waiting: false,
+            lmcache_coordinator_addr: String::new(),
         }
     }
 }

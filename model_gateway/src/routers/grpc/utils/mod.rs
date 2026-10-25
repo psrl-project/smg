@@ -6,6 +6,7 @@ pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
 mod routed_experts;
+pub(crate) mod sampler_topk;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.

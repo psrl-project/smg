@@ -711,6 +711,7 @@ impl AppContextBuilder {
 
         if is_cache_aware {
             let monitor = Arc::new(KvEventMonitor::new(None));
+            monitor.start_lmcache_events(config.psrl.lmcache_coordinator_addr.clone());
             debug!("Created KV event monitor for event-driven cache-aware routing");
 
             // Inject monitor into PolicyRegistry — propagates to default_policy

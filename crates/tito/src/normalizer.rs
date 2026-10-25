@@ -145,21 +145,25 @@ pub(crate) fn sort_json_keys(value: &Value) -> Value {
     }
 }
 
-/// Canonical JSON for the *prefix hash only*: recursively sort object keys and
-/// strip trailing whitespace from every line of each string scalar.
+/// Canonical JSON for the *prefix hash only*: recursively sort object keys, strip
+/// trailing whitespace from every line of each string scalar, and drop trailing
+/// whitespace/newlines at the end of each string.
 ///
-/// This is hash-side whitespace tolerance, deliberately kept apart from
-/// [`sort_json_keys`] (which the render path uses and which must preserve
-/// values byte-for-byte).  Two spellings of the same tool input that differ
-/// only in line-trailing whitespace — the model emits a blank line as
-/// `"    "`, Claude Code re-serializes the parsed `input` object as `""` —
-/// otherwise produce different hashes, so the prefix lookup misses at that
-/// assistant boundary and the replay is re-tokenized into a forked leaf even
-/// though nothing semantic changed.  Stripping *trailing* per-line whitespace
-/// is safe for this purpose: interior whitespace and leading indentation are
-/// preserved, so whitespace-sensitive values (e.g. Python source in a Write
-/// payload) are unaffected, and only byte-equal-after-normalization messages
-/// map to the same node.
+/// The per-line rule is hash-side whitespace tolerance, deliberately kept apart from
+/// [`sort_json_keys`] (which the render path uses and which must preserve values
+/// byte-for-byte).  Two spellings of the same tool input that differ only in line-trailing
+/// whitespace — the model emits a blank line as `"    "`, Claude Code re-serializes the
+/// parsed `input` object as `""` — otherwise produce different hashes, so the prefix lookup
+/// misses at that assistant boundary and the replay is re-tokenized into a forked leaf even
+/// though nothing semantic changed.  Stripping *trailing* per-line whitespace is safe for
+/// this purpose: interior whitespace and leading indentation are preserved, so
+/// whitespace-sensitive values (e.g. Python source in a Write payload) are unaffected, and
+/// only byte-equal-after-normalization messages map to the same node.
+///
+/// The final trailing-whitespace trim covers the same drift one level further out: a client
+/// that re-serializes a tool argument drops a value-final newline (Codex's `view_image.path`,
+/// `exec_command.cmd`; Claude Code's Bash `command`), which the per-line rule alone leaves in
+/// place (`"a\n"` and `"a"` would still differ).  Hash-only, like the rule above.
 pub(crate) fn canonical_json_for_hash(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -171,7 +175,7 @@ pub(crate) fn canonical_json_for_hash(value: &Value) -> Value {
             Value::Object(sorted.into_iter().collect())
         }
         Value::Array(items) => Value::Array(items.iter().map(canonical_json_for_hash).collect()),
-        Value::String(s) => Value::String(strip_line_trailing_whitespace(s)),
+        Value::String(s) => Value::String(strip_line_trailing_whitespace(s).trim_end().to_string()),
         other => other.clone(),
     }
 }
@@ -318,15 +322,15 @@ pub fn hash_message_into_with(
                 hash_tool_call_into(hasher, tc, canonicalizer);
             }
         }
-        ChatMessage::Tool {
-            content,
-            tool_call_id,
-        } => {
+        ChatMessage::Tool { content, .. } => {
+            // `tool_call_id` is deliberately excluded from the hash. It never
+            // appears in the rendered tokens (the chat template emits
+            // `<tool_response>…</tool_response>` with no id) and the harness
+            // re-mints it on replay, so hashing it makes the prefix hash finer
+            // than the actual token prefix and a multi-turn replay can never
+            // match. Result order still disambiguates positionally.
             hasher.update(b"tool\x00");
             hash_message_content(hasher, Some(content));
-            hasher.update(b"\x00");
-            hasher.update(tool_call_id.as_bytes());
-            hasher.update(b"\x00");
         }
         ChatMessage::Function { content, name } => {
             hasher.update(b"function\x00");
@@ -349,8 +353,12 @@ fn hash_tool_call_into(
     tc: &openai_protocol::common::ToolCall,
     canonicalizer: Option<&dyn ToolInputCanonicalizer>,
 ) {
-    hasher.update(tc.id.as_bytes());
-    hasher.update(b"\x00");
+    // `tc.id` is deliberately excluded. It is an opaque correlator the harness
+    // mints (SMG generates a random `call_<uuid>`) — it never appears in the
+    // rendered tokens, and it is not reproduced when the client replays the
+    // turn. Hashing it makes the prefix hash finer than the token prefix, so a
+    // multi-turn session misses at every assistant boundary and forks. Semantic
+    // identity is (tool_type, function name, canonical arguments).
     hasher.update(tc.tool_type.as_bytes());
     hasher.update(b"\x00");
     hasher.update(tc.function.name.as_bytes());
@@ -636,6 +644,53 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_and_result_ids_do_not_change_hash() {
+        // The tool-call id (SMG mints a random `call_<uuid>`) and the tool
+        // result's `tool_call_id` never appear in the rendered tokens, so the
+        // prefix hash must be independent of them. Otherwise a client that
+        // re-mints/echoes ids differently on the next turn can never match the
+        // stored prefix and every turn forks.
+        use openai_protocol::common::{FunctionCallResponse, ToolCall};
+        let mk = |call_id: &str, result_id: &str| {
+            vec![
+                ChatMessage::Assistant {
+                    content: None,
+                    name: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: call_id.to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCallResponse {
+                            name: "exec_command".to_string(),
+                            arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+                        },
+                    }]),
+                },
+                ChatMessage::Tool {
+                    content: MessageContent::Text("out".to_string()),
+                    tool_call_id: result_id.to_string(),
+                },
+            ]
+        };
+        assert_eq!(
+            hash_messages(&mk("call_aaa", "call_aaa")),
+            hash_messages(&mk("call_bbb", "call_bbb")),
+            "tool-call/result ids must not affect the prefix hash"
+        );
+
+        // A genuinely different tool call still hashes differently.
+        let mut other = mk("call_aaa", "call_aaa");
+        if let ChatMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } = &mut other[0]
+        {
+            calls[0].function.name = "exec_command_v2".to_string();
+        }
+        assert_ne!(hash_messages(&mk("call_aaa", "call_aaa")), hash_messages(&other));
+    }
+
+    #[test]
     fn tool_call_arg_string_trailing_whitespace_does_not_change_hash() {
         // Line-trailing whitespace inside a string value is inert: the model
         // may emit a code payload whose blank lines carry four spaces while
@@ -697,6 +752,39 @@ mod tests {
         assert_ne!(
             hash_messages(&mk("import x\n    pass\n")),
             hash_messages(&mk("import x\npass\n"))
+        );
+    }
+
+    #[test]
+    fn tool_call_arg_value_final_newline_does_not_change_hash() {
+        // A client that re-serializes a tool argument drops a value-final newline:
+        // the store holds `...-76\n` (parsed from the model's XML) while Codex replays
+        // `...-76`.  Without this tolerance the prefix misses on the very next turn and
+        // forks a fresh trajectory every time (observed: ~28 single-turn trays/session).
+        use openai_protocol::common::{FunctionCallResponse, ToolCall};
+        let mk = |args: &str| {
+            vec![ChatMessage::Assistant {
+                content: None,
+                name: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCallResponse {
+                        name: "view_image".to_string(),
+                        arguments: Some(args.to_string()),
+                    },
+                }]),
+            }]
+        };
+        let with_newline =
+            serde_json::json!({ "path": "arge-resource-to-look-up-like-76\n" }).to_string();
+        let without = serde_json::json!({ "path": "arge-resource-to-look-up-like-76" }).to_string();
+        assert_eq!(hash_messages(&mk(&with_newline)), hash_messages(&mk(&without)));
+        // Interior newlines stay significant.
+        assert_ne!(
+            hash_messages(&mk(&serde_json::json!({"path": "a\nb"}).to_string())),
+            hash_messages(&mk(&serde_json::json!({"path": "ab"}).to_string()))
         );
     }
 

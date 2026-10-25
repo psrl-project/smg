@@ -4,28 +4,33 @@
 //! (`rollout_instance_hint`) to a newly-selected instance `B`, the cached
 //! prefix that `A` already holds would otherwise be re-prefilled on `B`. This
 //! coordinator proactively moves that prefix `A → B` out of band (a unary
-//! `TransferKv` RPC to `A`'s servicer, which pushes via LMCache `transfer_direct`),
-//! so `B` resumes from cache.
+//! `TransferKv` RPC to `A`'s servicer, which pulls it into `B` via LMCache
+//! `transfer_direct`), so `B` resumes from cache.
 //!
 //! The re-route is detected by the PSRL worker selector; this module owns the
 //! *mechanism*:
 //!
 //! - **Overlap gate** — consult the event-driven [`KvEventMonitor`] indexer to
 //!   confirm `A` actually holds the request prefix; skip the move otherwise.
-//! - **Three modes**:
+//! - **Two modes**:
 //!   - [`KvTransferMode::Async`] — fire-and-forget; dispatch to `B` immediately.
 //!   - [`KvTransferMode::Sync`] — await `TransferKv` before dispatch.
-//!   - [`KvTransferMode::PinSync`] — `PinKv(A)` → `TransferKv` → … → `UnpinKv(A)`.
 //! - **Back-pressure** — a per-source [`Semaphore`] bounds concurrent ZMQ moves.
 //! - **Observability** — Prometheus counters/histogram replace merge_base's
 //!   in-memory stat dict.
+//!
+//! The prefix stays protected while `B` reads it: LMCache takes a read lock on
+//! the source objects in the same call that resolves them, and releases it when
+//! the read finishes. An explicit pin around the transfer would be redundant
+//! with that lock, and a GPU pin would not help because the transfer reads L1,
+//! so [`KvTransferMode::PinSync`] is accepted and behaves as `Sync`.
 
 use std::{sync::Arc, time::Duration};
 
 use dashmap::DashMap;
 use kv_index::{compute_request_content_hashes, Tier};
 use metrics::{counter, histogram};
-use smg_grpc_client::vllm_proto::{PinKvRequest, TransferKvRequest, UnpinKvRequest};
+use smg_grpc_client::vllm_proto::TransferKvRequest;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
@@ -41,8 +46,8 @@ const LABEL_LMCACHE_PEER_URL: &str = "lmcache_peer_url";
 /// Default LMCache backend location string (matches merge_base default).
 const DEFAULT_BACKEND: &str = "LocalCPUBackend";
 
-/// Pin/unpin target set used for `PinSync` (protect both GPU and backend copies).
-const PIN_TARGETS: &[&str] = &["gpu", "backend"];
+/// Warns once when a deployment still selects the retired `pin_sync` mode.
+static PIN_SYNC_WARNED: std::sync::Once = std::sync::Once::new();
 
 /// Coordinates KV-cache transfers triggered by instance migration.
 pub struct KvTransferCoordinator {
@@ -132,37 +137,35 @@ impl KvTransferCoordinator {
                 // Fire-and-forget: schedule the move and let dispatch proceed.
                 let this = Arc::clone(self);
                 let src = Arc::clone(src);
-                let tokens = request.tokens.clone();
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "async transfer is intentionally detached from the dispatch path"
                 )]
                 tokio::spawn(async move {
-                    this.run_transfer(&src, request, false, &tokens).await;
+                    this.run_transfer(&src, request).await;
                 });
             }
             KvTransferMode::Sync => {
-                let tokens = request.tokens.clone();
-                self.run_transfer(src, request, false, &tokens).await;
+                self.run_transfer(src, request).await;
             }
             KvTransferMode::PinSync => {
-                let tokens = request.tokens.clone();
-                self.run_transfer(src, request, true, &tokens).await;
+                PIN_SYNC_WARNED.call_once(|| {
+                    warn!(
+                        "kv_transfer.transfer_mode=pin_sync is deprecated and now behaves as \
+                         sync: LMCache read-locks the source objects for the duration of the \
+                         read, so the surrounding pin added nothing while costing two RPCs \
+                         per transfer."
+                    );
+                });
+                self.run_transfer(src, request).await;
             }
         }
     }
 
-    /// Execute a single transfer against source `src`, optionally pinning the
-    /// source prefix for the duration (`PinSync`). Holds the per-source
+    /// Execute a single transfer against source `src`. Holds the per-source
     /// semaphore permit so a single instance can't be flooded with concurrent
     /// ZMQ moves.
-    async fn run_transfer(
-        &self,
-        src: &Arc<dyn Worker>,
-        request: TransferKvRequest,
-        pin: bool,
-        tokens: &[u32],
-    ) {
+    async fn run_transfer(&self, src: &Arc<dyn Worker>, request: TransferKvRequest) {
         let permit_src = self.semaphore_for(src.url());
         let _permit = permit_src.acquire().await;
 
@@ -176,20 +179,6 @@ impl KvTransferCoordinator {
         };
 
         let timeout = Duration::from_millis(self.config.transfer_timeout_ms);
-
-        // PinSync: pin the source prefix before moving so LRU can't evict it.
-        if pin {
-            let pin_req = PinKvRequest {
-                tokens: tokens.to_vec(),
-                targets: PIN_TARGETS.iter().map(|s| (*s).to_string()).collect(),
-            };
-            match tokio::time::timeout(timeout, client.pin_kv(pin_req)).await {
-                Ok(Ok(resp)) if resp.success => record_pin("pin", "ok"),
-                Ok(Ok(_)) => record_pin("pin", "error"),
-                Ok(Err(_)) => record_pin("pin", "error"),
-                Err(_) => record_pin("pin", "timeout"),
-            }
-        }
 
         let start = std::time::Instant::now();
         let outcome = tokio::time::timeout(timeout, client.transfer_kv(request)).await;
@@ -222,18 +211,8 @@ impl KvTransferCoordinator {
             }
         }
 
-        // PinSync: always unpin, even on transfer failure, to release the budget.
-        if pin {
-            let unpin_req = UnpinKvRequest {
-                tokens: tokens.to_vec(),
-                targets: PIN_TARGETS.iter().map(|s| (*s).to_string()).collect(),
-            };
-            match tokio::time::timeout(timeout, client.unpin_kv(unpin_req)).await {
-                Ok(Ok(resp)) if resp.success => record_pin("unpin", "ok"),
-                Ok(Ok(_)) | Ok(Err(_)) => record_pin("unpin", "error"),
-                Err(_) => record_pin("unpin", "timeout"),
-            }
-        }
+        // The source keeps its copy: its LMCache read lock is already released,
+        // and copy=false would race concurrent migrations that share a prefix.
     }
 
     /// Check whether the source instance holds any of the request's prefix
@@ -313,11 +292,6 @@ fn record_result(result: &'static str) {
 fn record_skip(reason: &'static str) {
     counter!("smg_kv_transfer_skipped_total", "reason" => reason).increment(1);
 }
-
-fn record_pin(op: &'static str, result: &'static str) {
-    counter!("smg_kv_pin_total", "op" => op, "result" => result).increment(1);
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

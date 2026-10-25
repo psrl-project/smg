@@ -8,9 +8,13 @@ pub trait ModelAdapter: Send + Sync {
     /// Adjust the end of the pretokenized prefix before merging with incremental tokens.
     fn adjust_prefix_boundary(&self, prefix: &[u32]) -> Vec<u32>;
 
-    /// Number of trailing boundary tokens the model may emit that will be
-    /// re-emitted by the chat template as the next turn's delimiter.
-    /// These are trimmed from non-last turns during training data construction.
+    /// Maximum trailing divergence tolerated between a turn's sampled output and the
+    /// authoritative token stream. These tokens are trimmed from non-last turns during
+    /// training data construction, and a final turn must align exactly.
+    ///
+    /// Families whose boundary token is normalized by `adjust_prefix_boundary` keep this
+    /// at 0, matching miles. Only a genuinely ambiguous delimiter, such as GLM4.7's
+    /// `<|observation|>` / `<|user|>`, raises it.
     fn max_trim_tokens(&self) -> usize {
         0
     }
@@ -132,7 +136,9 @@ impl ModelAdapter for Qwen3Adapter {
     }
 
     fn max_trim_tokens(&self) -> usize {
-        1
+        // The trailing newline is restored by `adjust_prefix_boundary`, so the sampled
+        // output aligns with the stream and no residual divergence is allowed.
+        0
     }
 
     fn assistant_start_str(&self) -> Option<&str> {
@@ -174,7 +180,9 @@ impl ModelAdapter for Qwen35Adapter {
     }
 
     fn max_trim_tokens(&self) -> usize {
-        1
+        // The trailing newline is restored by `adjust_prefix_boundary`, so the sampled
+        // output aligns with the stream and no residual divergence is allowed.
+        0
     }
 
     fn assistant_start_str(&self) -> Option<&str> {
@@ -219,7 +227,9 @@ impl ModelAdapter for QwenNextAdapter {
     }
 
     fn max_trim_tokens(&self) -> usize {
-        1
+        // The trailing newline is restored by `adjust_prefix_boundary`, so the sampled
+        // output aligns with the stream and no residual divergence is allowed.
+        0
     }
 
     fn assistant_start_str(&self) -> Option<&str> {
@@ -413,6 +423,17 @@ mod tests {
             &[64795u32, 64796]
         );
         assert_eq!(DefaultAdapter.trailing_token_ids(), &[] as &[u32]);
+    }
+
+    #[test]
+    fn adapter_max_trim_tokens_matches_miles() {
+        // The Qwen boundary newline is normalized by `adjust_prefix_boundary`, so their
+        // ceiling is 0. Only GLM4.7's ambiguous delimiter needs a tolerance of 1.
+        assert_eq!(Qwen3Adapter::new(151645, 198).max_trim_tokens(), 0);
+        assert_eq!(Qwen35Adapter::new(151645, 198).max_trim_tokens(), 0);
+        assert_eq!(QwenNextAdapter::new(151645, 198).max_trim_tokens(), 0);
+        assert_eq!(Glm47Adapter::new(64795, 64796).max_trim_tokens(), 1);
+        assert_eq!(DefaultAdapter.max_trim_tokens(), 0);
     }
 
     #[test]

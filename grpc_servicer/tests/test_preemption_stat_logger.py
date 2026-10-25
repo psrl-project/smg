@@ -10,7 +10,7 @@ from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
 
 def _make_stats(req_ids: list[str]):
     stats = MagicMock()
-    stats.gateway_preemption_req_ids = req_ids
+    stats.preemption_req_ids = req_ids
     return stats
 
 

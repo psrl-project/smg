@@ -3,6 +3,7 @@ pub mod error;
 pub mod harness;
 pub mod model_adapter;
 pub mod normalizer;
+pub mod sampler_distribution;
 pub mod store;
 pub mod validator;
 
@@ -14,9 +15,9 @@ pub use normalizer::{
     RenderContext,
 };
 pub use store::{
-    MismatchEntry, PrefixLookup, PrefixMatch, ResolvedTrajectoryId, TitoSessionData, TitoStore,
-    Trajectory, TrajectoryIdReservation, TrajectoryIdStrategy, TurnRecord, TurnRoutedExperts,
-    TurnRoutedExpertsDtype,
+    LookupMissReason, MismatchEntry, PrefixLookup, PrefixMatch, ResolvedTrajectoryId,
+    TitoSessionData, TitoStore, Trajectory, TrajectoryIdReservation, TrajectoryIdStrategy,
+    TurnRecord, TurnRoutedExperts, TurnRoutedExpertsDtype,
 };
 
 /// HTTP header name for the TITO session identifier.
@@ -26,3 +27,5 @@ pub const TITO_SESSION_HEADER: &str = "x-smg-tito-session-id";
 ///
 /// Used by the manual strategy and defaults to 0 when absent.
 pub const TITO_TRAJECTORY_ID_HEADER: &str = "x-smg-tito-trajectory-id";
+
+pub use sampler_distribution::{validate_sampler_row, SamplerDistribution, ValidatedSamplerRow};

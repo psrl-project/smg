@@ -148,6 +148,9 @@ impl SessionState {
 pub struct TurnRecord {
     pub prompt_token_count: usize,
     pub output_logprobs: Option<Vec<(f32, u32)>>,
+    pub sampler_capture_width: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampler_distribution: Option<crate::SamplerDistribution>,
     pub finish_reason: String,
     pub mismatch_report: Vec<MismatchEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -385,6 +388,37 @@ pub struct PrefixMatch {
     pub has_assistant_in_appended: bool,
 }
 
+/// Why a [`PrefixLookup`] failed to match a stored prefix.
+///
+/// Bounded by construction so the value is safe to use as a low-cardinality
+/// metric label.  `None` (the [`PrefixLookup::miss_reason`] value on a hit)
+/// means the lookup succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookupMissReason {
+    /// The request carried too few messages, or none of them were assistant
+    /// boundaries, so there was nothing to match against.  Structural: the
+    /// harness is not sending a replayable conversation.
+    NoCandidates,
+    /// The session has no stored state — first turn, or the session was
+    /// evicted/never created.
+    SessionNotFound,
+    /// Candidate assistant boundaries were computed, but none matched a stored
+    /// node.  The replayed assistant turn hashed differently from the one the
+    /// session generated (a hash round-trip drift).
+    NoMatchingNode,
+}
+
+impl LookupMissReason {
+    /// Stable, low-cardinality wire label (metric label / log field).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCandidates => "no_candidates",
+            Self::SessionNotFound => "session_not_found",
+            Self::NoMatchingNode => "no_matching_node",
+        }
+    }
+}
+
 /// `running_hasher` is the [`PrefixHasher`] state after folding both the
 /// render context and every message in the lookup `messages` slice.
 ///
@@ -402,6 +436,9 @@ pub struct PrefixLookup {
     /// Hash at the last assistant boundary in the lookup `messages`.  This is
     /// the parent hash for any node about to be stored after this lookup.
     pub parent_hash: Option<PrefixHash>,
+    /// `None` on a hit; otherwise why the lookup missed.  Callers fold this
+    /// into the hit-rate metric so a forking session is classified by reason.
+    pub miss_reason: Option<LookupMissReason>,
 }
 
 impl Default for TitoStore {
@@ -681,39 +718,24 @@ impl TitoStore {
         // We still return the running hasher so the caller
         // can store a root-level entry.
         if messages.len() < 2 || candidates.is_empty() {
-            tracing::debug!(
-                session_id = %session_id,
-                msg_count = messages.len(),
-                candidate_count = candidates.len(),
-                "find_prefix_with_lookup: no candidates"
-            );
             return Ok(PrefixLookup {
                 matched: None,
                 running_hasher: hasher,
                 parent_hash,
+                miss_reason: Some(LookupMissReason::NoCandidates),
             });
         }
-
-        tracing::debug!(
-            session_id = %session_id,
-            candidate_count = candidates.len(),
-            entries_count = self
-                .get_session_arc(session_id)
-                .map(|arc| arc.lock().entries.len())
-                .unwrap_or(0),
-            "find_prefix_with_lookup: lookup start"
-        );
 
         // Check from longest prefix to shortest. `get_session_arc` ensures the
         // DashMap shard lock is released before we lock the per-session Mutex.
         let arc = match self.get_session_arc(session_id) {
             Some(arc) => arc,
             None => {
-                tracing::debug!(session_id = %session_id, "find_prefix_with_lookup: session not found");
                 return Ok(PrefixLookup {
                     matched: None,
                     running_hasher: hasher,
                     parent_hash,
+                    miss_reason: Some(LookupMissReason::SessionNotFound),
                 });
             }
         };
@@ -721,42 +743,13 @@ impl TitoStore {
 
         for (k, hash) in candidates.iter().rev() {
             if let Some(entry) = state.entries.get(hash) {
+                // The harness compacted / re-injected the conversation when the
+                // appended slice contains assistant turns this session's model
+                // never generated.  Keep the hit and treat them as prompt —
+                // `merge_incremental` re-tokenizes them and the training mask
+                // stays 0 (only generated output is masked 1).
                 let appended = &messages[*k..];
                 let has_assistant_in_appended = appended.iter().any(is_assistant_role);
-                if has_assistant_in_appended {
-                    // The harness compacted / re-injected the conversation: the
-                    // appended slice contains assistant turns that this session's
-                    // model never generated.  Keep the hit and treat them as
-                    // prompt — `merge_incremental` re-tokenizes them and the
-                    // training mask stays 0 (only generated output is masked 1).
-                    // WARN in debug mode (compaction is notable there); DEBUG
-                    // otherwise so production logs do not spam on every hit.
-                    if self.is_debug() {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            matched_len = *k,
-                            appended_with_assistant = true,
-                            appended_msg_count = appended.len(),
-                            "TITO HIT — appended slice contains assistant turn(s); \
-                             treating as compacted context (prompt, mask 0)"
-                        );
-                    } else {
-                        tracing::debug!(
-                            session_id = %session_id,
-                            matched_len = *k,
-                            appended_with_assistant = true,
-                            appended_msg_count = appended.len(),
-                            "TITO HIT — appended slice contains assistant turn(s); \
-                             treating as compacted context (prompt, mask 0)"
-                        );
-                    }
-                }
-                tracing::debug!(
-                    session_id = %session_id,
-                    matched_len = *k,
-                    prefix_tokens = entry.token_ids.len(),
-                    "find_prefix_with_lookup: HIT"
-                );
                 let reusable_prefix_token_ids = entry
                     .reusable_prefix_token_ids
                     .as_deref()
@@ -769,6 +762,7 @@ impl TitoStore {
                     }),
                     running_hasher: hasher,
                     parent_hash,
+                    miss_reason: None,
                 });
             }
         }
@@ -777,6 +771,7 @@ impl TitoStore {
             matched: None,
             running_hasher: hasher,
             parent_hash,
+            miss_reason: Some(LookupMissReason::NoMatchingNode),
         })
     }
 
@@ -813,10 +808,7 @@ impl TitoStore {
     ) -> Option<PrefixHash> {
         let last_asst = messages.iter().rposition(is_assistant_role)?;
         let second_last_asst = messages[..last_asst].iter().rposition(is_assistant_role)?;
-        Some(self.hash_messages_with_context(
-            &messages[..=second_last_asst],
-            render_context,
-        ))
+        Some(self.hash_messages_with_context(&messages[..=second_last_asst], render_context))
     }
 
     /// Store token IDs for a completed generation using caller-supplied hashes.
@@ -957,10 +949,14 @@ impl TitoStore {
                         .reusable_prefix_token_ids
                         .as_deref()
                         .unwrap_or(&parent.token_ids);
-                    let new_ids: &[u32] = token_ids.reusable.as_deref().unwrap_or(&token_ids.expanded);
+                    let new_ids: &[u32] =
+                        token_ids.reusable.as_deref().unwrap_or(&token_ids.expanded);
                     let max_trim = state.max_trim_tokens;
                     let check_len = prev.len().saturating_sub(max_trim);
-                    if check_len > 0 && new_ids.len() >= check_len && &new_ids[..check_len] != &prev[..check_len] {
+                    if check_len > 0
+                        && new_ids.len() >= check_len
+                        && &new_ids[..check_len] != &prev[..check_len]
+                    {
                         let first = prev[..check_len]
                             .iter()
                             .zip(&new_ids[..check_len])
@@ -1409,7 +1405,10 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
         leaves.push(TitoLeafMeta {
             trajectory_id: *trajectory_id,
             node_id: leaf_id,
-            parent: nodes.iter().find(|n| n.id == leaf_id).and_then(|n| n.parent),
+            parent: nodes
+                .iter()
+                .find(|n| n.id == leaf_id)
+                .and_then(|n| n.parent),
             path_node_ids,
         });
     }
@@ -1527,6 +1526,8 @@ mod tests {
         TurnRecord {
             prompt_token_count,
             output_logprobs: None,
+            sampler_capture_width: 0,
+            sampler_distribution: None,
             finish_reason: finish_reason.to_string(),
             mismatch_report: vec![],
             routed_experts: None,
@@ -1773,6 +1774,60 @@ mod tests {
     }
 
     #[test]
+    fn lookup_reports_a_miss_reason() {
+        let store = make_store();
+        let ctx = render_context();
+
+        // (a) No assistant boundary to match → NoCandidates, before any session
+        //     is consulted.
+        let no_candidates = vec![user_msg("hi"), user_msg("there")];
+        let lookup = store
+            .find_prefix_with_lookup("missing", &no_candidates, &ctx)
+            .unwrap();
+        assert!(lookup.matched.is_none());
+        assert_eq!(lookup.miss_reason, Some(LookupMissReason::NoCandidates));
+
+        // (b) A replayable assistant boundary exists but the session has no
+        //     state → SessionNotFound.
+        let with_boundary = vec![
+            user_msg("hi"),
+            assistant_msg("hello"),
+            tool_msg("result", "call_1"),
+        ];
+        let lookup = store
+            .find_prefix_with_lookup("missing", &with_boundary, &ctx)
+            .unwrap();
+        assert_eq!(lookup.miss_reason, Some(LookupMissReason::SessionNotFound));
+
+        // (c) Session has state, but the replayed assistant turn hashes
+        //     differently → NoMatchingNode.
+        store.create_session("s1");
+        store_turn(
+            &store,
+            "s1",
+            &vec![user_msg("hi"), assistant_msg("hello")],
+            vec![1, 2, 3],
+            record(2, "stop"),
+            &ctx,
+        );
+        let drifted = vec![
+            user_msg("hi"),
+            assistant_msg("DIFFERENT"),
+            tool_msg("result", "call_1"),
+        ];
+        let lookup = store.find_prefix_with_lookup("s1", &drifted, &ctx).unwrap();
+        assert!(lookup.matched.is_none());
+        assert_eq!(lookup.miss_reason, Some(LookupMissReason::NoMatchingNode));
+
+        // (d) A real hit carries no miss reason.
+        let lookup = store
+            .find_prefix_with_lookup("s1", &with_boundary, &ctx)
+            .unwrap();
+        assert!(lookup.matched.is_some());
+        assert_eq!(lookup.miss_reason, None);
+    }
+
+    #[test]
     fn delete_session_is_idempotent() {
         let store = make_store();
         store.create_session("s1");
@@ -1954,7 +2009,13 @@ mod tests {
         assert!(single["trajectories"][0].get("turn_records").is_none());
         assert_eq!(single["tree"]["leaves"].as_array().unwrap().len(), 1);
         assert_eq!(single["tree"]["nodes"][0]["stored"], true);
-        assert_eq!(single["tree"]["leaves"][0]["path_node_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            single["tree"]["leaves"][0]["path_node_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         let multi_store = make_store();
         multi_store.create_session("multi");
@@ -2149,6 +2210,8 @@ mod tests {
                 TurnRecord {
                     prompt_token_count: 42,
                     output_logprobs: Some(vec![(-0.5, 100), (-1.2, 200)]),
+                    sampler_capture_width: 0,
+                    sampler_distribution: None,
                     finish_reason: "stop".to_string(),
                     mismatch_report: vec![MismatchEntry {
                         mismatch_type: "token_diff".to_string(),
@@ -2556,12 +2619,20 @@ mod tests {
     fn prefix_validation_tolerates_boundary_but_rejects_divergence() {
         let store = make_store();
         store.create_session("s");
-        // Qwen3-like ceiling: tolerate 1 trailing boundary token per turn.
+        // Explicit tolerance of 1, so the last stored token falls inside the window.
         store.set_session_max_trim_tokens("s", 1);
 
         let parent_hash: PrefixHash = [1u8; 32];
         store
-            .store_with_hashes("s", parent_hash, None, vec![10, 20, 30], record(3, "stop"), 0, false)
+            .store_with_hashes(
+                "s",
+                parent_hash,
+                None,
+                vec![10, 20, 30],
+                record(3, "stop"),
+                0,
+                false,
+            )
             .unwrap();
 
         // Clean extension: the new checkpoint re-emits the truncated turn's
@@ -2601,7 +2672,10 @@ mod tests {
         // points at the clean-extension leaf, not the divergent node.
         let trajectories = store.get_all_trajectories("s");
         assert_eq!(trajectories.len(), 1);
-        assert_eq!(trajectories[0].accumulated_token_ids, vec![10, 20, 30, 151645, 198]);
+        assert_eq!(
+            trajectories[0].accumulated_token_ids,
+            vec![10, 20, 30, 151645, 198]
+        );
     }
 
     #[test]
@@ -2726,6 +2800,8 @@ mod tests {
         let record = TurnRecord {
             prompt_token_count: 3,
             output_logprobs: None,
+            sampler_capture_width: 0,
+            sampler_distribution: None,
             finish_reason: "stop".to_string(),
             mismatch_report: Vec::new(),
             routed_experts: None,
@@ -2752,6 +2828,8 @@ mod dead_leaf_tests {
             turn_record: TurnRecord {
                 prompt_token_count: 0,
                 output_logprobs: None,
+                sampler_capture_width: 0,
+                sampler_distribution: None,
                 finish_reason: "stop".to_string(),
                 mismatch_report: vec![],
                 routed_experts: None,

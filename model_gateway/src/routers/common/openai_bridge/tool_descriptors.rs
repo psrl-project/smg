@@ -333,6 +333,7 @@ fn is_client_visible_output_item(
         | ResponseOutputItem::ShellCallOutput { .. }
         | ResponseOutputItem::ApplyPatchCall { .. }
         | ResponseOutputItem::ApplyPatchCallOutput { .. }
+        | ResponseOutputItem::CustomToolCall { .. }
         | ResponseOutputItem::Message { .. }
         | ResponseOutputItem::Reasoning { .. }
         | ResponseOutputItem::Compaction { .. }
