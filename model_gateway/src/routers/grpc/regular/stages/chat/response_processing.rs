@@ -20,7 +20,7 @@ use crate::{
                 stages::{PipelineStage, StagePhase},
             },
             context::{FinalResponse, RequestContext, TitoRequestContext},
-            proto_wrapper::{ProtoGenerateComplete, RoutedExpertsError},
+            proto_wrapper::ProtoGenerateComplete,
             regular::{processor, streaming},
         },
     },
@@ -343,10 +343,10 @@ fn do_tito_capture_non_streaming(
         mismatch_count = mismatch_report.len(),
         "do_tito_capture_non_streaming: storing tokens"
     );
-    // A malformed routed-experts segment means the capture would record tokens
-    // against metadata that does not describe them, so skip the turn rather than
-    // store a record the trainer would read as valid.
-    let turn_record = match extract_turn_record(
+    // A malformed routed-experts segment or a missing/misaligned sampler head means the capture
+    // would record tokens against metadata that does not describe them. Fail the turn instead of
+    // storing a record the trainer would read as valid.
+    let turn_record = extract_turn_record(
         first_complete,
         prompt_ids.len(),
         dispatched_prompt_start,

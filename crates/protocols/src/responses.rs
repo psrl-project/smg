@@ -1792,24 +1792,6 @@ pub enum ResponseInputOutputItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ComputerCallStatus>,
     },
-    /// `type: "custom_tool_call"` — assistant's call into a registered
-    /// custom tool. Spec: `{ call_id, input, name, type, id?, namespace? }`.
-    /// `id` / `namespace` are modelled as `Option<String>` so newly-minted
-    /// client-side calls can omit them; they are populated on items
-    /// round-tripped from a previous response. `input` is the model's
-    /// free-form payload (constrained by the tool's `format` if grammar is
-    /// set); the client owns execution and replies with a matching
-    /// [`Self::CustomToolCallOutput`].
-    #[serde(rename = "custom_tool_call")]
-    CustomToolCall {
-        call_id: String,
-        input: String,
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        namespace: Option<String>,
-    },
     /// `type: "custom_tool_call_output"` — client's response to a
     /// `custom_tool_call`. Spec: `{ call_id, output, type, id? }` (no
     /// `status` field per spec). `id` is
@@ -2233,6 +2215,22 @@ pub enum ResponseOutputItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         status: String,
+    },
+    /// `type: "custom_tool_call"` — the model calling a user-defined
+    /// `type: "custom"` tool (for example Codex's `apply_patch`). The output
+    /// shape mirrors the replayable input variant so a later turn can echo the
+    /// item back verbatim.
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        input: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     #[serde(rename = "mcp_list_tools")]
     McpListTools {
@@ -3297,7 +3295,7 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
     };
 
     let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
-    
+
     // A tools-less request cannot call anything, so a non-`none` `tool_choice` is inert
     // rather than invalid. Codex sends `tool_choice: "auto"` unconditionally — including on
     // its tools-less compaction turns — so rejecting the pair aborts the whole turn.
@@ -4035,7 +4033,10 @@ mod tests {
         .unwrap();
         match &item {
             ResponseOutputItem::CustomToolCall {
-                call_id, name, input, ..
+                call_id,
+                name,
+                input,
+                ..
             } => {
                 assert_eq!(call_id, "call_1");
                 assert_eq!(name, "apply_patch");
@@ -4084,10 +4085,9 @@ mod tests {
                 .unwrap();
         assert!(matches!(tool, ResponseTool::Custom(_)));
 
-        let nested: NamespaceTool = serde_json::from_value(
-            serde_json::json!({ "type": "custom", "name": "shell" }),
-        )
-        .unwrap();
+        let nested: NamespaceTool =
+            serde_json::from_value(serde_json::json!({ "type": "custom", "name": "shell" }))
+                .unwrap();
         assert!(matches!(nested, NamespaceTool::Custom(_)));
     }
 }
