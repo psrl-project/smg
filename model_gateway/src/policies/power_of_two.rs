@@ -141,13 +141,24 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::worker::{BasicWorkerBuilder, EngineStats, Worker, WorkerType};
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
             disable_health_check: true,
             ..Default::default()
         }
+    }
+
+    /// Publish a queue length the fallback path reads.
+    ///
+    /// The policy compares engine-reported waiting+running requests when a
+    /// load snapshot is unavailable. `increment_load` only moves the gateway's
+    /// own counter, which this path does not read.
+    fn set_engine_queue(worker: &dyn Worker, requests: usize) {
+        let mut stats = EngineStats::default();
+        stats.scheduler_stats.num_running_reqs = requests;
+        worker.update_engine_stats(stats, 0);
     }
 
     /// Create a `WorkerLoadResponse` with a single DP rank at the given token_usage ratio.
@@ -189,14 +200,10 @@ mod tests {
             .health_config(no_health_check())
             .build();
 
-        // Set different loads
-        for _ in 0..10 {
-            worker1.increment_load();
-        }
-        for _ in 0..5 {
-            worker2.increment_load();
-        }
-        // worker3 has load 0
+        // Set different engine-reported queue lengths.
+        set_engine_queue(&worker1, 10);
+        set_engine_queue(&worker2, 5);
+        // worker3 has no requests
 
         let workers: Vec<Arc<dyn Worker>> =
             vec![Arc::new(worker1), Arc::new(worker2), Arc::new(worker3)];
@@ -293,10 +300,9 @@ mod tests {
             .health_config(no_health_check())
             .build();
 
-        // Manually increment load on Worker B to simulate active requests
-        for _ in 0..5 {
-            worker_b.increment_load();
-        }
+        // Simulate five in-flight requests on Worker B. The fallback path reads
+        // the engine's queue length, not the gateway load counter.
+        set_engine_queue(&worker_b, 5);
 
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker_a), Arc::new(worker_b)];
 
@@ -340,15 +346,13 @@ mod tests {
 
         let policy = PowerOfTwoPolicy::new();
 
-        // Helper to create a worker with specific request load
+        // Helper to create a worker with a specific engine-reported queue length
         let create_worker = |url: &str, reqs: usize| {
             let w = BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
                 .health_config(no_health_check())
                 .build();
-            for _ in 0..reqs {
-                w.increment_load();
-            }
+            set_engine_queue(&w, reqs);
             Arc::new(w)
         };
 

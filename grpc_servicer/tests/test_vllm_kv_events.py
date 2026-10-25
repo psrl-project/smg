@@ -246,5 +246,5 @@ class TestServicerWiring:
             vllm_config = type("VC", (), {"kv_events_config": _Cfg()})()
 
         servicer = VllmEngineServicer(_Engine(), start_time=0.0)
-        assert servicer._kv_events_config is not None
+        assert servicer.kv_events_config is not None
         assert hasattr(servicer, "SubscribeKvEvents")

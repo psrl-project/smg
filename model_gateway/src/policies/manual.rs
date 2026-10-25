@@ -320,13 +320,20 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::worker::{BasicWorkerBuilder, EngineStats, Worker, WorkerType};
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
             disable_health_check: true,
             ..Default::default()
         }
+    }
+
+    /// Publish the engine queue length `MinLoad` reads.
+    fn set_engine_queue(worker: &dyn Worker, requests: usize) {
+        let mut stats = EngineStats::default();
+        stats.scheduler_stats.num_running_reqs = requests;
+        worker.update_engine_stats(stats, 0);
     }
 
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
@@ -895,6 +902,8 @@ mod tests {
         workers[0].increment_load();
         workers[0].increment_load();
         workers[1].increment_load();
+        set_engine_queue(&*workers[0], 2);
+        set_engine_queue(&*workers[1], 1);
 
         assert_eq!(workers[0].load(), 2);
         assert_eq!(workers[1].load(), 1);

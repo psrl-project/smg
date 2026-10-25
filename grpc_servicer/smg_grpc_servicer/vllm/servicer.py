@@ -159,7 +159,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - SubscribePreemptionEvents: Stream scheduler-preempted request IDs to SMG
     """
 
-    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None, kv_cache_manager=None, kv_transfer_stats_log_interval_s: float = 30.0, enable_kv_event_replay: bool = False,):
+    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None, kv_cache_manager=None, kv_transfer_stats_log_interval_s: float = 30.0, enable_kv_event_replay: bool = False, default_request_seed: int | None = None,):
         """
         Initialize the servicer.
 
@@ -177,8 +177,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 gateway gap-replay can recover missed sequences. When False
                 (default), fall back to the original per-subscription inline ZMQ
                 loop with no buffering — the known-good baseline.
+            default_request_seed: Seed applied when the request does not state
+                one. ``None`` leaves vLLM's own default in place.
         """
         self.enable_kv_event_replay = enable_kv_event_replay
+        self.default_request_seed = default_request_seed
+        # In-flight Generate calls per data-parallel rank. Used by the gateway
+        # to observe where work landed without asking the engine.
+        self._active_requests_by_dp: dict[int, int] = {}
         self.engine = async_llm
         self.start_time = start_time
         self.preemption_queue: asyncio.Queue[list[str]] = (
@@ -369,6 +375,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         output_collector = None
         registration_pending = False
+        active_dp_rank = None
         try:
             arrival_time = time.time()
 
@@ -431,6 +438,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 if _has_kv_connector and request.HasField("kv_transfer_params")
                 else None,
                 model_version_tag=_version_tag,
+                default_seed=self.default_request_seed,
             )
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
 
@@ -476,14 +484,23 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 return
             registration_pending = True
 
-            output_collector = await self.engine.add_request(
-                request_id=request_id,
-                prompt=prompt,
-                params=sampling_params,
-                tokenization_kwargs=tokenization_kwargs,
-            )
+            data_parallel_rank = request.data_parallel_rank
+            add_request_kwargs = {
+                "request_id": request_id,
+                "prompt": prompt,
+                "params": sampling_params,
+                "tokenization_kwargs": tokenization_kwargs,
+                "data_parallel_rank": data_parallel_rank,
+            }
+            if request.HasField("priority"):
+                add_request_kwargs["priority"] = request.priority
+            output_collector = await self.engine.add_request(**add_request_kwargs)
             registration_pending = False
             self.finish_generate_admission()
+            active_dp_rank = data_parallel_rank
+            self._active_requests_by_dp[data_parallel_rank] = (
+                self._active_requests_by_dp.get(data_parallel_rank, 0) + 1
+            )
 
             finished = False
             while not finished:
@@ -540,8 +557,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         finally:
             if registration_pending:
                 self.finish_generate_admission()
+            if active_dp_rank is not None:
+                remaining = self._active_requests_by_dp.get(active_dp_rank, 0) - 1
+                if remaining > 0:
+                    self._active_requests_by_dp[active_dp_rank] = remaining
+                else:
+                    self._active_requests_by_dp.pop(active_dp_rank, None)
             if output_collector is not None:
                 output_collector.close()
+
+    def get_active_request_count(self, data_parallel_rank: int = 0) -> int:
+        """Return the number of Generate calls in flight for one DP rank."""
+        return self._active_requests_by_dp.get(data_parallel_rank, 0)
 
     async def Embed(
         self,
@@ -1298,6 +1325,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         stream: bool = True,
         kv_transfer_params: vllm_engine_pb2.KvTransferParams | None = None,
         model_version_tag: str | None = None,
+        default_seed: int | None = None,
     ) -> SamplingParams:
         """
         Convert protobuf SamplingParams to vLLM SamplingParams.
@@ -1384,7 +1412,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             n=params.n if params.n > 0 else 1,
             logprobs=params.logprobs if params.HasField("logprobs") else None,
             prompt_logprobs=params.prompt_logprobs if params.HasField("prompt_logprobs") else None,
-            seed=params.seed if params.HasField("seed") else None,
+            seed=params.seed if params.HasField("seed") else default_seed,
             include_stop_str_in_output=params.include_stop_str_in_output,
             logit_bias=dict(params.logit_bias) if params.logit_bias else None,
             structured_outputs=structured_outputs,
@@ -1464,6 +1492,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             logger.warning(
                 "routed_experts has unexpected ndim=%d; dropping",
                 routed_experts.ndim,
+            )
+            return None
+        if routed_experts.dtype not in (np.uint8, np.uint16):
+            logger.warning(
+                "routed_experts has unsupported dtype=%s; dropping",
+                routed_experts.dtype,
             )
             return None
         if not routed_experts.flags["C_CONTIGUOUS"]:

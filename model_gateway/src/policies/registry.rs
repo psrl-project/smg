@@ -864,21 +864,12 @@ mod tests {
     }
 
     #[test]
-    fn test_set_mesh_sync_propagates_to_default_cache_aware_policy() {
-        let registry = PolicyRegistry::new(PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 10_000,
-            block_size: 16,
-            gpu_overlap_weight: 1.0,
-            lmcache_overlap_weight: 0.5,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-        enable_kv_admission_control: false,
-                kv_capacity_threshold: 1.0,
-        });
+    fn test_init_pd_cache_aware_policies_initializes_role_trees() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // PD mode has one policy per role. Each must get only its own workers,
+        // otherwise a decode selection can match a prefill tenant.
+        registry.set_prefill_policy(cache_aware_policy());
+        registry.set_decode_policy(cache_aware_policy());
 
         let prefill_workers = vec![
             worker("http://prefill-1:8000", WorkerType::Prefill),

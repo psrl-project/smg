@@ -43,6 +43,85 @@ pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 /// vLLM NIXL KV connector name
 pub const NIXL_CONNECTOR: &str = "NixlConnector";
 
+/// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
+/// client's local flush deadline.
+const FLUSH_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Timeout for worker HTTP profile requests. Stopping a profile can take
+/// a long time while the backend serializes large traces.
+const PROFILE_HTTP_TIMEOUT: Duration = Duration::from_secs(630);
+
+/// POST an admin endpoint on an HTTP worker and map the outcome to a
+/// [`WorkerResult`].
+async fn admin_http_post(
+    client: &reqwest::Client,
+    url: String,
+    api_key: Option<&String>,
+    body: Option<serde_json::Value>,
+    operation: &str,
+    timeout: Duration,
+) -> WorkerResult<()> {
+    let mut req = client.post(&url).timeout(timeout);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => Ok(()),
+        Ok(resp) => Err(WorkerError::OperationFailed {
+            url,
+            operation: operation.to_string(),
+            reason: format!("HTTP {}", resp.status()),
+        }),
+        Err(e) => Err(WorkerError::OperationFailed {
+            url,
+            operation: operation.to_string(),
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Unwrap the optional gRPC client for an admin op, erroring when absent.
+fn require_grpc_client(
+    url: &str,
+    operation: &str,
+    client: Option<Arc<GrpcClient>>,
+) -> WorkerResult<Arc<GrpcClient>> {
+    client.ok_or_else(|| WorkerError::OperationFailed {
+        url: url.to_string(),
+        operation: operation.to_string(),
+        reason: "no gRPC client available".to_string(),
+    })
+}
+
+/// Map a gRPC admin-op outcome (`success` flag plus message) to a
+/// [`WorkerResult`].
+fn admin_grpc_result(
+    url: &str,
+    operation: &str,
+    result: Result<(bool, String), tonic::Status>,
+) -> WorkerResult<()> {
+    match result {
+        Ok((true, _)) => Ok(()),
+        Ok((false, message)) => Err(WorkerError::OperationFailed {
+            url: url.to_string(),
+            operation: operation.to_string(),
+            reason: if message.is_empty() {
+                "backend reported failure".to_string()
+            } else {
+                message
+            },
+        }),
+        Err(status) => Err(WorkerError::OperationFailed {
+            url: url.to_string(),
+            operation: operation.to_string(),
+            reason: status.to_string(),
+        }),
+    }
+}
+
 pub struct WorkerRoutingKeyLoad {
     url: String,
     active_routing_keys: dashmap::DashMap<String, usize>,
@@ -384,20 +463,104 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Flush the KV cache on this worker (admin operation).
     async fn flush_cache(&self) -> WorkerResult<()> {
-        Ok(())
+        match self.connection_mode() {
+            ConnectionMode::Http => {
+                admin_http_post(
+                    self.http_client(),
+                    self.endpoint_url("/flush_cache"),
+                    self.api_key(),
+                    None,
+                    "flush_cache",
+                    FLUSH_HTTP_TIMEOUT,
+                )
+                .await
+            }
+            ConnectionMode::Grpc => {
+                let client =
+                    require_grpc_client(self.url(), "flush_cache", self.get_grpc_client().await?)?;
+                let result = client.flush_cache(0.0).await;
+                admin_grpc_result(
+                    self.url(),
+                    "flush_cache",
+                    result.map(|r| (r.success, r.message)),
+                )
+            }
+        }
     }
 
     /// Start profiling on this worker (admin operation).
     async fn start_profile(
         &self,
-        _options: &openai_protocol::worker::ProfileOptions,
+        options: &openai_protocol::worker::ProfileOptions,
     ) -> WorkerResult<()> {
-        Ok(())
+        match self.connection_mode() {
+            ConnectionMode::Http => {
+                let body =
+                    serde_json::to_value(options).map_err(|e| WorkerError::OperationFailed {
+                        url: self.url().to_string(),
+                        operation: "start_profile".to_string(),
+                        reason: format!("failed to serialize profile options: {e}"),
+                    })?;
+                admin_http_post(
+                    self.http_client(),
+                    self.endpoint_url("/start_profile"),
+                    self.api_key(),
+                    Some(body),
+                    "start_profile",
+                    PROFILE_HTTP_TIMEOUT,
+                )
+                .await
+            }
+            ConnectionMode::Grpc => {
+                let client = require_grpc_client(
+                    self.url(),
+                    "start_profile",
+                    self.get_grpc_client().await?,
+                )?;
+                let req = smg_grpc_client::common_proto::StartProfileRequest {
+                    output_dir: options.output_dir.clone(),
+                    start_step: options.start_step,
+                    num_steps: options.num_steps,
+                    activities: options.activities.clone().unwrap_or_default(),
+                    with_stack: options.with_stack,
+                    record_shapes: options.record_shapes,
+                    profile_by_stage: options.profile_by_stage,
+                };
+                let result = client.start_profile(req).await;
+                admin_grpc_result(
+                    self.url(),
+                    "start_profile",
+                    result.map(|r| (r.success, r.message)),
+                )
+            }
+        }
     }
 
     /// Stop profiling on this worker (admin operation).
     async fn stop_profile(&self) -> WorkerResult<()> {
-        Ok(())
+        match self.connection_mode() {
+            ConnectionMode::Http => {
+                admin_http_post(
+                    self.http_client(),
+                    self.endpoint_url("/stop_profile"),
+                    self.api_key(),
+                    None,
+                    "stop_profile",
+                    PROFILE_HTTP_TIMEOUT,
+                )
+                .await
+            }
+            ConnectionMode::Grpc => {
+                let client =
+                    require_grpc_client(self.url(), "stop_profile", self.get_grpc_client().await?)?;
+                let result = client.stop_profile().await;
+                admin_grpc_result(
+                    self.url(),
+                    "stop_profile",
+                    result.map(|r| (r.success, r.message)),
+                )
+            }
+        }
     }
 
     /// Get the maximum number of running requests this worker can handle.

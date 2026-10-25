@@ -38,14 +38,27 @@ def test_build_routed_experts_accepts_c_contiguous_singleton_dimension_stride():
 
 
 @pytest.mark.parametrize(
-    "routed_experts, message",
+    "routed_experts",
     [
-        (np.zeros((4, 2), dtype=np.uint8), "must be 3D"),
-        (np.zeros((0, 2, 3), dtype=np.uint8), "dimensions must be positive"),
-        (np.zeros((4, 2, 3), dtype=np.int16), "uint8 or uint16"),
-        (np.zeros((4, 2, 3), dtype=np.uint8)[:, :, ::-1], "C-contiguous"),
+        np.zeros((4, 2), dtype=np.uint8),
+        np.zeros((0, 2, 3), dtype=np.uint8),
+        np.zeros((4, 2, 3), dtype=np.int16),
     ],
 )
-def test_build_routed_experts_rejects_malformed_present_payload(routed_experts, message):
-    with pytest.raises(ValueError, match=message):
-        VllmEngineServicer._build_routed_experts_tensor(routed_experts)
+def test_build_routed_experts_drops_malformed_present_payload(routed_experts):
+    # Routed experts are auxiliary training data: a malformed payload must not
+    # abort the stream, so the servicer drops it and the gateway sees a missing
+    # field.
+    assert VllmEngineServicer._build_routed_experts_tensor(routed_experts) is None
+
+
+def test_build_routed_experts_copies_non_contiguous_payload():
+    routed_experts = np.zeros((4, 2, 3), dtype=np.uint8)[:, :, ::-1]
+
+    proto = VllmEngineServicer._build_routed_experts_tensor(routed_experts)
+
+    expected = np.ascontiguousarray(routed_experts)
+    assert proto.dtype == "uint8"
+    assert proto.num_layers == 2
+    assert proto.top_k == 3
+    assert proto.data == expected.tobytes()

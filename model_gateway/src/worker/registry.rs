@@ -729,6 +729,13 @@ impl WorkerRegistry {
                 .push(worker_id.clone());
         }
 
+        // A local writer has taken ownership: a mesh import claimed by
+        // `register_or_replace` must now publish its own state. This must be
+        // visible before the `Replaced` event wakes the outbound loop, which
+        // gates on the live origin.
+        self.worker_origins
+            .insert(worker_id.clone(), WorkerOrigin::Local);
+
         let _ = self.event_tx.send(WorkerEvent::Replaced {
             worker_id: worker_id.clone(),
             old: old_worker,
@@ -1275,16 +1282,36 @@ impl WorkerRegistry {
             return;
         }
 
+        // Adopt the publisher's worker id for a new import. Tombstones are
+        // addressed by the key suffix (the publisher id), so an import that
+        // mints a fresh id can never be removed by its owner.
+        if !state.worker_id.is_empty() {
+            self.reserve_id_for_url_as(&state.url, WorkerId::from_string(state.worker_id.clone()));
+        }
+
         // New worker — build from the full WorkerSpec if available,
         // otherwise fall back to minimal builder (old nodes / rolling upgrade).
-        let worker = match bincode::deserialize::<openai_protocol::worker::WorkerSpec>(&state.spec)
-        {
-            Ok(spec) if !state.spec.is_empty() => {
-                super::builder::BasicWorkerBuilder::from_spec(spec).build()
-            }
-            _ => super::builder::BasicWorkerBuilder::new(&state.url)
+        // The publisher encodes the spec as JSON: `WorkerSpec` has
+        // `skip_serializing_*` fields that a positional format cannot round-trip.
+        let minimal = || {
+            super::builder::BasicWorkerBuilder::new(&state.url)
                 .model(ModelCard::new(&state.model_id))
-                .build(),
+                .build()
+        };
+        let worker = if state.spec.is_empty() {
+            minimal()
+        } else {
+            match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
+                Ok(spec) => super::builder::BasicWorkerBuilder::from_spec(spec).build(),
+                Err(err) => {
+                    tracing::warn!(
+                        url = %state.url,
+                        error = %err,
+                        "failed to decode mesh WorkerSpec; importing the minimal worker"
+                    );
+                    minimal()
+                }
+            }
         };
 
         // Same legacy `set_healthy(state.health)` semantics for the

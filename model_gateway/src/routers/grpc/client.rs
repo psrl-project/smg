@@ -268,6 +268,50 @@ impl GrpcClient {
         }
     }
 
+    /// Flush the backend KV cache. Returns `Unimplemented` for backends
+    /// without the FlushCache RPC.
+    pub async fn flush_cache(
+        &self,
+        timeout_s: f32,
+    ) -> Result<smg_grpc_client::common_proto::FlushCacheResponse, tonic::Status> {
+        match self {
+            Self::Sglang(client) => client.flush_cache(timeout_s).await,
+            Self::TokenSpeed(client) => client.flush_cache(timeout_s).await,
+            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+                "FlushCache RPC not supported for this backend",
+            )),
+        }
+    }
+
+    /// Start the profiler on the backend. Returns `Unimplemented` for
+    /// backends without the StartProfile RPC.
+    pub async fn start_profile(
+        &self,
+        req: smg_grpc_client::common_proto::StartProfileRequest,
+    ) -> Result<smg_grpc_client::common_proto::ProfileResponse, tonic::Status> {
+        match self {
+            Self::Sglang(client) => client.start_profile(req).await,
+            Self::TokenSpeed(client) => client.start_profile(req).await,
+            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+                "StartProfile RPC not supported for this backend",
+            )),
+        }
+    }
+
+    /// Stop the profiler on the backend. Returns `Unimplemented` for
+    /// backends without the StopProfile RPC.
+    pub async fn stop_profile(
+        &self,
+    ) -> Result<smg_grpc_client::common_proto::ProfileResponse, tonic::Status> {
+        match self {
+            Self::Sglang(client) => client.stop_profile().await,
+            Self::TokenSpeed(client) => client.stop_profile().await,
+            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+                "StopProfile RPC not supported for this backend",
+            )),
+        }
+    }
+
     /// Subscribe to KV cache events (all backends).
     ///
     /// `dp_rank` selects the data-parallel rank when the backend fronts
