@@ -404,6 +404,9 @@ pub struct GenerateMetaInfo {
     pub prompt_tokens: u32,
     pub weight_version: String,
     pub input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    /// Raw prompt alternatives by input position, with no alternatives for the first token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_top_logprobs: Option<Vec<Vec<(f64, u32)>>>,
     pub output_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
     pub completion_tokens: u32,
     pub cached_tokens: u32,

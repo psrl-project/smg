@@ -102,3 +102,86 @@ pub(crate) fn convert_generate_input_logprobs(
         })
         .collect()
 }
+
+/// Preserve raw prompt alternatives without decoding token IDs.
+pub(crate) fn convert_generate_input_top_logprobs(
+    proto_logprobs: &ProtoInputLogProbs,
+) -> Vec<Vec<(f64, u32)>> {
+    proto_logprobs
+        .token_ids
+        .iter()
+        .enumerate()
+        .map(|(position, _)| {
+            if position == 0 {
+                return Vec::new();
+            }
+            proto_logprobs
+                .top_logprobs
+                .get(position)
+                .map(|top| {
+                    top.values
+                        .iter()
+                        .zip(&top.token_ids)
+                        .map(|(&probability, &token)| (f64::from(probability), token))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod prompt_top_logprobs_tests {
+    use super::*;
+    use crate::routers::grpc::proto_wrapper::ProtoTopLogProbs;
+
+    #[test]
+    fn preserves_raw_ids_and_first_token_placeholder() {
+        let prompt = ProtoInputLogProbs {
+            token_logprobs: vec![None, Some(-0.5), Some(-0.25)],
+            token_ids: vec![12, 99, 7],
+            top_logprobs: vec![
+                ProtoTopLogProbs {
+                    values: vec![],
+                    token_ids: vec![],
+                },
+                ProtoTopLogProbs {
+                    values: vec![-0.5, -1.0],
+                    token_ids: vec![99, 42],
+                },
+                ProtoTopLogProbs {
+                    values: vec![-0.25, -2.0],
+                    token_ids: vec![7, 88],
+                },
+            ],
+        };
+        let alternatives = convert_generate_input_top_logprobs(&prompt);
+        assert_eq!(
+            alternatives,
+            vec![
+                vec![],
+                vec![(-0.5, 99), (-1.0, 42)],
+                vec![(-0.25, 7), (-2.0, 88)]
+            ]
+        );
+        let json = serde_json::to_value(alternatives).unwrap();
+        assert_eq!(json[0], serde_json::json!([]));
+        assert_eq!(json[1][0], serde_json::json!([-0.5, 99]));
+        let sampled = convert_generate_input_logprobs(&prompt);
+        assert_eq!(sampled[0], vec![None, Some(12.0)]);
+        assert_eq!(sampled[2], vec![Some(-0.25), Some(7.0)]);
+    }
+
+    #[test]
+    fn missing_alternatives_remain_empty() {
+        let prompt = ProtoInputLogProbs {
+            token_logprobs: vec![None, Some(-0.5)],
+            token_ids: vec![12, 99],
+            top_logprobs: vec![],
+        };
+        assert_eq!(
+            convert_generate_input_top_logprobs(&prompt),
+            vec![vec![], vec![]]
+        );
+    }
+}

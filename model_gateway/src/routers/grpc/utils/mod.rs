@@ -18,8 +18,8 @@ pub(crate) use chat_utils::{
     resolve_tokenizer, send_error_sse,
 };
 pub(crate) use logprobs::{
-    convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
-    convert_proto_to_openai_logprobs,
+    convert_generate_input_logprobs, convert_generate_input_top_logprobs,
+    convert_generate_output_logprobs, convert_proto_logprobs, convert_proto_to_openai_logprobs,
 };
 pub(crate) use metrics::{error_type_from_status, route_to_endpoint};
 pub(crate) use parsers::{

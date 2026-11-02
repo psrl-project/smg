@@ -374,6 +374,11 @@ impl VllmEngineClient {
             sampling_params.logprobs = Some(response_width.max(capture_width));
         }
 
+        // Explicit prompt scoring keeps rollout-only logprobs out of the prefill path.
+        if body.return_logprob.unwrap_or(false) && body.logprob_start_len == Some(0) {
+            sampling_params.prompt_logprobs = Some(response_width);
+        }
+
         let grpc_request = proto::GenerateRequest {
             request_id,
             input: Some(proto::generate_request::Input::Tokenized(
@@ -986,6 +991,58 @@ mod tests {
     fn test_proto_types_compilation() {
         let _health_req = proto::HealthCheckRequest {};
         // HealthCheckRequest is now empty - no fields to test
+    }
+
+    #[tokio::test]
+    async fn native_generate_requests_prompt_logprobs() {
+        let client = VllmEngineClient {
+            client: proto::vllm_engine_client::VllmEngineClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+            trace_injector: Arc::new(NoopTraceInjector),
+        };
+        for width in [0, 32] {
+            let body: GenerateRequest = serde_json::from_value(serde_json::json!({
+                "input_ids": [12, 99, 7],
+                "sampling_params": {"temperature": 1.0, "max_new_tokens": 1},
+                "return_logprob": true,
+                "return_prompt_token_ids": true,
+                "logprob_start_len": 0,
+                "top_logprobs_num": width,
+            }))
+            .unwrap();
+            let request = client
+                .build_plain_generate_request("score".into(), &body, None, vec![12, 99, 7], None)
+                .unwrap();
+            let params = request.sampling_params.unwrap();
+            assert_eq!(params.prompt_logprobs, Some(width));
+            assert_eq!(params.logprobs, Some(width));
+            assert_eq!(params.temperature, Some(1.0));
+            assert_eq!(params.max_tokens, Some(1));
+            let output_only = GenerateRequest {
+                logprob_start_len: None,
+                ..body
+            };
+            let output_request = client
+                .build_plain_generate_request(
+                    "rollout".into(),
+                    &output_only,
+                    None,
+                    vec![12, 99, 7],
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                output_request.sampling_params.unwrap().prompt_logprobs,
+                None
+            );
+            match request.input.unwrap() {
+                proto::generate_request::Input::Tokenized(tokens) => {
+                    assert_eq!(tokens.input_ids, vec![12, 99, 7])
+                }
+                _ => panic!("Scoring must retain raw token IDs."),
+            }
+        }
     }
 
     #[test]
