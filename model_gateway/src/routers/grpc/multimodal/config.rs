@@ -216,8 +216,14 @@ impl MultimodalComponents {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("Failed to create reqwest client")?;
-        let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
-            .context("Failed to create MediaConnector")?;
+        let media_connector = MediaConnector::new(
+            client,
+            MediaConnectorConfig {
+                allowed_local_media_path: allowed_local_media_path_from_env(),
+                ..MediaConnectorConfig::default()
+            },
+        )
+        .context("Failed to create MediaConnector")?;
 
         Ok(Self {
             media_connector: Arc::new(media_connector),
@@ -227,6 +233,27 @@ impl MultimodalComponents {
             pixel_cache: pixel_cache_from_env(),
         })
     }
+}
+
+/// Local-filesystem root under which `MediaSource::File` fetches are allowed, read
+/// from `SMG_MM_ALLOWED_LOCAL_MEDIA_PATH` (unset / empty -> local-file media is
+/// disabled entirely, matching the pre-existing default). Mirrors the `SMG_MM_*`
+/// env-var convention already used for multimodal config elsewhere in this module
+/// (see `pixel_cache_from_env`, `transport.rs`'s `SMG_MM_TENSOR_TRANSPORT` /
+/// `SMG_MM_SHM_MIN_BYTES`) rather than threading a new CLI flag through
+/// `RouterArgs` -- this is a security allow-list, not routing policy, so it is
+/// deliberately opt-in and unset by default. Read once per process; the directory
+/// is not expected to change at runtime.
+fn allowed_local_media_path_from_env() -> Option<std::path::PathBuf> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("SMG_MM_ALLOWED_LOCAL_MEDIA_PATH")
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .clone()
 }
 
 #[cfg(test)]
