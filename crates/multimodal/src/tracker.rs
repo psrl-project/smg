@@ -12,6 +12,36 @@ use super::{
 
 type PendingTask = JoinHandle<MultiModalResult<TrackedMedia>>;
 
+/// Classify a raw `*Url` content-part string into the right [`MediaSource`] variant.
+///
+/// Recognizes, in order: a `data:` URI (inline base64), a `file://` URI (explicit
+/// local-file reference), and a bare absolute filesystem path (no scheme at all --
+/// what callers that predate the `file://` convention, e.g. PSRL's own gateway, send).
+/// Everything else -- including a string that merely fails to parse as a URL for some
+/// other reason -- falls back to the pre-existing behavior of treating it as an HTTP(S)
+/// URL, so `fetch_http_*`'s own error reporting is unchanged for genuinely malformed input.
+///
+/// Before this function existed, every one of these three cases other than `data:`
+/// fell into the same `_ => MediaSource::Url(url)` arm, including both a `file://` URI
+/// and a schemeless absolute path -- `MediaSource::File`'s already-implemented,
+/// already-tested fetch path (`MediaConnector::fetch_file`, with its
+/// `allowed_local_media_path` sandbox check) was never reachable from here. See
+/// `workspace/issue3/README.md` for the full writeup.
+fn classify_media_url(url: String) -> MediaSource {
+    match url::Url::parse(&url) {
+        Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
+        Ok(parsed) if parsed.scheme() == "file" => match parsed.to_file_path() {
+            Ok(path) => MediaSource::File(path),
+            // Malformed file:// URL (e.g. a host component) -- fall through to the
+            // Url path so the existing InvalidUrl/HTTP error reporting still applies,
+            // rather than silently mis-reading a URL the caller mis-constructed.
+            Err(()) => MediaSource::Url(url),
+        },
+        _ if url.starts_with('/') => MediaSource::File(std::path::PathBuf::from(url)),
+        _ => MediaSource::Url(url),
+    }
+}
+
 #[derive(Debug)]
 pub struct TrackerOutput {
     pub data: MultiModalData,
@@ -37,10 +67,7 @@ impl AsyncMultiModalTracker {
         match part {
             MediaContentPart::Text { .. } => {}
             MediaContentPart::ImageUrl { url, detail, uuid } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = classify_media_url(url);
                 self.enqueue_image(source, detail.unwrap_or_default(), uuid);
             }
             MediaContentPart::ImageData {
@@ -59,10 +86,7 @@ impl AsyncMultiModalTracker {
                 return Err(MultiModalError::UnsupportedContent("image_embeds"));
             }
             MediaContentPart::AudioUrl { url, uuid } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = classify_media_url(url);
                 self.enqueue_audio(source, uuid);
             }
             MediaContentPart::AudioData {
@@ -73,10 +97,7 @@ impl AsyncMultiModalTracker {
                 self.enqueue_audio(MediaSource::InlineBytes(data), uuid);
             }
             MediaContentPart::VideoUrl { url, uuid } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = classify_media_url(url);
                 self.enqueue_video(source, uuid);
             }
             MediaContentPart::VideoData {
