@@ -228,7 +228,25 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                 Some("all") => true,
                 Some("validate") => meta.is_validate,
                 Some("train") => !meta.is_validate,
-                _ => false,
+                // An unlabelled worker is eligible for anything. Nothing in the
+                // production registration path sets `psrl_request_scope` -- not
+                // SMG's own worker registry and not PSRL's `smg_adapter.py`, which
+                // sends `kv_block_size` and `lmcache_instance_id` but not this key.
+                // Only this module's unit tests set it. Refusing unlabelled workers
+                // therefore drops every candidate and strands every request in the
+                // routing queue with no log line, so treat absence as "no scope
+                // restriction" -- the behavior before this filter was introduced.
+                None => true,
+                // A label that is present but unrecognized is a real
+                // misconfiguration rather than an older producer, so keep refusing
+                // it -- but say so, instead of failing the way absence used to.
+                Some(other) => {
+                    warn!(
+                        scope = other,
+                        "PSRL: unrecognized psrl_request_scope label; worker excluded"
+                    );
+                    false
+                }
             }
         });
 
