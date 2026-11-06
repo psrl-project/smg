@@ -346,16 +346,23 @@ fn do_tito_capture_non_streaming(
     // A malformed routed-experts segment or a missing/misaligned sampler head means the capture
     // would record tokens against metadata that does not describe them. Fail the turn instead of
     // storing a record the trainer would read as valid.
+    let sampler_capture_width = if tito_ctx.capture == smg_tito::TurnCapture::Full {
+        tito_ctx.request.sampler_top_logprobs.map_or(
+            0,
+            openai_protocol::sampler_capture::SamplerCaptureWidth::get,
+        )
+    } else {
+        0
+    };
     let turn_record = match extract_turn_record(
         first_complete,
         prompt_ids.len(),
         dispatched_prompt_start,
         weight_version,
         mismatch_report,
-        tito_ctx.request.sampler_top_logprobs.map_or(
-            0,
-            openai_protocol::sampler_capture::SamplerCaptureWidth::get,
-        ),
+        sampler_capture_width,
+        tito_ctx.trajectory_id,
+        tito_ctx.capture,
     ) {
         Ok(record) => record,
         Err(error) => {
@@ -485,76 +492,89 @@ fn extract_turn_record(
     weight_version: Option<String>,
     mismatch_report: Vec<smg_tito::MismatchEntry>,
     sampler_capture_width: u32,
+    owner_trajectory_id: u64,
+    capture: smg_tito::TurnCapture,
 ) -> Result<smg_tito::TurnRecord, String> {
-    let mut sampler_distribution = None;
-    let output_logprobs: Vec<(f32, u32)> = complete
-        .output_logprobs(true)
-        .map(|lp| {
-            if sampler_capture_width > 0
-                && lp.token_ids == complete.output_ids()
-                && lp.token_logprobs.len() == lp.token_ids.len()
-                && lp.top_logprobs.len() == lp.token_ids.len()
-                && lp.top_logprobs.iter().all(|row| {
-                    row.token_ids.len() >= sampler_capture_width as usize
-                        && row.token_ids.len() == row.values.len()
-                })
-            {
-                sampler_distribution = smg_tito::SamplerDistribution::from_rows(
-                    lp.top_logprobs.into_iter().map(|row| {
-                        // Sort by descending log-probability so the finite support is always a strict
-                        // prefix (the compact-transport contract) regardless of the engine's wire
-                        // order, and keep the top `sampler_capture_width` entries if a row overshoots.
-                        let mut entries: Vec<_> =
-                            row.token_ids.into_iter().zip(row.values).collect();
-                        entries.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-                        entries.truncate(sampler_capture_width as usize);
-                        entries.into_iter().unzip()
-                    }),
-                );
-            }
-            lp.token_logprobs.into_iter().zip(lp.token_ids).collect()
-        })
-        .unwrap_or_default();
-    if sampler_capture_width > 0
-        && !complete.output_ids().is_empty()
-        && sampler_distribution.is_none()
-    {
-        return Err("Missing or misaligned sampler distribution in TITO completion".to_owned());
-    }
+    let output_token_ids = complete.output_ids().to_vec();
     let finish_reason = complete.finish_reason().to_string();
-    let routed_experts = complete
-        .routed_experts()
-        .map_err(|error| error.to_string())?
-        .map(|re| {
-            let dtype = match re.dtype {
-                crate::routers::grpc::proto_wrapper::RoutedExpertsDtype::U8 => {
-                    smg_tito::TurnRoutedExpertsDtype::U8
+    let mut sampler_distribution = None;
+    let mut output_logprobs = None;
+    let mut routed_experts = None;
+
+    if capture == smg_tito::TurnCapture::Full {
+        let logprobs: Vec<(f32, u32)> = complete
+            .output_logprobs(true)
+            .map(|lp| {
+                if sampler_capture_width > 0
+                    && lp.token_ids == complete.output_ids()
+                    && lp.token_logprobs.len() == lp.token_ids.len()
+                    && lp.top_logprobs.len() == lp.token_ids.len()
+                    && lp.top_logprobs.iter().all(|row| {
+                        row.token_ids.len() >= sampler_capture_width as usize
+                            && row.token_ids.len() == row.values.len()
+                    })
+                {
+                    sampler_distribution = smg_tito::SamplerDistribution::from_rows(
+                        lp.top_logprobs.into_iter().map(|row| {
+                            // Sort by descending log-probability so the finite support is always a strict
+                            // prefix (the compact-transport contract) regardless of the engine's wire
+                            // order, and keep the top `sampler_capture_width` entries if a row overshoots.
+                            let mut entries: Vec<_> =
+                                row.token_ids.into_iter().zip(row.values).collect();
+                            entries.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                            entries.truncate(sampler_capture_width as usize);
+                            entries.into_iter().unzip()
+                        }),
+                    );
                 }
-                crate::routers::grpc::proto_wrapper::RoutedExpertsDtype::U16 => {
-                    smg_tito::TurnRoutedExpertsDtype::U16
-                }
-            };
-            smg_tito::TurnRoutedExperts {
-                data: Arc::new(re.data.to_vec()),
-                num_layers: re.num_layers,
-                top_k: re.top_k,
-                dtype,
-                prompt_start: dispatched_prompt_start,
-            }
-        });
-    Ok(smg_tito::TurnRecord {
-        prompt_token_count,
-        sampler_capture_width,
-        sampler_distribution,
-        output_logprobs: if output_logprobs.is_empty() {
+                lp.token_logprobs.into_iter().zip(lp.token_ids).collect()
+            })
+            .unwrap_or_default();
+        if sampler_capture_width > 0
+            && !complete.output_ids().is_empty()
+            && sampler_distribution.is_none()
+        {
+            return Err("Missing or misaligned sampler distribution in TITO completion".to_owned());
+        }
+        output_logprobs = if logprobs.is_empty() {
             None
         } else {
-            Some(output_logprobs)
-        },
+            Some(logprobs)
+        };
+        routed_experts = complete
+            .routed_experts()
+            .map_err(|error| error.to_string())?
+            .map(|re| {
+                let dtype = match re.dtype {
+                    crate::routers::grpc::proto_wrapper::RoutedExpertsDtype::U8 => {
+                        smg_tito::TurnRoutedExpertsDtype::U8
+                    }
+                    crate::routers::grpc::proto_wrapper::RoutedExpertsDtype::U16 => {
+                        smg_tito::TurnRoutedExpertsDtype::U16
+                    }
+                };
+                smg_tito::TurnRoutedExperts {
+                    data: Arc::new(re.data.to_vec()),
+                    num_layers: re.num_layers,
+                    top_k: re.top_k,
+                    dtype,
+                    prompt_start: dispatched_prompt_start,
+                }
+            });
+    }
+
+    Ok(smg_tito::TurnRecord {
+        prompt_token_count,
+        output_token_ids: Some(output_token_ids),
+        output_logprobs,
+        sampler_capture_width,
+        sampler_distribution,
         finish_reason,
         mismatch_report,
         routed_experts,
         weight_version,
+        owner_trajectory_id,
+        capture,
     })
 }
 

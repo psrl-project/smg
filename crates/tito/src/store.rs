@@ -71,6 +71,10 @@ pub struct PrefixEntry {
     /// True when this assistant turn ends with a tool call (no stored
     /// observation after it inside this node).
     pub ends_tool_call: bool,
+    /// Trajectory that generated this node.
+    pub owner_trajectory_id: u64,
+    /// Whether this node stored a training payload.
+    pub capture: TurnCapture,
 }
 
 /// Token representations stored for one TITO node.
@@ -95,6 +99,30 @@ impl StoredTokenSequences {
     }
 }
 
+/// Role, identity, and capture policy for one trajectory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrajectoryMeta {
+    /// `main`, `subagent`, `auxiliary`, or `compaction`.
+    pub thread_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    /// Capture policy requested for this trajectory's own turns.
+    pub capture: TurnCapture,
+}
+
+impl Default for TrajectoryMeta {
+    fn default() -> Self {
+        Self {
+            thread_source: "main".to_owned(),
+            agent_id: None,
+            parent_agent_id: None,
+            capture: TurnCapture::Full,
+        }
+    }
+}
+
 /// Internal session state managed behind a Mutex.
 pub(crate) struct SessionState {
     pub entries: HashMap<PrefixHash, PrefixEntry>,
@@ -115,6 +143,8 @@ pub(crate) struct SessionState {
     pub trajectory_leaves: HashMap<u64, PrefixHash>,
     /// Per-trajectory cross-turn `routed_experts_prompt_start` offset.
     pub trajectory_re_offsets: HashMap<u64, u32>,
+    /// Per-trajectory role, agent identity, and capture policy.
+    pub trajectory_meta: HashMap<u64, TrajectoryMeta>,
     /// IDs selected by requests that have not completed storage yet.
     pub inflight_auto_trajectory_ids: HashSet<u64>,
     /// Maximum number of trailing boundary tokens that may be trimmed per non-last turn
@@ -135,6 +165,7 @@ impl SessionState {
             leaf_hashes: HashSet::new(),
             trajectory_leaves: HashMap::new(),
             trajectory_re_offsets: HashMap::new(),
+            trajectory_meta: HashMap::new(),
             inflight_auto_trajectory_ids: HashSet::new(),
             max_trim_tokens: 0,
             gc_threshold: 0,
@@ -143,10 +174,25 @@ impl SessionState {
     }
 }
 
+/// How much training payload a TITO turn stores.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCapture {
+    /// Store log-probs, sampler distribution, and routed experts.
+    #[default]
+    Full,
+    /// Store only the token ids and turn boundaries.
+    Tokens,
+}
+
 /// Per-turn training data record.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct TurnRecord {
     pub prompt_token_count: usize,
+    /// Generated token ids. Always populated so a token-only record still has
+    /// the authoritative output boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_ids: Option<Vec<u32>>,
     pub output_logprobs: Option<Vec<(f32, u32)>>,
     pub sampler_capture_width: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +203,12 @@ pub struct TurnRecord {
     pub routed_experts: Option<TurnRoutedExperts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weight_version: Option<String>,
+    /// Trajectory that generated this node.
+    #[serde(default)]
+    pub owner_trajectory_id: u64,
+    /// Whether this turn stored a training payload.
+    #[serde(default)]
+    pub capture: TurnCapture,
 }
 
 /// Compact NumPy-style dtype descriptor for TITO-tracked routed-experts.
@@ -267,6 +319,16 @@ pub struct Trajectory {
     /// One `TurnRecord` per assistant turn, ordered from oldest to newest.
     #[serde(rename = "records")]
     pub turn_records: Vec<TurnRecord>,
+    /// `main`, `subagent`, `auxiliary`, or `compaction`.
+    pub thread_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_trajectory_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    /// Capture policy requested for this trajectory's own turns.
+    pub capture: TurnCapture,
 }
 
 /// One node of the TITO prefix tree (one assistant boundary).
@@ -293,6 +355,10 @@ pub struct TitoNodeMeta {
     pub num_tokens: usize,
     /// Trajectory ids whose root→leaf path passes through this node.
     pub trajectory_ids: Vec<u64>,
+    /// Trajectory that generated this node.
+    pub owner_trajectory_id: u64,
+    /// Whether this node stored a training payload.
+    pub capture: TurnCapture,
 }
 
 /// One live trajectory leaf (root→leaf view) in the session tree.
@@ -303,6 +369,16 @@ pub struct TitoLeafMeta {
     pub parent: Option<u64>,
     /// Root→leaf node ids (in [`TitoTreeMeta::nodes`] id space).
     pub path_node_ids: Vec<u64>,
+    /// `main`, `subagent`, `auxiliary`, or `compaction`.
+    pub thread_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_trajectory_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    /// Capture policy requested for this trajectory's own turns.
+    pub capture: TurnCapture,
 }
 
 /// Prefix-tree structure of one session snapshot.
@@ -653,6 +729,36 @@ impl TitoStore {
         }
     }
 
+    /// Record role, identity, and capture policy for one trajectory.
+    ///
+    /// A later turn without a usable role keeps the existing non-main role.
+    /// Capture is monotonic: once a trajectory has a full payload, it stays full.
+    pub fn set_trajectory_meta(
+        &self,
+        session_id: &str,
+        trajectory_id: u64,
+        meta: TrajectoryMeta,
+    ) {
+        let arc = self.get_or_create_session_arc(session_id);
+        let mut state = arc.lock();
+        let entry = state
+            .trajectory_meta
+            .entry(trajectory_id)
+            .or_insert_with(|| meta.clone());
+        if meta.thread_source != "main" || entry.thread_source.is_empty() {
+            entry.thread_source = meta.thread_source;
+        }
+        if meta.agent_id.is_some() {
+            entry.agent_id = meta.agent_id;
+        }
+        if meta.parent_agent_id.is_some() {
+            entry.parent_agent_id = meta.parent_agent_id;
+        }
+        if meta.capture == TurnCapture::Full {
+            entry.capture = TurnCapture::Full;
+        }
+    }
+
     /// Override the GC threshold for a specific session.
     pub fn set_session_gc_threshold(&self, session_id: &str, threshold: usize) {
         if let Some(arc) = self.get_session_arc(session_id) {
@@ -980,19 +1086,41 @@ impl TitoStore {
         }
         state.leaf_hashes.insert(leaf_hash);
 
-        let seq = state.next_seq;
-        state.next_seq = state.next_seq.wrapping_add(1);
-        state.entries.insert(
-            leaf_hash,
-            PrefixEntry {
-                token_ids: Arc::new(token_ids.expanded),
-                reusable_prefix_token_ids: token_ids.reusable.map(Arc::new),
-                parent_hash,
-                turn_record,
-                seq,
-                ends_tool_call,
-            },
-        );
+        let capture = turn_record.capture;
+        // A full payload is never downgraded. A token-only node may be upgraded
+        // when a trainable trajectory later stores the same node with a payload.
+        // Two full stores keep the first owner: the node's tokens are identical,
+        // so the trajectory that generated them first is the one that owns them.
+        let existing = state.entries.get(&leaf_hash);
+        let replace = match existing {
+            None => true,
+            Some(entry) => capture == TurnCapture::Full || entry.capture == TurnCapture::Tokens,
+        };
+        if replace {
+            let owner_trajectory_id = match existing {
+                Some(entry) if entry.capture == TurnCapture::Full && capture == TurnCapture::Full => {
+                    entry.owner_trajectory_id
+                }
+                _ => trajectory_id,
+            };
+            let mut turn_record = turn_record;
+            turn_record.owner_trajectory_id = owner_trajectory_id;
+            let seq = state.next_seq;
+            state.next_seq = state.next_seq.wrapping_add(1);
+            state.entries.insert(
+                leaf_hash,
+                PrefixEntry {
+                    token_ids: Arc::new(token_ids.expanded),
+                    reusable_prefix_token_ids: token_ids.reusable.map(Arc::new),
+                    parent_hash,
+                    turn_record,
+                    seq,
+                    ends_tool_call,
+                    owner_trajectory_id,
+                    capture,
+                },
+            );
+        }
 
         // Advance the trajectory pointer for this trajectory_id to the newly stored hash.
         state.trajectory_leaves.insert(trajectory_id, leaf_hash);
@@ -1306,6 +1434,23 @@ fn compute_dead_leaf_hashes(state: &SessionState) -> HashSet<PrefixHash> {
     dead
 }
 
+fn parent_trajectory_id_for(
+    state: &SessionState,
+    trajectory_id: u64,
+    path: &[PrefixHash],
+) -> Option<u64> {
+    // The leaf belongs to this trajectory. The parent is the nearest ancestor
+    // node that a different trajectory generated.
+    for hash in path.iter().rev().skip(1) {
+        if let Some(entry) = state.entries.get(hash) {
+            if entry.owner_trajectory_id != trajectory_id {
+                return Some(entry.owner_trajectory_id);
+            }
+        }
+    }
+    None
+}
+
 fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> TitoTreeMeta {
     // 1. Root→leaf hash paths for every live trajectory.  Climb from the leaf
     //    through stored entries; a parent without a stored entry is a phantom
@@ -1371,6 +1516,8 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
                     truncated: entry.turn_record.finish_reason == "length",
                     num_tokens: entry.token_ids.len(),
                     trajectory_ids: Vec::new(),
+                    owner_trajectory_id: entry.owner_trajectory_id,
+                    capture: entry.capture,
                 },
                 None => TitoNodeMeta {
                     id,
@@ -1381,6 +1528,8 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
                     truncated: false,
                     num_tokens: 0,
                     trajectory_ids: Vec::new(),
+                    owner_trajectory_id: 0,
+                    capture: TurnCapture::Tokens,
                 },
             }
         })
@@ -1402,6 +1551,20 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
                 node.trajectory_ids.push(*trajectory_id);
             }
         }
+        let parent_trajectory_id = parent_trajectory_id_for(state, *trajectory_id, path);
+        let meta = state
+            .trajectory_meta
+            .get(trajectory_id)
+            .cloned()
+            .unwrap_or_default();
+        let parent_agent_id = meta.parent_agent_id.clone().or_else(|| {
+            parent_trajectory_id.and_then(|parent_id| {
+                state
+                    .trajectory_meta
+                    .get(&parent_id)
+                    .and_then(|parent_meta| parent_meta.agent_id.clone())
+            })
+        });
         leaves.push(TitoLeafMeta {
             trajectory_id: *trajectory_id,
             node_id: leaf_id,
@@ -1410,6 +1573,11 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
                 .find(|n| n.id == leaf_id)
                 .and_then(|n| n.parent),
             path_node_ids,
+            thread_source: meta.thread_source,
+            agent_id: meta.agent_id,
+            parent_trajectory_id,
+            parent_agent_id,
+            capture: meta.capture,
         });
     }
 
@@ -1429,10 +1597,40 @@ fn collect_trajectories(state: &SessionState, excluded: &HashSet<PrefixHash>) ->
         .into_iter()
         .filter_map(|(trajectory_id, leaf_hash)| {
             let entry = state.entries.get(&leaf_hash)?;
+            let mut parent_trajectory_id = None;
+            let mut current = entry.parent_hash;
+            while let Some(hash) = current {
+                let Some(parent_entry) = state.entries.get(&hash) else {
+                    break;
+                };
+                if parent_entry.owner_trajectory_id != trajectory_id {
+                    parent_trajectory_id = Some(parent_entry.owner_trajectory_id);
+                    break;
+                }
+                current = parent_entry.parent_hash;
+            }
+            let meta = state
+                .trajectory_meta
+                .get(&trajectory_id)
+                .cloned()
+                .unwrap_or_default();
+            let parent_agent_id = meta.parent_agent_id.clone().or_else(|| {
+                parent_trajectory_id.and_then(|parent_id| {
+                    state
+                        .trajectory_meta
+                        .get(&parent_id)
+                        .and_then(|parent_meta| parent_meta.agent_id.clone())
+                })
+            });
             Some(Trajectory {
                 trajectory_id,
                 accumulated_token_ids: (*entry.token_ids).clone(),
                 turn_records: collect_records_for_leaf(state, leaf_hash),
+                thread_source: meta.thread_source,
+                agent_id: meta.agent_id,
+                parent_trajectory_id,
+                parent_agent_id,
+                capture: meta.capture,
             })
         })
         .collect()
@@ -1525,6 +1723,7 @@ mod tests {
     fn record(prompt_token_count: usize, finish_reason: &str) -> TurnRecord {
         TurnRecord {
             prompt_token_count,
+            output_token_ids: None,
             output_logprobs: None,
             sampler_capture_width: 0,
             sampler_distribution: None,
@@ -1532,6 +1731,8 @@ mod tests {
             mismatch_report: vec![],
             routed_experts: None,
             weight_version: None,
+            owner_trajectory_id: 0,
+            capture: TurnCapture::Full,
         }
     }
 
@@ -2185,6 +2386,75 @@ mod tests {
     }
 
     #[test]
+    fn token_only_store_does_not_downgrade_a_full_node() {
+        let store = make_store();
+        store.create_session("s1");
+        let ctx = render_context();
+        let msgs = vec![user_msg("hi"), assistant_msg("hello")];
+
+        store_turn(&store, "s1", &msgs, vec![1, 2, 3], record(2, "old"), &ctx);
+        let mut token_only = record(2, "token-only");
+        token_only.capture = TurnCapture::Tokens;
+        store_turn(&store, "s1", &msgs, vec![1, 2, 3], token_only, &ctx);
+
+        let trajectory = &store.get_all_trajectories("s1")[0];
+        assert_eq!(trajectory.capture, TurnCapture::Full);
+        assert_eq!(trajectory.turn_records[0].finish_reason, "old");
+        assert_eq!(trajectory.turn_records[0].owner_trajectory_id, 0);
+    }
+
+    #[test]
+    fn a_full_store_upgrades_a_token_only_node() {
+        let store = make_store();
+        store.create_session("s1");
+        let ctx = render_context();
+        let msgs = vec![user_msg("hi"), assistant_msg("hello")];
+
+        let mut token_only = record(2, "token-only");
+        token_only.capture = TurnCapture::Tokens;
+        store_turn(&store, "s1", &msgs, vec![1, 2, 3], token_only, &ctx);
+        store
+            .store(
+                "s1",
+                &msgs,
+                vec![1, 2, 3],
+                record(2, "full"),
+                &ctx,
+                1,
+            )
+            .unwrap();
+
+        let trajectory = &store.get_all_trajectories("s1")[0];
+        assert_eq!(trajectory.capture, TurnCapture::Full);
+        assert_eq!(trajectory.turn_records[0].finish_reason, "full");
+        assert_eq!(trajectory.turn_records[0].owner_trajectory_id, 1);
+    }
+
+    #[test]
+    fn two_full_stores_keep_the_first_owner() {
+        let store = make_store();
+        store.create_session("s1");
+        let ctx = render_context();
+        let msgs = vec![user_msg("hi"), assistant_msg("hello")];
+
+        store_turn(&store, "s1", &msgs, vec![1, 2, 3], record(2, "first"), &ctx);
+        store
+            .store(
+                "s1",
+                &msgs,
+                vec![1, 2, 3],
+                record(2, "second"),
+                &ctx,
+                1,
+            )
+            .unwrap();
+
+        let trajectory = &store.get_all_trajectories("s1")[0];
+        assert_eq!(trajectory.turn_records[0].finish_reason, "second");
+        assert_eq!(trajectory.turn_records[0].owner_trajectory_id, 0);
+    }
+
+    #[test]
     fn delete_session_cleans_entries_and_records() {
         let store = make_store();
         store.create_session("s1");
@@ -2220,6 +2490,7 @@ mod tests {
                     }],
                     routed_experts: None,
                     weight_version: None,
+                    ..Default::default()
                 },
                 &ctx,
                 0,
@@ -2806,6 +3077,7 @@ mod tests {
             mismatch_report: Vec::new(),
             routed_experts: None,
             weight_version: None,
+            ..Default::default()
         };
         let value = serde_json::to_value(&record).unwrap();
         assert!(value.get("routed_experts").is_none());
@@ -2827,6 +3099,7 @@ mod dead_leaf_tests {
             parent_hash: parent,
             turn_record: TurnRecord {
                 prompt_token_count: 0,
+                output_token_ids: None,
                 output_logprobs: None,
                 sampler_capture_width: 0,
                 sampler_distribution: None,
@@ -2834,9 +3107,13 @@ mod dead_leaf_tests {
                 mismatch_report: vec![],
                 routed_experts: None,
                 weight_version: None,
+                owner_trajectory_id: 0,
+                capture: TurnCapture::Full,
             },
             seq,
             ends_tool_call,
+            owner_trajectory_id: 0,
+            capture: TurnCapture::Full,
         }
     }
 

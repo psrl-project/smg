@@ -331,6 +331,7 @@ fn record(prompt_token_count: usize) -> TurnRecord {
         mismatch_report: vec![],
         routed_experts: None,
         weight_version: None,
+        ..Default::default()
     }
 }
 

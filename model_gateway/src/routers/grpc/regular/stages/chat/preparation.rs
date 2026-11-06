@@ -488,6 +488,44 @@ impl ChatPreparationStage {
             })?;
         let trajectory_id = resolved_trajectory.trajectory_id;
 
+        // Normalized PSRL agent metadata. A missing header is the strict default:
+        // the call is charged to the main agent and captured in full.
+        let header = |name: &str| -> Option<String> {
+            ctx.input
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get(name))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let agent_role = header(smg_tito::PSRL_AGENT_ROLE_HEADER)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| {
+                matches!(
+                    value.as_str(),
+                    "main" | "subagent" | "auxiliary" | "compaction"
+                )
+            })
+            .unwrap_or_else(|| "main".to_owned());
+        let agent_id =
+            header(smg_tito::PSRL_AGENT_ID_HEADER).filter(|value| !value.trim().is_empty());
+        let parent_agent_id = header(smg_tito::PSRL_PARENT_AGENT_ID_HEADER)
+            .filter(|value| !value.trim().is_empty());
+        let capture = match header(smg_tito::PSRL_TITO_CAPTURE_HEADER).as_deref() {
+            Some("tokens") => smg_tito::TurnCapture::Tokens,
+            _ => smg_tito::TurnCapture::Full,
+        };
+        store.set_trajectory_meta(
+            &session_id,
+            trajectory_id,
+            smg_tito::TrajectoryMeta {
+                thread_source: agent_role.clone(),
+                agent_id: agent_id.clone(),
+                parent_agent_id: parent_agent_id.clone(),
+                capture,
+            },
+        );
+
         ctx.state.tito_context = Some(TitoRequestContext {
             session_id: session_id.clone(),
             request: request_arc,
@@ -495,6 +533,7 @@ impl ChatPreparationStage {
             is_tito_hit: false,
             matched_message_num: 0,
             trajectory_id,
+            capture,
             trajectory_id_reservation: resolved_trajectory.reservation,
             prompt_token_ids: Vec::new(),
             reusable_prompt_token_ids: None,

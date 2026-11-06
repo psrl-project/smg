@@ -530,6 +530,8 @@ pub(crate) struct TitoRequestContext {
     /// Resolved trajectory identifier. In manual mode this comes from the request
     /// header; in auto mode TITO derives it from the matched tree leaf.
     pub trajectory_id: u64,
+    /// Training payload capture policy for this turn.
+    pub capture: smg_tito::TurnCapture,
     /// Prevents concurrent auto-mode branches from claiming the same trajectory.
     pub trajectory_id_reservation: Option<smg_tito::TrajectoryIdReservation>,
     /// Prompt token IDs computed during preparation (set in ChatPreparationStage, read in
