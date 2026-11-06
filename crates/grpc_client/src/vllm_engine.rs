@@ -32,6 +32,14 @@ pub mod proto {
 // The generated module structure depends on the package name in the .proto file
 // package vllm.grpc.engine; generates a nested module structure
 
+/// Upper bound on a single decoded gRPC response from the engine.
+///
+/// tonic defaults to 4 MiB, which an inference stream can exceed once a chunk
+/// carries a long tokenized payload with per-token logprobs. The gateway then
+/// fails the whole episode with `decoded message length too large`, so the
+/// client accepts the sizes the engine is allowed to send.
+const MAX_DECODED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// A smart wrapper around Streaming<GenerateResponse> that automatically
 /// sends abort when dropped (e.g., due to client disconnection or early termination).
 ///
@@ -156,7 +164,8 @@ impl VllmEngineClient {
             .connect()
             .await?;
 
-        let client = proto::vllm_engine_client::VllmEngineClient::new(channel);
+        let client = proto::vllm_engine_client::VllmEngineClient::new(channel)
+            .max_decoding_message_size(MAX_DECODED_RESPONSE_BYTES);
 
         Ok(Self {
             client,
