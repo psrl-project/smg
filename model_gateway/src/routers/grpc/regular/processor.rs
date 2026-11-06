@@ -522,6 +522,14 @@ impl ResponseProcessor {
                     .weight_version
                     .clone()
                     .unwrap_or_else(|| "default".to_string()),
+                input_top_logprobs: if request_logprobs {
+                    complete
+                        .input_logprobs()
+                        .as_ref()
+                        .map(utils::convert_generate_input_top_logprobs)
+                } else {
+                    None
+                },
                 input_token_logprobs,
                 output_token_logprobs,
                 completion_tokens: complete.completion_tokens(),
