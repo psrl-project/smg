@@ -209,6 +209,10 @@ pub struct TurnRecord {
     /// Whether this turn stored a training payload.
     #[serde(default)]
     pub capture: TurnCapture,
+    /// Session-wide storage order, assigned when the token stream is first stored.
+    /// A later payload upgrade keeps it, because the output was already available.
+    #[serde(default)]
+    pub sequence: u64,
 }
 
 /// Compact NumPy-style dtype descriptor for TITO-tracked routed-experts.
@@ -359,6 +363,8 @@ pub struct TitoNodeMeta {
     pub owner_trajectory_id: u64,
     /// Whether this node stored a training payload.
     pub capture: TurnCapture,
+    /// Storage sequence of this node's turn.
+    pub sequence: u64,
 }
 
 /// One live trajectory leaf (root→leaf view) in the session tree.
@@ -394,16 +400,70 @@ pub struct TitoTreeMeta {
     pub leaves: Vec<TitoLeafMeta>,
 }
 
+/// Wire format of a session snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotFormat {
+    /// One expanded trajectory per leaf; the historical shape.
+    #[default]
+    Expanded,
+    /// One compact node per tree node; each token is carried once.
+    Compact,
+}
+
+/// One node of the compact snapshot. A node carries its own token segment and
+/// its turn record; a leaf path reconstructs the expanded trajectory.
+#[derive(Clone, Debug, Serialize)]
+pub struct TitoCompactNode {
+    pub id: u64,
+    pub hash: String,
+    pub stored: bool,
+    pub parent: Option<u64>,
+    pub finish_reason: String,
+    pub truncated: bool,
+    pub num_tokens: usize,
+    pub trajectory_ids: Vec<u64>,
+    pub owner_trajectory_id: u64,
+    pub capture: TurnCapture,
+    /// Storage sequence of this node's turn.
+    pub sequence: u64,
+    /// Absolute token offset of `token_ids` in this node's accumulated stream.
+    pub token_start: usize,
+    /// This node's own token segment, not the accumulated prefix.
+    pub token_ids: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_record: Option<TurnRecord>,
+}
+
+/// Compact session snapshot: nodes and leaves, with no per-leaf duplication.
+#[derive(Clone, Debug, Serialize)]
+pub struct TitoCompactSessionData {
+    pub session_id: String,
+    pub max_trim_tokens: usize,
+    pub format: SnapshotFormat,
+    pub nodes: Vec<TitoCompactNode>,
+    pub leaves: Vec<TitoLeafMeta>,
+}
+
 /// Consistent training-data snapshot returned for every TITO session.
 #[derive(Debug, Serialize)]
 pub struct TitoSessionData {
     pub session_id: String,
     pub max_trim_tokens: usize,
+    pub format: SnapshotFormat,
     /// Always an array: empty, single-trajectory, and multi-trajectory sessions
     /// share the same wire format.
     pub trajectories: Vec<Trajectory>,
     /// Prefix-tree structural metadata for the same snapshot.
     pub tree: TitoTreeMeta,
+}
+
+/// A snapshot in either wire format.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum TitoSnapshot {
+    Expanded(TitoSessionData),
+    Compact(TitoCompactSessionData),
 }
 
 /// Top-level store: session_id → Arc<Mutex<SessionState>>.
@@ -596,6 +656,30 @@ impl TitoStore {
         manual_trajectory_id: u64,
         matched_parent_hash: Option<PrefixHash>,
     ) -> Result<ResolvedTrajectoryId, TitoError> {
+        self.resolve_trajectory_id_for_agent(
+            session_id,
+            manual_trajectory_id,
+            matched_parent_hash,
+            None,
+            None,
+        )
+    }
+
+    /// Resolve a trajectory while keeping a branch from reusing another agent's
+    /// live leaf.
+    ///
+    /// In auto mode the parent hash names the leaf the request extends. Reusing
+    /// that leaf's trajectory is only valid when the request belongs to the same
+    /// agent and role. A subagent branching from the main leaf, a compaction
+    /// starting a new context, or a parallel agent gets a fresh trajectory id.
+    pub fn resolve_trajectory_id_for_agent(
+        &self,
+        session_id: &str,
+        manual_trajectory_id: u64,
+        matched_parent_hash: Option<PrefixHash>,
+        agent_role: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<ResolvedTrajectoryId, TitoError> {
         if self.trajectory_id_strategy == TrajectoryIdStrategy::Manual {
             return Ok(ResolvedTrajectoryId {
                 trajectory_id: manual_trajectory_id,
@@ -613,6 +697,12 @@ impl TitoStore {
                     .filter(|(trajectory_id, leaf_hash)| {
                         **leaf_hash == parent_hash
                             && !session.inflight_auto_trajectory_ids.contains(trajectory_id)
+                            && trajectory_meta_compatible(
+                                &session,
+                                **trajectory_id,
+                                agent_role,
+                                agent_id,
+                            )
                     })
                     .map(|(trajectory_id, _)| *trajectory_id)
                     .min()
@@ -1105,6 +1195,9 @@ impl TitoStore {
             };
             let mut turn_record = turn_record;
             turn_record.owner_trajectory_id = owner_trajectory_id;
+            turn_record.sequence = existing
+                .map(|entry| entry.turn_record.sequence)
+                .unwrap_or(state.next_seq);
             let seq = state.next_seq;
             state.next_seq = state.next_seq.wrapping_add(1);
             state.entries.insert(
@@ -1151,21 +1244,50 @@ impl TitoStore {
         collect_trajectories(&state, &excluded)
     }
 
-    /// Return an atomic session snapshot with a stable multi-trajectory shape.
+    /// Return an atomic expanded session snapshot.
     ///
     /// The session existence check, metadata read, and trajectory collection all
     /// happen under one lock so callers cannot observe a mixed snapshot.
     pub fn get_session_data(&self, session_id: &str) -> Option<TitoSessionData> {
+        match self.get_session_data_with_format(session_id, SnapshotFormat::Expanded)? {
+            TitoSnapshot::Expanded(data) => Some(data),
+            TitoSnapshot::Compact(_) => unreachable!("expanded request returned compact data"),
+        }
+    }
+
+    /// Return an atomic session snapshot in the requested wire format.
+    ///
+    /// `Expanded` is the historical per-trajectory view. `Compact` stores each
+    /// tree node once, with its own token segment and turn record, so shared
+    /// prefixes and payloads are not duplicated per leaf.
+    pub fn get_session_data_with_format(
+        &self,
+        session_id: &str,
+        format: SnapshotFormat,
+    ) -> Option<TitoSnapshot> {
         let arc = self.get_session_arc(session_id)?;
         let state = arc.lock();
 
         let excluded = self.dead_leaf_exclusions(&state);
-        Some(TitoSessionData {
-            session_id: session_id.to_string(),
-            max_trim_tokens: state.max_trim_tokens,
-            trajectories: collect_trajectories(&state, &excluded),
-            tree: collect_tree_meta(&state, &excluded),
-        })
+        match format {
+            SnapshotFormat::Expanded => Some(TitoSnapshot::Expanded(TitoSessionData {
+                session_id: session_id.to_string(),
+                max_trim_tokens: state.max_trim_tokens,
+                format: SnapshotFormat::Expanded,
+                trajectories: collect_trajectories(&state, &excluded),
+                tree: collect_tree_meta(&state, &excluded),
+            })),
+            SnapshotFormat::Compact => {
+                let (nodes, leaves) = collect_compact_snapshot(&state, &excluded);
+                Some(TitoSnapshot::Compact(TitoCompactSessionData {
+                    session_id: session_id.to_string(),
+                    max_trim_tokens: state.max_trim_tokens,
+                    format: SnapshotFormat::Compact,
+                    nodes,
+                    leaves,
+                }))
+            }
+        }
     }
 
     /// Dead-leaf exclusion set for snapshot collection.
@@ -1434,6 +1556,38 @@ fn compute_dead_leaf_hashes(state: &SessionState) -> HashSet<PrefixHash> {
     dead
 }
 
+fn trajectory_meta_compatible(
+    state: &SessionState,
+    trajectory_id: u64,
+    agent_role: Option<&str>,
+    agent_id: Option<&str>,
+) -> bool {
+    let Some(meta) = state.trajectory_meta.get(&trajectory_id) else {
+        // Legacy sessions have no role metadata; keep their existing reuse rule.
+        return true;
+    };
+    let role = agent_role.unwrap_or("main").trim().to_ascii_lowercase();
+    let role_ok = match role.as_str() {
+        "main" => meta.thread_source == "main" || meta.thread_source == "compaction",
+        "compaction" => meta.thread_source == "compaction",
+        "subagent" => {
+            meta.thread_source == "subagent" || meta.thread_source == "compaction"
+        }
+        "auxiliary" => meta.thread_source == "auxiliary",
+        _ => true,
+    };
+    if !role_ok {
+        return false;
+    }
+    match (agent_id, meta.agent_id.as_deref()) {
+        (Some(left), Some(right)) => left == right,
+        // A main thread may gain an id after its first call; a compaction must
+        // keep the id of the agent it compacts.
+        (Some(_), None) | (None, Some(_)) => role == "main",
+        (None, None) => true,
+    }
+}
+
 fn parent_trajectory_id_for(
     state: &SessionState,
     trajectory_id: u64,
@@ -1518,6 +1672,7 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
                     trajectory_ids: Vec::new(),
                     owner_trajectory_id: entry.owner_trajectory_id,
                     capture: entry.capture,
+                    sequence: entry.turn_record.sequence,
                 },
                 None => TitoNodeMeta {
                     id,
@@ -1530,6 +1685,7 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
                     trajectory_ids: Vec::new(),
                     owner_trajectory_id: 0,
                     capture: TurnCapture::Tokens,
+                    sequence: 0,
                 },
             }
         })
@@ -1582,6 +1738,86 @@ fn collect_tree_meta(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Ti
     }
 
     TitoTreeMeta { nodes, leaves }
+}
+
+fn common_prefix_len(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn collect_compact_snapshot(
+    state: &SessionState,
+    excluded: &HashSet<PrefixHash>,
+) -> (Vec<TitoCompactNode>, Vec<TitoLeafMeta>) {
+    let tree = collect_tree_meta(state, excluded);
+    let TitoTreeMeta {
+        nodes: node_metas,
+        leaves,
+    } = tree;
+    let hash_by_id: HashMap<u64, String> = node_metas
+        .iter()
+        .map(|node| (node.id, node.hash.clone()))
+        .collect();
+    let hash_to_entry: HashMap<String, PrefixHash> = state
+        .entries
+        .keys()
+        .map(|hash| (hash_hex(hash), *hash))
+        .collect();
+
+    let nodes = node_metas
+        .into_iter()
+        .map(|node| {
+            let entry = if node.stored {
+                hash_to_entry
+                    .get(&node.hash)
+                    .and_then(|hash| state.entries.get(hash))
+            } else {
+                None
+            };
+            let parent_tokens = node
+                .parent
+                .and_then(|parent_id| hash_by_id.get(&parent_id))
+                .and_then(|hash| hash_to_entry.get(hash))
+                .and_then(|hash| state.entries.get(hash))
+                .map(|entry| entry.token_ids.as_ref());
+            let (token_start, token_ids, turn_record, sequence) = match entry {
+                Some(entry) => {
+                    // A trimmed boundary may make the stored prefix diverge from
+                    // this node's own prompt tail. Start at the common prefix so
+                    // the leaf reconstructs this node's tokens exactly.
+                    let start = parent_tokens
+                        .map(|parent| common_prefix_len(parent, &entry.token_ids))
+                        .unwrap_or(0);
+                    (
+                        start,
+                        entry.token_ids[start..].to_vec(),
+                        Some(entry.turn_record.clone()),
+                        entry.turn_record.sequence,
+                    )
+                }
+                None => (0, Vec::new(), None, 0),
+            };
+            TitoCompactNode {
+                id: node.id,
+                hash: node.hash,
+                stored: node.stored,
+                parent: node.parent,
+                finish_reason: node.finish_reason,
+                truncated: node.truncated,
+                num_tokens: node.num_tokens,
+                trajectory_ids: node.trajectory_ids,
+                owner_trajectory_id: node.owner_trajectory_id,
+                capture: node.capture,
+                sequence,
+                token_start,
+                token_ids,
+                turn_record,
+            }
+        })
+        .collect();
+    (nodes, leaves)
 }
 
 fn collect_trajectories(state: &SessionState, excluded: &HashSet<PrefixHash>) -> Vec<Trajectory> {
@@ -1733,6 +1969,7 @@ mod tests {
             weight_version: None,
             owner_trajectory_id: 0,
             capture: TurnCapture::Full,
+            sequence: 0,
         }
     }
 
@@ -1780,6 +2017,124 @@ mod tests {
             .resolve_trajectory_id("s1", 99, Some(root_hash))
             .unwrap();
         assert_eq!(next.trajectory_id, 0);
+    }
+
+    #[test]
+    fn auto_strategy_does_not_merge_another_agent_branch_into_main() {
+        let store = make_auto_store();
+        let context = render_context();
+        let root = vec![user_msg("hi"), assistant_msg("hello")];
+        let root_hash = hash_messages_with_context(&root, &context);
+
+        let main = store
+            .resolve_trajectory_id_for_agent("s1", 0, None, Some("main"), Some("main"))
+            .unwrap();
+        store.set_trajectory_meta(
+            "s1",
+            main.trajectory_id,
+            TrajectoryMeta {
+                thread_source: "main".to_string(),
+                agent_id: Some("main".to_string()),
+                parent_agent_id: None,
+                capture: TurnCapture::Full,
+            },
+        );
+        store
+            .store(
+                "s1",
+                &root,
+                vec![1, 2],
+                record(1, "root"),
+                &context,
+                main.trajectory_id,
+            )
+            .unwrap();
+        main.reservation.as_ref().unwrap().release();
+
+        let subagent = store
+            .resolve_trajectory_id_for_agent("s1", 0, Some(root_hash), Some("subagent"), Some("sub-1"))
+            .unwrap();
+        assert_ne!(subagent.trajectory_id, main.trajectory_id);
+        store.set_trajectory_meta(
+            "s1",
+            subagent.trajectory_id,
+            TrajectoryMeta {
+                thread_source: "subagent".to_string(),
+                agent_id: Some("sub-1".to_string()),
+                parent_agent_id: Some("main".to_string()),
+                capture: TurnCapture::Full,
+            },
+        );
+        store
+            .store(
+                "s1",
+                &[
+                    user_msg("hi"),
+                    assistant_msg("hello"),
+                    user_msg("sub"),
+                    assistant_msg("sub answer"),
+                ],
+                vec![1, 2, 3, 4],
+                record(3, "sub"),
+                &context,
+                subagent.trajectory_id,
+            )
+            .unwrap();
+        subagent.reservation.as_ref().unwrap().release();
+
+        let continuation = store
+            .resolve_trajectory_id_for_agent("s1", 0, Some(root_hash), Some("main"), Some("main"))
+            .unwrap();
+        assert_eq!(continuation.trajectory_id, main.trajectory_id);
+        continuation.reservation.as_ref().unwrap().release();
+
+        let compaction = store
+            .resolve_trajectory_id_for_agent("s1", 0, Some(root_hash), Some("compaction"), Some("main"))
+            .unwrap();
+        assert_ne!(compaction.trajectory_id, main.trajectory_id);
+        assert_ne!(compaction.trajectory_id, subagent.trajectory_id);
+        store.set_trajectory_meta(
+            "s1",
+            compaction.trajectory_id,
+            TrajectoryMeta {
+                thread_source: "compaction".to_string(),
+                agent_id: Some("main".to_string()),
+                parent_agent_id: None,
+                capture: TurnCapture::Full,
+            },
+        );
+        let compacted = vec![
+            user_msg("hi"),
+            assistant_msg("hello"),
+            user_msg("compress"),
+            assistant_msg("summary"),
+        ];
+        let compacted_hash = hash_messages_with_context(&compacted, &context);
+        store
+            .store(
+                "s1",
+                &compacted,
+                vec![1, 2, 5, 6],
+                record(3, "compaction"),
+                &context,
+                compaction.trajectory_id,
+            )
+            .unwrap();
+        compaction.reservation.as_ref().unwrap().release();
+
+        // The agent continues after its compaction: the main request belongs to
+        // the compaction trajectory, not to a fresh or an older main id.
+        let resumed = store
+            .resolve_trajectory_id_for_agent(
+                "s1",
+                0,
+                Some(compacted_hash),
+                Some("main"),
+                Some("main"),
+            )
+            .unwrap();
+        assert_eq!(resumed.trajectory_id, compaction.trajectory_id);
+        resumed.reservation.as_ref().unwrap().release();
     }
 
     #[test]
@@ -2029,6 +2384,77 @@ mod tests {
     }
 
     #[test]
+    fn compact_snapshot_stores_shared_prefix_once_and_keeps_sequence() {
+        let store = make_store();
+        store.create_session("compact");
+        let ctx = render_context();
+
+        store_turn(
+            &store,
+            "compact",
+            &[user_msg("hi"), assistant_msg("hello")],
+            vec![1, 2],
+            record(1, "root"),
+            &ctx,
+        );
+        store_turn(
+            &store,
+            "compact",
+            &[
+                user_msg("hi"),
+                assistant_msg("hello"),
+                user_msg("a"),
+                assistant_msg("aa"),
+            ],
+            vec![1, 2, 3, 4],
+            record(3, "a"),
+            &ctx,
+        );
+        store
+            .store(
+                "compact",
+                &[
+                    user_msg("hi"),
+                    assistant_msg("hello"),
+                    user_msg("b"),
+                    assistant_msg("bb"),
+                ],
+                vec![1, 2, 5, 6],
+                record(3, "b"),
+                &ctx,
+                1,
+            )
+            .unwrap();
+
+        let expanded = store.get_session_data("compact").unwrap();
+        let compact = match store
+            .get_session_data_with_format("compact", SnapshotFormat::Compact)
+            .unwrap()
+        {
+            TitoSnapshot::Compact(data) => data,
+            TitoSnapshot::Expanded(_) => panic!("compact request returned expanded data"),
+        };
+
+        assert_eq!(expanded.format, SnapshotFormat::Expanded);
+        assert_eq!(compact.format, SnapshotFormat::Compact);
+        assert_eq!(compact.nodes.len(), 3);
+        assert_eq!(compact.leaves.len(), 2);
+        let root = compact.nodes.iter().find(|node| node.token_start == 0).unwrap();
+        assert_eq!(root.token_ids, vec![1, 2]);
+        assert_eq!(root.turn_record.as_ref().unwrap().sequence, 0);
+        let child_segments = compact
+            .nodes
+            .iter()
+            .filter(|node| node.token_start == 2)
+            .map(|node| node.token_ids.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(child_segments, HashSet::from([vec![3, 4], vec![5, 6]]));
+        assert_eq!(expanded.trajectories[0].turn_records[0].sequence, 0);
+        assert_eq!(expanded.trajectories[0].turn_records[1].sequence, 1);
+        assert_eq!(expanded.trajectories[1].turn_records[1].sequence, 2);
+    }
+
+    #[test]
     fn delete_session_is_idempotent() {
         let store = make_store();
         store.create_session("s1");
@@ -2181,6 +2607,7 @@ mod tests {
             serde_json::json!({
                 "session_id": "empty",
                 "max_trim_tokens": 0,
+                "format": "expanded",
                 "trajectories": [],
                 "tree": {"nodes": [], "leaves": []},
             })
@@ -3109,6 +3536,7 @@ mod dead_leaf_tests {
                 weight_version: None,
                 owner_trajectory_id: 0,
                 capture: TurnCapture::Full,
+                sequence: 0,
             },
             seq,
             ends_tool_call,

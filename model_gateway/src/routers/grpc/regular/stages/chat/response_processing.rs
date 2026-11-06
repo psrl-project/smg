@@ -575,6 +575,7 @@ fn extract_turn_record(
         weight_version,
         owner_trajectory_id,
         capture,
+        sequence: 0,
     })
 }
 

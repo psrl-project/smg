@@ -770,10 +770,20 @@ async fn tito_delete_session(
     StatusCode::NO_CONTENT
 }
 
+/// Query for the TITO snapshot wire format.
+#[derive(Default, Deserialize)]
+struct TitoSnapshotQuery {
+    format: Option<String>,
+}
+
 /// GET /tito/sessions/{session_id} — retrieve session training data.
+///
+/// `format=expanded` (default) returns one trajectory per leaf. `format=compact`
+/// returns the tree nodes and leaves with each shared token segment stored once.
 async fn tito_get_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
+    Query(query): Query<TitoSnapshotQuery>,
 ) -> Response {
     let store = match state.context.tito_store.as_ref() {
         Some(s) => s,
@@ -788,7 +798,21 @@ async fn tito_get_session(
         }
     };
 
-    match store.get_session_data(&session_id) {
+    let format = match query.format.as_deref().unwrap_or("expanded") {
+        "expanded" => smg_tito::SnapshotFormat::Expanded,
+        "compact" => smg_tito::SnapshotFormat::Compact,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown snapshot format {other:?}; expected expanded or compact")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match store.get_session_data_with_format(&session_id, format) {
         Some(session_data) => Json(session_data).into_response(),
         None => (
             StatusCode::NOT_FOUND,

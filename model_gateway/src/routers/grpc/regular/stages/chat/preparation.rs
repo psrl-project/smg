@@ -475,19 +475,6 @@ impl ChatPreparationStage {
         let running_hasher = lookup.running_hasher.clone();
         let parent_hash = lookup.parent_hash;
 
-        let resolved_trajectory = store
-            .resolve_trajectory_id(&session_id, manual_trajectory_id, parent_hash)
-            .map_err(|e| {
-                error!(
-                    function = "ChatPreparationStage::try_tito",
-                    session_id = %session_id,
-                    error = %e,
-                    "Failed to resolve TITO trajectory ID"
-                );
-                error::internal_error("tito_trajectory_id_resolution_failed", e.to_string())
-            })?;
-        let trajectory_id = resolved_trajectory.trajectory_id;
-
         // Normalized PSRL agent metadata. A missing header is the strict default:
         // the call is charged to the main agent and captured in full.
         let header = |name: &str| -> Option<String> {
@@ -515,6 +502,25 @@ impl ChatPreparationStage {
             Some("tokens") => smg_tito::TurnCapture::Tokens,
             _ => smg_tito::TurnCapture::Full,
         };
+        let resolved_trajectory = store
+            .resolve_trajectory_id_for_agent(
+                &session_id,
+                manual_trajectory_id,
+                parent_hash,
+                Some(&agent_role),
+                agent_id.as_deref(),
+            )
+            .map_err(|e| {
+                error!(
+                    function = "ChatPreparationStage::try_tito",
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to resolve TITO trajectory ID"
+                );
+                error::internal_error("tito_trajectory_id_resolution_failed", e.to_string())
+            })?;
+        let trajectory_id = resolved_trajectory.trajectory_id;
+
         store.set_trajectory_meta(
             &session_id,
             trajectory_id,
