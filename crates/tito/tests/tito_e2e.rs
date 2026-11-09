@@ -20,7 +20,7 @@ use openai_protocol::chat::{ChatMessage, MessageContent};
 use serde_json::json;
 use smg_tito::{
     engine::TitoEngine,
-    model_adapter::{select_adapter_for_tokenizer, ModelAdapter},
+    model_adapter::{select_adapter, select_adapter_for_tokenizer, ModelAdapter},
     normalizer::{hash_messages_with_context, RenderContext},
     store::TitoStore,
     validator::TokenSeqValidator,
@@ -242,6 +242,20 @@ fn load_qwen35_tokenizer_with_template(template: &str) -> Option<Arc<dyn Tokeniz
     let mut f = tempfile::NamedTempFile::new().ok()?;
     std::io::Write::write_all(&mut f, template.as_bytes()).ok()?;
     create_tokenizer_with_chat_template(&dir, f.path().to_str()).ok()
+}
+
+fn real_qwen38_dir() -> Option<String> {
+    let dir = std::env::var("SMG_QWEN38_TOKENIZER_DIR").ok()?;
+    Path::new(&dir)
+        .join("tokenizer.json")
+        .exists()
+        .then_some(dir)
+}
+
+/// Load the real Qwen3.8 tokenizer with its own (position-dependent) template.
+fn load_qwen38_tokenizer() -> Option<Arc<dyn Tokenizer>> {
+    let dir = real_qwen38_dir()?;
+    create_tokenizer_with_chat_template(&dir, None).ok()
 }
 
 fn render(
@@ -972,4 +986,95 @@ fn qwen35_patched_template_is_position_independent() {
     );
     // The assistant's reasoning block must be present in both renders.
     assert!(before_text.contains("<think>"));
+}
+
+#[test]
+fn real_qwen38_template_forces_the_whole_slice_path() {
+    // Qwen3.8's template raises `No user query found in messages.` when the
+    // message list has no real user turn.  The per-segment path renders a
+    // `[dummy_system]` base and fails on that guard; the whole-slice path
+    // renders `[dummy_system, dummy_user]` and is the only sound merge for
+    // this template family.  After the merge the turn must commit, which is
+    // what the store's prefix validation checks.
+    let Some(tokenizer) = load_qwen38_tokenizer() else {
+        eprintln!("SKIP: real Qwen3.8 tokenizer not found");
+        return;
+    };
+    let ctx = render_context();
+
+    let by_name = select_adapter("Qwen/Qwen3.8-27B");
+    assert!(
+        !by_name.rendering_is_position_dependent(),
+        "the name-only selection is the pre-fix behaviour this test guards against"
+    );
+    let by_template = select_adapter_for_tokenizer("Qwen/Qwen3.8-27B", &*tokenizer);
+    assert!(
+        by_template.rendering_is_position_dependent(),
+        "the template itself is position-dependent"
+    );
+
+    let store = TitoStore::new();
+    store.create_session("s1");
+
+    let system = ChatMessage::System {
+        content: MessageContent::Text("You are a coding agent.\nSolve the task.".to_string()),
+        name: None,
+    };
+    let user1 = user_msg("Inspect the repo.");
+    let (turn0_full, assistant1) = simulate_generation(
+        &*tokenizer,
+        &[system.clone(), user1.clone()],
+        &ctx,
+        "Let me look around.",
+    );
+    store
+        .store(
+            "s1",
+            &[system.clone(), user1.clone(), assistant1.clone()],
+            turn0_full.clone(),
+            record(turn0_full.len()),
+            &ctx,
+            0,
+        )
+        .unwrap();
+
+    let turn1_req = vec![
+        system.clone(),
+        user1.clone(),
+        assistant1.clone(),
+        tool_msg("repo has src/main.py", "call_1"),
+        user_msg("Fix the bug in src/main.py."),
+    ];
+    let lookup = store
+        .find_prefix_with_lookup("s1", &turn1_req, &ctx)
+        .unwrap();
+    let pm = lookup.matched.expect("expected a prefix HIT");
+    assert_eq!(pm.matched_message_num, 3);
+    let appended = &turn1_req[pm.matched_message_num..];
+
+    let segment_error =
+        TitoEngine::merge_incremental(pm, appended, &*tokenizer, &*by_name, &ctx, None)
+            .expect_err("the per-segment path must hit the template's no-user guard");
+    assert!(
+        format!("{segment_error}").contains("render"),
+        "{segment_error}"
+    );
+
+    let pm = store
+        .find_prefix_with_lookup("s1", &turn1_req, &ctx)
+        .unwrap()
+        .matched
+        .expect("expected a prefix HIT");
+    let merged =
+        TitoEngine::merge_incremental(pm, appended, &*tokenizer, &*by_template, &ctx, None)
+            .expect("the whole-slice path must render the dummy user base");
+
+    let answer = "I found the bug and fixed it.";
+    let mut full_ids = merged.clone();
+    full_ids.extend(encode(&*tokenizer, &format!("{answer}<|im_end|>")));
+    let mut all_messages = turn1_req;
+    all_messages.push(assistant_msg(answer));
+    store
+        .store("s1", &all_messages, full_ids, record(merged.len()), &ctx, 0)
+        .expect("the second turn must commit on top of the stored prefix");
 }

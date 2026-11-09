@@ -290,7 +290,7 @@ impl ModelAdapter for Glm47Adapter {
 /// [`select_adapter_for_tokenizer`] in production so the boundary adjustment
 /// matches the actual checkpoint vocabulary.
 pub fn select_adapter(model_identifier: &str) -> Box<dyn ModelAdapter> {
-    select_adapter_with_ids(model_identifier, None, None)
+    select_adapter_with_ids(model_identifier, None, None, false)
 }
 
 /// Select an adapter at runtime, deriving the model-specific special-token IDs
@@ -312,6 +312,7 @@ pub fn select_adapter_for_tokenizer(
         model_identifier,
         Some((im_end, newline)),
         Some((observation, user)),
+        tokenizer.chat_template_is_position_dependent(),
     )
 }
 
@@ -319,6 +320,7 @@ fn select_adapter_with_ids(
     model_identifier: &str,
     qwen_ids: Option<(u32, u32)>,
     glm_ids: Option<(u32, u32)>,
+    template_position_dependent: bool,
 ) -> Box<dyn ModelAdapter> {
     let lower = model_identifier.to_ascii_lowercase();
     let (im_end, newline) = qwen_ids.unwrap_or((151645, 198));
@@ -335,7 +337,18 @@ fn select_adapter_with_ids(
     // "qwen3.5" / "qwen-3.5" both contain "qwen3.5" or "qwen_3.5" after normalisation;
     // we normalise dots/dashes/underscores to a single form for reliable matching.
     let normalised = lower.replace(['.', '-', '_'], "");
-    if normalised.contains("qwen35") || normalised.contains("qwen3point5") {
+    // Qwen 3.5 and later generations share the template's `last_query_index`
+    // wrapping, so their assistant turns render position-dependently. The
+    // template itself is the authority: a dotted generation such as
+    // `Qwen3.8-27B` normalises to `Qwen38-27B` and would otherwise fall into
+    // the generic Qwen3 adapter, whose per-segment dummy base (`[system]`)
+    // makes the template raise `No user query found in messages.` and forces
+    // the merge down the full-render fallback.
+    if lower.contains("qwen")
+        && (template_position_dependent
+            || normalised.contains("qwen35")
+            || normalised.contains("qwen3point5"))
+    {
         return Box::new(Qwen35Adapter::new(im_end, newline));
     }
     if normalised.contains("qwen3") {
@@ -352,6 +365,21 @@ fn select_adapter_with_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_position_dependent_qwen_template_uses_the_whole_slice_merge() {
+        // Qwen3.8 templates wrap assistant turns against `last_query_index`,
+        // so the per-segment dummy base is unsound for them.
+        for model in ["Qwen/Qwen3.8-27B", "Qwen/Qwen3-8B"] {
+            let adapter = select_adapter_with_ids(model, Some((151645, 198)), None, true);
+            assert!(
+                adapter.rendering_is_position_dependent(),
+                "{model} must render position-dependently"
+            );
+        }
+        let adapter = select_adapter_with_ids("Qwen/Qwen3-8B", Some((151645, 198)), None, false);
+        assert!(!adapter.rendering_is_position_dependent());
+    }
 
     #[test]
     fn default_adapter_is_identity() {
