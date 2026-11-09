@@ -832,6 +832,96 @@ fn sort_json_keys(value: &JsonValue) -> JsonValue {
     }
 }
 
+/// Hugging Face chat-template helper for surfacing model-authored validation
+/// errors instead of a generic "unknown function" render failure.
+fn raise_exception(message: String) -> std::result::Result<String, MinijinjaError> {
+    Err(MinijinjaError::new(ErrorKind::InvalidOperation, message))
+}
+
+/// Whether the template mentions the `developer` role at all (vLLM's
+/// `_detect_developer_role_support`): a template that never names it has no
+/// branch for it, and the renderer rewrites developer messages to system ones.
+fn detect_developer_role_support(template: &str) -> bool {
+    template.contains("\"developer\"") || template.contains("'developer'")
+}
+
+/// The messages with every `developer` message rewritten as a `system`
+/// message without its `tools` field (vLLM's `_convert_developer_to_system`),
+/// then the system messages merged into one at the front when a system
+/// message is not the first message (vLLM's `_consolidate_system_messages`,
+/// which follows the rewrite in its renderer). `None` when no message has
+/// the role, so the caller keeps its slice.
+fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+    let is_developer =
+        |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("developer");
+    if !messages.iter().any(is_developer) {
+        return None;
+    }
+    let rewritten = messages
+        .iter()
+        .map(|m| {
+            if !is_developer(m) {
+                return m.clone();
+            }
+            let mut rewritten = m.clone();
+            if let Some(fields) = rewritten.as_object_mut() {
+                fields.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("system".to_string()),
+                );
+                fields.remove("tools");
+            }
+            rewritten
+        })
+        .collect();
+    Some(consolidate_system_messages(rewritten))
+}
+
+/// vLLM's `_consolidate_system_messages`, for the templates that want the
+/// system message first: the messages unchanged when the only system message
+/// is the first one; otherwise one system message at the front carrying the
+/// non-empty system texts joined by blank lines (a parts list contributes its
+/// text parts joined by newlines), then the other messages in their order.
+fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let is_system =
+        |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("system");
+    if !messages
+        .iter()
+        .enumerate()
+        .any(|(index, m)| index > 0 && is_system(m))
+    {
+        return messages;
+    }
+    let mut system_texts: Vec<String> = Vec::new();
+    let mut others = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !is_system(&message) {
+            others.push(message);
+            continue;
+        }
+        let text = match message.get("content") {
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    serde_json::Value::String(text) => Some(text.as_str()),
+                    serde_json::Value::Object(fields) => {
+                        fields.get("text").and_then(serde_json::Value::as_str)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            system_texts.push(text);
+        }
+    }
+    let merged = serde_json::json!({"role": "system", "content": system_texts.join("\n\n")});
+    std::iter::once(merged).chain(others).collect()
+}
+
 /// Build a pre-configured `Environment<'static>` with the given template string,
 /// Python-compat method callback, and custom `tojson` filter already registered.
 /// The template is stored under the name `"chat"` using owned storage so the
@@ -856,6 +946,7 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     // This overrides minijinja's built-in tojson to support additional kwargs
     // like ensure_ascii, separators, and sort_keys that HuggingFace templates use
     env.add_filter("tojson", tojson_filter);
+    env.add_function("raise_exception", raise_exception);
 
     Ok(env)
 }
@@ -1029,6 +1120,10 @@ pub struct ChatTemplateState {
     /// the last user query. Stock Qwen3.5 templates expose this through the
     /// `last_query_index` namespace; position-independent overrides omit it.
     position_dependent: bool,
+    /// Whether the template has a branch for the `developer` role. When it
+    /// has none, `apply` renders developer messages as system messages, as
+    /// vLLM's HF renderer does, instead of letting the template reject them.
+    developer_role_supported: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1049,6 +1144,9 @@ impl ChatTemplateState {
         let position_dependent = template
             .as_deref()
             .is_some_and(|source| source.contains("last_query_index"));
+        let developer_role_supported = template
+            .as_deref()
+            .is_none_or(detect_developer_role_support);
         let env = template.map(build_environment).transpose()?;
         Ok(Self {
             env,
@@ -1057,6 +1155,7 @@ impl ChatTemplateState {
             thinking_key_name,
             think_in_prefill,
             position_dependent,
+            developer_role_supported,
         })
     }
 
@@ -1072,6 +1171,7 @@ impl ChatTemplateState {
             thinking_key_name: None,
             think_in_prefill: false,
             position_dependent: false,
+            developer_role_supported: true,
         }
     }
 
@@ -1088,6 +1188,22 @@ impl ChatTemplateState {
                  https://huggingface.co/docs/transformers/main/en/chat_templating",
             )
         })?;
+
+        // A template without a `developer` branch renders nothing for a
+        // developer message; vLLM's renderer hands such a template the message
+        // as a system message, and so does this one (`tools` on it dropped).
+        let converted;
+        let messages: &[serde_json::Value] = if self.developer_role_supported {
+            messages
+        } else {
+            match developer_messages_as_system(messages) {
+                Some(rewritten) => {
+                    converted = rewritten;
+                    &converted
+                }
+                None => messages,
+            }
+        };
 
         // Apply the resolved thinking preference under the template's own toggle
         // key (`enable_thinking` vs `thinking`, per detection). Skip entirely
@@ -1117,7 +1233,9 @@ impl ChatTemplateState {
         let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
             detect_all(&template);
         let position_dependent = template.contains("last_query_index");
+        let developer_role_supported = detect_developer_role_support(&template);
         let env = build_environment(template)?;
+        self.developer_role_supported = developer_role_supported;
         self.content_format = content_format;
         self.thinking_toggle = thinking_toggle;
         self.thinking_key_name = thinking_key_name;
@@ -1172,6 +1290,72 @@ mod tests {
             )
             .unwrap();
         assert!(state.position_dependent());
+    }
+
+    #[test]
+    fn test_raise_exception_surfaces_template_validation_message() {
+        let state = ChatTemplateState::new(Some(
+            "{{ raise_exception('No user query found in messages.') }}".to_string(),
+        ))
+        .unwrap();
+
+        let error = state
+            .apply(&[], ChatTemplateParams::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("No user query found"), "{error}");
+    }
+
+    #[test]
+    fn developer_message_renders_as_system_when_the_template_has_no_developer_branch() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}\
+                        {% if messages[0].tools is defined %}TOOLS{% endif %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "developer", "content": "Be terse.", "tools": [{"name": "t"}]}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<sys>Be terse.</sys><usr>hi</usr>");
+    }
+
+    #[test]
+    fn a_developer_message_after_a_system_message_merges_into_one_system_turn() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "You are terse."}),
+            serde_json::json!({"role": "developer", "content": "Answer in French."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>You are terse.\n\nAnswer in French.</sys><usr>hi</usr>"
+        );
+    }
+
+    #[test]
+    fn developer_message_reaches_a_template_that_handles_the_role() {
+        let template = "{% for m in messages %}{% if m.role == 'developer' %}<dev>{{ m.content }}</dev>\
+                        {% elif m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "developer", "content": "Be terse."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<dev>Be terse.</dev><usr>hi</usr>");
     }
 
     #[test]
